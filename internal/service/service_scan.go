@@ -141,6 +141,18 @@ func (s *Service) run(ctx context.Context) error {
 			if !relevant {
 				continue
 			}
+			// Fill FirstSeen from the page's earliest observation before the
+			// timeliness gate. A brand-new competition analysed today may have been
+			// first observed in a previous scan (when AI failed); without this, its
+			// FirstSeen would be zero at the gate and the year-less/dateless case
+			// would be wrongly rejected by the freshness fallback.
+			if competition.FirstSeen.IsZero() {
+				firstSeen, firstSeenErr := s.store.FirstObservedAt(ctx, doc.URL)
+				if firstSeenErr != nil {
+					return fmt.Errorf("read first observed time for %s: %w", doc.URL, firstSeenErr)
+				}
+				competition.FirstSeen = firstSeen
+			}
 			// Dual-dimension gate at ingest: a competition must satisfy both
 			// trust and timeliness to be persisted. A first-time competition
 			// from an explicitly past-year edition, or one whose page was

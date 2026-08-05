@@ -487,3 +487,37 @@ func openStore(t *testing.T, path string) *store.Store {
 func fixedNow() time.Time {
 	return time.Date(2026, 8, 3, 8, 0, 0, 0, time.FixedZone("CST", 8*3600))
 }
+
+// TestYearlessFreshlyObservedCompetitionIsIngested is the regression guard for
+// the FirstSeen fallback. A brand-new competition with no year, no dates and
+// no publish date must not be rejected by isCurrentEdition just because its
+// FirstSeen is zero before upsert. The fix fills FirstSeen from the page's
+// earliest observation time, so the freshness fallback has a value.
+func TestYearlessFreshlyObservedCompetitionIsIngested(t *testing.T) {
+	// Title deliberately carries no year, and the body has no dates.
+	page := `<html><head><title>华为软件精英挑战赛官网</title></head><body>
+<p>华为软件精英挑战赛，面向全球在校学生开放的算法竞技赛事。</p>
+<p>赛题围绕真实云场景下的资源调度与优化问题展开。</p></body></html>`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, page) }))
+	defer server.Close()
+
+	app, database, _ := newPageService(t, server.URL, "huawei-competition", "华为软件精英挑战赛", "high")
+	defer database.Close()
+
+	if err := app.Run(context.Background()); err != nil {
+		t.Fatalf("Run() returned an error (yearless competition should be ingested, not rejected): %v", err)
+	}
+	competitions, err := database.ListCompetitions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(competitions) != 1 {
+		t.Fatalf("yearless competition produced %d rows, want 1", len(competitions))
+	}
+	if got := competitions[0].Name; got != "华为软件精英挑战赛官网" {
+		t.Fatalf("ingested name = %q, want the yearless competition", got)
+	}
+	if competitions[0].FirstSeen.IsZero() {
+		t.Fatal("ingested competition must have a non-zero FirstSeen from its observation")
+	}
+}

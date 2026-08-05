@@ -371,6 +371,30 @@ SELECT id FROM observations WHERE source_id=? AND url=? AND content_hash=? ORDER
 	return nil
 }
 
+// FirstObservedAt returns the earliest seen_at recorded for a document URL
+// across every source. It is used as the authoritative "when was this page
+// first discovered" signal, which for a brand-new competition may predate the
+// moment analysis finally succeeds. An empty URL is rejected with an error;
+// a URL with no observation rows returns sql.ErrNoRows.
+func (s *Store) FirstObservedAt(ctx context.Context, documentURL string) (time.Time, error) {
+	if strings.TrimSpace(documentURL) == "" {
+		return time.Time{}, errors.New("document URL must not be empty")
+	}
+	var seenAt *int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT MIN(seen_at) FROM observations WHERE url = ?`, documentURL).Scan(&seenAt)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if seenAt == nil {
+		// MIN() over an empty set yields NULL, which must not be coerced into
+		// Unix time 0. Surface it as "not found" so callers can distinguish a
+		// never-seen page from a page observed at the epoch.
+		return time.Time{}, sql.ErrNoRows
+	}
+	return time.Unix(*seenAt, 0), nil
+}
+
 func (s *Store) UpsertCompetition(ctx context.Context, value model.Competition, sourceID string, now time.Time) (model.Competition, bool, error) {
 	model.NormalizeLifecycle(&value)
 	sourceURL, sourceTrust := value.OfficialURL, value.Trust
@@ -385,7 +409,14 @@ func (s *Store) UpsertCompetition(ctx context.Context, value model.Competition, 
 		return model.Competition{}, false, err
 	}
 	if isNew {
-		value.FirstSeen = now
+		// Preserve a FirstSeen that the caller already determined (e.g. the
+		// page's earliest observation time) so a page whose analysis succeeded
+		// days after it was first seen still records the original discovery
+		// date rather than the analysis date. Fall back to now only when the
+		// caller left it zero.
+		if value.FirstSeen.IsZero() {
+			value.FirstSeen = now
+		}
 		value.LastSeen = now
 		err := tx.QueryRowContext(ctx, `INSERT INTO competitions(
 entity_key,name,organizer,status,status_evidence,registration_phase,competition_phase,registration_start,registration_start_raw,registration_end,registration_end_raw,
