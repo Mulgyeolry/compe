@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os/exec"
 	"regexp"
@@ -32,6 +34,153 @@ type Collector interface {
 // content or server error. Callers treat it as "do not retry blindly and do
 // not waste analysis on this page".
 var ErrAntiBot = errors.New("request blocked by anti-bot protection")
+
+// ErrUnsafeURL marks an outbound request rejected by the SSRF policy: the
+// target host resolves to a loopback, private, link-local, metadata or
+// multicast address, or the URL itself is not a safe public http(s) address.
+// Callers and tests identify rejected requests with errors.Is(err, ErrUnsafeURL).
+var ErrUnsafeURL = errors.New("unsafe outbound URL")
+
+// errRejectRedirect is a sentinel used by the public CheckRedirect policy; it
+// is never returned to callers directly, only used to abort a redirect chain.
+var errRejectRedirect = errors.New("unsafe redirect target")
+
+// unsafeNetworks lists the address families that must never be dialed by the
+// public crawler. Everything here is either loopback, private, link-local,
+// metadata, multicast or otherwise non-public.
+var unsafeNetworks = []netip.Prefix{
+	// IPv4
+	netip.MustParsePrefix("0.0.0.0/8"),      // "this" network
+	netip.MustParsePrefix("10.0.0.0/8"),     // private
+	netip.MustParsePrefix("100.64.0.0/10"),  // carrier-grade NAT
+	netip.MustParsePrefix("127.0.0.0/8"),    // loopback
+	netip.MustParsePrefix("169.254.0.0/16"), // link-local / cloud metadata
+	netip.MustParsePrefix("172.16.0.0/12"),  // private
+	netip.MustParsePrefix("192.0.0.0/24"),   // IETF protocol assignments
+	netip.MustParsePrefix("192.168.0.0/16"), // private
+	netip.MustParsePrefix("198.18.0.0/15"),  // benchmarking
+	netip.MustParsePrefix("224.0.0.0/4"),    // multicast
+	netip.MustParsePrefix("240.0.0.0/4"),    // reserved
+	// IPv6
+	netip.MustParsePrefix("::/128"),    // unspecified
+	netip.MustParsePrefix("::1/128"),   // loopback
+	netip.MustParsePrefix("fc00::/7"),  // unique local (private)
+	netip.MustParsePrefix("fe80::/10"), // link-local
+	netip.MustParsePrefix("ff00::/8"),  // multicast
+}
+
+// isSafeIP reports whether a validated address is safe to dial. IPv4-mapped
+// IPv6 addresses (e.g. ::ffff:127.0.0.1) are un-mapped first so they are judged
+// by their real IPv4 semantics.
+func isSafeIP(addr netip.Addr) bool {
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	if addr.Zone() != "" {
+		return false
+	}
+	if addr.IsUnspecified() || addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsMulticast() {
+		return false
+	}
+	for _, network := range unsafeNetworks {
+		if network.Contains(addr) {
+			return false
+		}
+	}
+	return true
+}
+
+// validatePublicURL performs lightweight syntactic checks on a URL that the
+// public crawler may touch. It does not resolve DNS; the secure transport's
+// DialContext does that at connection time. Scheme, hostname, userinfo and
+// direct-IP safety are enforced here.
+func validatePublicURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid URL %q", ErrUnsafeURL, raw)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("%w: unsupported scheme %q", ErrUnsafeURL, parsed.Scheme)
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return nil, fmt.Errorf("%w: empty host", ErrUnsafeURL)
+	}
+	if parsed.User != nil {
+		return nil, fmt.Errorf("%w: URL contains userinfo", ErrUnsafeURL)
+	}
+	lower := strings.ToLower(strings.TrimSuffix(host, "."))
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") {
+		return nil, fmt.Errorf("%w: localhost host %q", ErrUnsafeURL, host)
+	}
+	if port := parsed.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("%w: invalid port %q", ErrUnsafeURL, port)
+		}
+	}
+	// A literal IP host can be checked immediately without DNS.
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if !isSafeIP(addr) {
+			return nil, fmt.Errorf("%w: private address %s", ErrUnsafeURL, addr)
+		}
+	}
+	return parsed, nil
+}
+
+// isSafeCandidateURL is a light pre-filter for candidate URLs harvested from
+// pages, RSS items and search results. It avoids DNS lookups (which could fire
+// hundreds of times for one listing page); the secure DialContext performs the
+// authoritative check at request time.
+func isSafeCandidateURL(raw string) bool {
+	// A domain host is only rejected here if it is literally localhost or an
+	// unsafe literal IP; its resolved address is checked later by the secure
+	// transport's DialContext.
+	_, err := validatePublicURL(raw)
+	return err == nil
+}
+
+// publicRoundTripper builds an http.RoundTripper for untrusted public targets.
+// It clones the default transport so TLS, connection pooling and timeouts are
+// preserved, then installs a DNS-validating DialContext and disables the proxy
+// so a proxy cannot re-resolve the target and bypass the local IP check.
+func publicRoundTripper(lookupIP func(context.Context, string) ([]net.IPAddr, error), dialContext func(context.Context, string, string) (net.Conn, error)) http.RoundTripper {
+	if lookupIP == nil {
+		lookupIP = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+			return net.DefaultResolver.LookupIPAddr(ctx, host)
+		}
+	}
+	if dialContext == nil {
+		dialContext = (&net.Dialer{Timeout: 15 * time.Second}).DialContext
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("%w: cannot split address %q", ErrUnsafeURL, address)
+		}
+		ips, err := lookupIP(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		// Conservative: if any resolved address is unsafe, reject the whole
+		// target to avoid racing a DNS rebinding to a private IP.
+		for _, ip := range ips {
+			addr, ok := netip.AddrFromSlice(ip.IP)
+			if !ok {
+				continue
+			}
+			if !isSafeIP(addr) {
+				return nil, fmt.Errorf("%w: private address %s for %q", ErrUnsafeURL, addr, host)
+			}
+		}
+		// Dial the validated IP directly so the transport does not re-resolve
+		// the hostname. TLS still verifies the certificate against the original
+		// hostname because the request URL is unchanged.
+		return dialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+	}
+	return transport
+}
 
 // retryableStatus returns true when the HTTP status indicates a transient
 // failure that may succeed on a later attempt. 4xx client errors (other than
@@ -93,22 +242,47 @@ func antiBotDetected(raw []byte) bool {
 }
 
 type HTTPCollector struct {
-	client     *http.Client
-	searxngURL string
-	maxBytes   int64
-	maxRetries int
+	client        *http.Client // public, SSRF-protected client for untrusted targets
+	serviceClient *http.Client // trusted client used only for c.searxngURL
+	searxngURL    string
+	maxBytes      int64
+	maxRetries    int
+}
+
+// publicCheckRedirect is the redirect policy for the public client. It limits
+// redirect depth and re-validates every hop so a public page cannot redirect us
+// to a private/metadata address.
+func publicCheckRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("too many redirects")
+	}
+	if _, err := validatePublicURL(req.URL.String()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// serviceCheckRedirect only limits redirect depth; the trusted SearxNG client
+// must be able to follow redirects within the Docker network without the public
+// address restrictions.
+func serviceCheckRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("too many redirects")
+	}
+	return nil
 }
 
 func NewHTTPCollector(cfg config.Config) *HTTPCollector {
+	timeout := time.Duration(cfg.Fetch.TimeoutSeconds) * time.Second
 	return &HTTPCollector{
 		client: &http.Client{
-			Timeout: time.Duration(cfg.Fetch.TimeoutSeconds) * time.Second,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 5 {
-					return errors.New("too many redirects")
-				}
-				return nil
-			},
+			Timeout:       timeout,
+			CheckRedirect: publicCheckRedirect,
+			Transport:     publicRoundTripper(nil, nil),
+		},
+		serviceClient: &http.Client{
+			Timeout:       timeout,
+			CheckRedirect: serviceCheckRedirect,
 		},
 		searxngURL: strings.TrimRight(cfg.SearxngURL, "/"),
 		maxBytes:   cfg.Fetch.MaxBytes,
@@ -116,12 +290,67 @@ func NewHTTPCollector(cfg config.Config) *HTTPCollector {
 	}
 }
 
-// doRequest executes the request with exponential-backoff retries. It retries
-// transient network errors and retryable HTTP statuses, and surfaces ErrAntiBot
-// when a 2xx response is actually an anti-bot challenge. The request body is
-// nil for every caller, so a clone per attempt is unnecessary; callers must
-// construct a fresh request each round if they need retry support.
+// routeToServer forwards every public request to target (an httptest server)
+// while preserving the original path and query and keeping the original host
+// on the response, so the SSRF pre-filter on extracted links sees a public
+// hostname. It is used only by NewHTTPCollectorForTest.
+type routeToServer struct{ to *url.URL }
+
+func (r *routeToServer) RoundTrip(req *http.Request) (*http.Response, error) {
+	proxy := *r.to
+	proxy.Path = req.URL.Path
+	proxy.RawQuery = req.URL.RawQuery
+	cloned := req.Clone(req.Context())
+	cloned.URL = &proxy
+	resp, err := http.DefaultTransport.RoundTrip(cloned)
+	if err != nil {
+		return nil, err
+	}
+	resp.Request = req
+	return resp, nil
+}
+
+// NewHTTPCollectorForTest builds a collector whose public client routes every
+// request to target (typically an httptest server) instead of using the
+// SSRF-protected transport. It lets service-level tests reach a local test
+// server that would otherwise be rejected as a private address. Production code
+// must use NewHTTPCollector.
+func NewHTTPCollectorForTest(target *url.URL) *HTTPCollector {
+	return &HTTPCollector{
+		client: &http.Client{
+			Timeout:       20 * time.Second,
+			CheckRedirect: publicCheckRedirect,
+			Transport:     &routeToServer{to: target},
+		},
+		serviceClient: &http.Client{
+			Timeout:       20 * time.Second,
+			CheckRedirect: serviceCheckRedirect,
+		},
+		searxngURL: target.String(),
+		maxBytes:   5 << 20,
+		maxRetries: 2,
+	}
+}
+
+// doRequest executes a public, SSRF-protected request with exponential-backoff
+// retries. It is used for all untrusted targets (page/RSS sources, Fetch,
+// search-result candidates). See doRequestWithClient for the retry loop.
 func (c *HTTPCollector) doRequest(ctx context.Context, target string, headers map[string]string) (*http.Response, error) {
+	return c.doRequestWithClient(ctx, c.client, target, headers)
+}
+
+// doServiceRequest executes a request through the trusted client, used only to
+// talk to the configured SearxNG instance inside the trusted network.
+func (c *HTTPCollector) doServiceRequest(ctx context.Context, target string, headers map[string]string) (*http.Response, error) {
+	return c.doRequestWithClient(ctx, c.serviceClient, target, headers)
+}
+
+// doRequestWithClient runs the shared retry loop over the given client. It
+// retries transient network errors and retryable HTTP statuses, and surfaces
+// ErrAntiBot when a 2xx response is actually an anti-bot challenge. A request
+// rejected by the SSRF policy (ErrUnsafeURL) returns immediately without
+// retrying, because a security rejection is not a transient network failure.
+func (c *HTTPCollector) doRequestWithClient(ctx context.Context, client *http.Client, target string, headers map[string]string) (*http.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -139,8 +368,11 @@ func (c *HTTPCollector) doRequest(ctx context.Context, target string, headers ma
 		for key, value := range headers {
 			req.Header.Set(key, value)
 		}
-		resp, err := c.client.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
+			if errors.Is(err, ErrUnsafeURL) {
+				return nil, err
+			}
 			lastErr = err
 			// Network errors are transient unless the context was cancelled.
 			if ctx.Err() != nil {
@@ -215,6 +447,9 @@ func (c *HTTPCollector) discoverPage(ctx context.Context, source config.Source) 
 		if title == "" || len([]rune(title)) < 4 {
 			return true
 		}
+		if !isSafeCandidateURL(absolute.String()) {
+			return true
+		}
 		links = append(links, model.Candidate{SourceID: source.ID, SourceName: source.Name, Title: title, URL: canonicalURL(absolute.String()), Snippet: title})
 		return true
 	})
@@ -260,6 +495,9 @@ func (c *HTTPCollector) discoverRSS(ctx context.Context, source config.Source) (
 		if len(items) >= source.Limit {
 			break
 		}
+		if !isSafeCandidateURL(item.Link) {
+			continue
+		}
 		items = append(items, model.Candidate{SourceID: source.ID, SourceName: source.Name, Title: item.Title, URL: canonicalURL(item.Link), Snippet: normalizeSpace(item.Description)})
 	}
 	return deduplicate(items), nil
@@ -268,7 +506,10 @@ func (c *HTTPCollector) discoverRSS(ctx context.Context, source config.Source) (
 func (c *HTTPCollector) discoverSearch(ctx context.Context, source config.Source) ([]model.Candidate, error) {
 	query := strings.ReplaceAll(source.Query, "{year}", strconv.Itoa(time.Now().Year()))
 	endpoint := c.searxngURL + "/search?format=json&q=" + url.QueryEscape(query)
-	resp, err := c.doRequest(ctx, endpoint, botHeaders())
+	// SearxNG is a trusted in-network service; only this request may use the
+	// service client. The result URLs it returns are untrusted and are fetched
+	// later through the public client, never here.
+	resp, err := c.doServiceRequest(ctx, endpoint, botHeaders())
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +526,7 @@ func (c *HTTPCollector) discoverSearch(ctx context.Context, source config.Source
 	}
 	items := make([]model.Candidate, 0, min(len(payload.Results), source.Limit))
 	for _, result := range payload.Results {
-		if len(items) >= source.Limit || !allowedURL(result.URL, source.AllowedDomains) {
+		if len(items) >= source.Limit || !allowedURL(result.URL, source.AllowedDomains) || !isSafeCandidateURL(result.URL) {
 			continue
 		}
 		items = append(items, model.Candidate{SourceID: source.ID, SourceName: source.Name, Title: result.Title, URL: canonicalURL(result.URL), Snippet: normalizeSpace(result.Content)})
@@ -526,12 +767,18 @@ func extractPDF(ctx context.Context, data []byte) (string, error) {
 }
 
 func allowedURL(raw string, domains []string) bool {
-	if len(domains) == 0 {
-		return true
-	}
-	parsed, err := url.Parse(raw)
+	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	if parsed.Hostname() == "" {
+		return false
+	}
+	if len(domains) == 0 {
+		return true
 	}
 	host := strings.ToLower(parsed.Hostname())
 	for _, domain := range domains {

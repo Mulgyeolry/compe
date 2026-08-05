@@ -126,7 +126,9 @@ func TestSearchFindsAgentCompetitionAndFiltersIrrelevantPage(t *testing.T) {
 	defer server.Close()
 	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"results":[{"title":"2026 高校 AI Agent 应用创新赛报名通知","url":"`+server.URL+`/agent","content":"面向大学生的智能体和RAG应用比赛，现已开放报名"}]}`)
+		// The result URL uses a public-style hostname; the test collector
+		// routes it back to the httptest server.
+		_, _ = io.WriteString(w, `{"results":[{"title":"2026 高校 AI Agent 应用创新赛报名通知","url":"https://contest.example.com/agent","content":"面向大学生的智能体和RAG应用比赛，现已开放报名"}]}`)
 	})
 	mux.HandleFunc("/agent", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `<html><head><title>2026 高校 AI Agent 应用创新赛</title></head><body><p>主办方：示范大学计算机学院。</p><p>现已开放报名，报名时间：2026年8月1日至2026年9月30日。</p><p>允许组队参赛，围绕AI Agent和RAG开发应用。</p></body></html>`)
@@ -135,7 +137,9 @@ func TestSearchFindsAgentCompetitionAndFiltersIrrelevantPage(t *testing.T) {
 	parsed, _ := url.Parse(server.URL)
 	cfg := baseConfig(t)
 	cfg.SearxngURL = server.URL
-	cfg.MediumDomains = []string{parsed.Hostname()}
+	// The httptest host and the public-style search-result host are both
+	// medium-trust so the search-found agent competition is ingested.
+	cfg.MediumDomains = []string{parsed.Hostname(), "contest.example.com"}
 	cfg.Sources = []config.Source{
 		{ID: "agent-search", Name: "Agent discovery", Kind: "search", Query: "AI Agent 比赛 报名", Limit: 10},
 		{ID: "cooking", Name: "烹饪比赛", Kind: "page", URL: server.URL + "/cooking", Trust: "high", Limit: 5},
@@ -146,7 +150,7 @@ func TestSearchFindsAgentCompetitionAndFiltersIrrelevantPage(t *testing.T) {
 	database := openStore(t, cfg.DBPath)
 	defer database.Close()
 	sender := &memorySender{}
-	app := service.New(cfg, database, fetcher.NewHTTPCollector(cfg), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := service.New(cfg, database, newTestCollector(t, server.URL), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableAllCategoryTestUser(t, database, app, "agent@example.com", fixedNow())
 	app.SetNow(fixedNow)
 	if err := app.Run(context.Background()); err != nil {
@@ -239,7 +243,7 @@ func TestConflictingOfficialDatesAreNotScheduled(t *testing.T) {
 	database := openStore(t, cfg.DBPath)
 	defer database.Close()
 	sender := &memorySender{}
-	app := service.New(cfg, database, fetcher.NewHTTPCollector(cfg), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := service.New(cfg, database, newTestCollector(t, server.URL), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableAllCategoryTestUser(t, database, app, "conflict@example.com", fixedNow())
 	app.SetNow(fixedNow)
 	if err := app.Run(context.Background()); err != nil {
@@ -268,7 +272,7 @@ func TestMultiUserCategoryMatching(t *testing.T) {
 	algorithmUser := createTestUser(t, database, "algorithm@example.com", "algorithm", now)
 	_ = createTestUser(t, database, "cloud@example.com", "cloud_native", now)
 	sender := &memorySender{}
-	app := service.New(cfg, database, fetcher.NewHTTPCollector(cfg), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := service.New(cfg, database, newTestCollector(t, server.URL), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	manager, err := authn.New("0123456789abcdef0123456789abcdef")
 	if err != nil {
 		t.Fatal(err)
@@ -459,10 +463,23 @@ func newPageService(t *testing.T, pageURL, id, name, trust string) (*service.Ser
 	cfg.Sources = []config.Source{{ID: id, Name: name, Kind: "page", URL: pageURL, Trust: trust, Limit: 10}}
 	database := openStore(t, cfg.DBPath)
 	sender := &memorySender{}
-	app := service.New(cfg, database, fetcher.NewHTTPCollector(cfg), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := service.New(cfg, database, newTestCollector(t, pageURL), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableAllCategoryTestUser(t, database, app, "fixture@example.com", fixedNow())
 	app.SetNow(fixedNow)
 	return app, database, sender
+}
+
+// newTestCollector builds a fetcher.Collector whose public client routes every
+// request to the given (httptest) server URL. This lets service tests reach a
+// local test server that the production SSRF-protected collector would reject
+// as a private address.
+func newTestCollector(t *testing.T, targetURL string) fetcher.Collector {
+	t.Helper()
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fetcher.NewHTTPCollectorForTest(parsed)
 }
 
 func baseConfig(t *testing.T) config.Config {

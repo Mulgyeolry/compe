@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -81,8 +82,14 @@ func TestDiscoverPagePrioritizesCompetitionDetailLinks(t *testing.T) {
 		_, _ = fmt.Fprint(w, `<a href="/contest/2026">2026全国大学生程序设计大赛报名通知</a></main></body></html>`)
 	}))
 	defer server.Close()
-	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1 << 20}
-	items, err := collector.Discover(context.Background(), config.Source{ID: "page", Name: "page", Kind: "page", URL: server.URL, Limit: 2})
+	serverURL, _ := url.Parse(server.URL)
+	// Use a public-style hostname so the extracted candidate links pass the
+	// SSRF pre-filter, while routing actual requests to the httptest server.
+	collector := &HTTPCollector{client: &http.Client{
+		Timeout:   time.Second,
+		Transport: &routeTransport{to: serverURL},
+	}, maxBytes: 1 << 20}
+	items, err := collector.Discover(context.Background(), config.Source{ID: "page", Name: "page", Kind: "page", URL: "https://contest.example.com/list", Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +102,28 @@ func TestDiscoverPagePrioritizesCompetitionDetailLinks(t *testing.T) {
 	if !found {
 		t.Fatalf("competition detail link was crowded out: %#v", items)
 	}
+}
+
+// routeTransport forwards every request to a fixed server while preserving the
+// original path and query, letting tests exercise link extraction without real
+// DNS or the SSRF transport.
+type routeTransport struct{ to *url.URL }
+
+func (r *routeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	proxy := *r.to
+	proxy.Path = req.URL.Path
+	proxy.RawQuery = req.URL.RawQuery
+	cloned := req.Clone(req.Context())
+	cloned.URL = &proxy
+	resp, err := http.DefaultTransport.RoundTrip(cloned)
+	if err != nil {
+		return nil, err
+	}
+	// Keep the original public hostname on the response so doc.URL and the
+	// extracted candidate links resolve to a public-style host, which lets the
+	// SSRF pre-filter pass while requests actually hit the httptest server.
+	resp.Request = req
+	return resp, nil
 }
 
 func TestPDFSegmentsPreservePageNumbers(t *testing.T) {
