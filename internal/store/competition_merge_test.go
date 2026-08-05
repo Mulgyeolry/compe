@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -173,6 +174,146 @@ func TestAnalyzerUpgradeCanClearInvalidatedFactsFromSameSource(t *testing.T) {
 	}
 	if saved.Status != model.StatusUnknown || saved.StatusEvidence != "" || saved.RegistrationEnd != nil || saved.RegistrationEndRaw != "" || saved.Fee != "" || saved.Organizer != "" {
 		t.Fatalf("invalidated v1 facts survived analyzer upgrade: %#v", saved)
+	}
+}
+
+// TestUpsertReusedURLCreatesSeparateCompetitionForNewYear verifies that when
+// an official site reuses the same URL for a new edition in a different year,
+// the new competition is created as a separate row instead of silently merging
+// into the existing year's row (which would corrupt status and per-user choices).
+func TestUpsertReusedURLCreatesSeparateCompetitionForNewYear(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "url-years.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	const sharedURL = "https://contest.example.com/notice"
+
+	first := model.Competition{
+		EntityKey:   "huawei-2026",
+		Name:        "2026 华为软件精英挑战赛",
+		Status:      model.StatusRegistrationOpen,
+		OfficialURL: sharedURL,
+		Trust:       model.TrustHigh,
+	}
+	if _, isNew, err := database.UpsertCompetition(ctx, first, "huawei", now); err != nil || !isNew {
+		t.Fatalf("insert 2026 isNew=%v err=%v", isNew, err)
+	}
+
+	second := model.Competition{
+		EntityKey:   "huawei-2027",
+		Name:        "2027 华为软件精英挑战赛",
+		Status:      model.StatusRegistrationOpen,
+		OfficialURL: sharedURL,
+		Trust:       model.TrustHigh,
+	}
+	if _, isNew, err := database.UpsertCompetition(ctx, second, "huawei", now.Add(time.Hour)); err != nil || !isNew {
+		t.Fatalf("insert 2027 isNew=%v err=%v (expected a new row for the new year)", isNew, err)
+	}
+
+	competitions, err := database.ListCompetitions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(competitions) != 2 {
+		t.Fatalf("reused URL with different years produced %d rows, want 2", len(competitions))
+	}
+	if competitions[0].ID == competitions[1].ID {
+		t.Fatal("2026 and 2027 must be distinct competition rows")
+	}
+	// The 2026 row must not have been overwritten by the 2027 data.
+	if competitions[0].Name != "2026 华为软件精英挑战赛" && competitions[1].Name != "2026 华为软件精英挑战赛" {
+		t.Fatalf("2026 competition name was not preserved: %#v", competitions)
+	}
+}
+
+// TestUpsertReusedURLUpdatesSameYearChangedTitle verifies that a different
+// announcement for the SAME year (same URL, same year, changed title) still
+// merges into the existing row.
+func TestUpsertReusedURLUpdatesSameYearChangedTitle(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "url-sameyear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	const sharedURL = "https://contest.example.com/notice"
+
+	first := model.Competition{
+		EntityKey:   "huawei-2026-a",
+		Name:        "2026 华为软件精英挑战赛报名预告",
+		Status:      model.StatusPreview,
+		OfficialURL: sharedURL,
+		Trust:       model.TrustHigh,
+	}
+	if _, isNew, err := database.UpsertCompetition(ctx, first, "huawei", now); err != nil || !isNew {
+		t.Fatalf("insert preview isNew=%v err=%v", isNew, err)
+	}
+
+	second := model.Competition{
+		EntityKey:   "huawei-2026-b",
+		Name:        "2026 华为软件精英挑战赛正式报名通知",
+		Status:      model.StatusRegistrationOpen,
+		OfficialURL: sharedURL,
+		Trust:       model.TrustHigh,
+	}
+	old, isNew, err := database.UpsertCompetition(ctx, second, "huawei", now.Add(time.Hour))
+	if err != nil || isNew {
+		t.Fatalf("same-year changed title isNew=%v err=%v (expected update, not new row)", isNew, err)
+	}
+	if old.Status != model.StatusPreview {
+		t.Fatalf("expected previous status preview, got %s", old.Status)
+	}
+
+	competitions, err := database.ListCompetitions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(competitions) != 1 {
+		t.Fatalf("same-year reused URL created %d rows, want 1", len(competitions))
+	}
+	if competitions[0].Status != model.StatusRegistrationOpen {
+		t.Fatalf("new announcement did not update the existing competition: %#v", competitions[0])
+	}
+}
+
+// TestUpsertReusedURLCreatesSeparateCompetitionForDifferentEdition verifies
+// that two editions with explicit different ordinals ("第十届" vs "第十一届")
+// on the same URL are kept as separate competitions.
+func TestUpsertReusedURLCreatesSeparateCompetitionForDifferentEdition(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "url-editions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	now := time.Now()
+	const sharedURL = "https://contest.example.com/cloud"
+	editions := []string{"第十届全国大学生云计算大赛", "第十一届全国大学生云计算大赛"}
+	for index, name := range editions {
+		competition := model.Competition{
+			EntityKey:   fmt.Sprintf("cloud-%d", index),
+			Name:        name,
+			Status:      model.StatusRegistrationOpen,
+			OfficialURL: sharedURL,
+			Trust:       model.TrustHigh,
+		}
+		if _, isNew, err := database.UpsertCompetition(ctx, competition, "cloud", now.Add(time.Duration(index)*time.Hour)); err != nil || !isNew {
+			t.Fatalf("edition %q isNew=%v err=%v", name, isNew, err)
+		}
+	}
+	competitions, err := database.ListCompetitions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(competitions) != 2 {
+		t.Fatalf("different explicit editions on same URL produced %d rows, want 2", len(competitions))
+	}
+	if competitions[0].ID == competitions[1].ID {
+		t.Fatal("the two editions must be distinct rows")
 	}
 }
 

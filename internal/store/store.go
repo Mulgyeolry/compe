@@ -426,7 +426,21 @@ func findExistingCompetition(ctx context.Context, tx *sql.Tx, value model.Compet
 	var competitionID int64
 	err := tx.QueryRowContext(ctx, `SELECT competition_id FROM competition_sources WHERE url=? LIMIT 1`, value.OfficialURL).Scan(&competitionID)
 	if err == nil {
-		return loadCompetition(tx.QueryRowContext(ctx, competitionSelect+` WHERE id=?`, competitionID))
+		existing, loadErr := loadCompetition(tx.QueryRowContext(ctx, competitionSelect+` WHERE id=?`, competitionID))
+		if loadErr != nil {
+			return model.Competition{}, loadErr
+		}
+		// The URL is reused year after year for the same official site. If the
+		// newly crawled announcement is an explicitly different year or edition,
+		// it is a brand-new competition, not an update of the existing one. We
+		// do not return it here and instead fall through to the identity match
+		// below; if nothing else matches, sql.ErrNoRows lets the caller create a
+		// fresh row rather than silently merging across editions.
+		if explicitCompetitionEditionConflict(existing, value) {
+			err = sql.ErrNoRows
+		} else {
+			return existing, nil
+		}
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return model.Competition{}, err
@@ -480,6 +494,21 @@ func sameCompetitionIdentity(left, right model.Competition) bool {
 		return false
 	}
 	return true
+}
+
+// explicitCompetitionEditionConflict reports whether two competitions are
+// unmistakably different editions: either both carry a four-digit year that
+// differs, or both carry an explicit "第X届" ordinal that differs. It is used
+// to prevent a reused official URL from silently merging a new edition into an
+// existing one. When only one side has a year or edition, there is no explicit
+// conflict and the URL match is allowed to stand.
+func explicitCompetitionEditionConflict(left, right model.Competition) bool {
+	leftYear, rightYear := competitionYear(left.Name+" "+left.StatusEvidence), competitionYear(right.Name+" "+right.StatusEvidence)
+	if leftYear != 0 && rightYear != 0 && leftYear != rightYear {
+		return true
+	}
+	leftEdition, rightEdition := competitionEdition(left.Name), competitionEdition(right.Name)
+	return leftEdition != "" && rightEdition != "" && leftEdition != rightEdition
 }
 
 func competitionEdition(text string) string {
