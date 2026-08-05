@@ -1,5 +1,7 @@
 package model
 
+import "time"
+
 func CompositeStatus(registration RegistrationPhase, competition CompetitionPhase) Status {
 	switch competition {
 	case CompetitionFinished:
@@ -56,4 +58,11 @@ func NormalizeLifecycle(value *Competition) {
 		value.RegistrationPhase, value.CompetitionPhase = PhasesForLegacyStatus(value.Status)
 	}
 	value.Status = CompositeStatus(value.RegistrationPhase, value.CompetitionPhase)
+}
+
+// DayStart truncates a time to the start of its calendar day in the same
+// location. It is the shared helper used by the analyzer and service packages
+// for "is this date still in the future today?" comparisons.
+func DayStart(value time.Time) time.Time {
+	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, value.Location())
 }

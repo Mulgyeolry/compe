@@ -8,6 +8,19 @@ fetch:
   timeout_seconds: 20
   max_bytes: 5242880
   max_candidates_per_source: 40
+  # 临时网络错误或 429/5xx 响应的额外重试次数（指数退避）。
+  max_retries: 2
+
+# 数据源健康告警：某源连续多次扫描失败后，向部署者发送告警邮件。
+# 单个来源偶尔失败不会触发；恢复成功后计数自动清零。
+alert:
+  enabled: true
+  consecutive_failure_limit: 3
+
+# 新赛事发现：标题未标注年份时，若页面在新鲜度窗口内首次被系统看到，
+# 仍视为当前届公告并推送；超过窗口的页面视为往届残留，不推送。
+discovery:
+  announcement_freshness_days: 90
 
 # 数据清洗在每次系统扫描结束后执行。去重事件和官方事实不会被删除。
 retention:

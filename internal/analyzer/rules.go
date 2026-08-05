@@ -278,7 +278,7 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 	status, evidence := detectStatus(text)
 	start, startRaw, end, endRaw := extractDates(text, a.location)
 	competitionStart, competitionStartRaw, competitionEnd, competitionEndRaw := extractCompetitionDates(text, a.location)
-	if end != nil && end.Before(dayStart(now.In(a.location))) && status == model.StatusRegistrationOpen {
+	if end != nil && end.Before(model.DayStart(now.In(a.location))) && status == model.StatusRegistrationOpen {
 		status = model.StatusRegistrationClosed
 	}
 	if end == nil && status == model.StatusRegistrationOpen {
@@ -286,7 +286,7 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 		if len(candidates) > 0 {
 			allPast := true
 			for _, candidateEnd := range candidates {
-				if !candidateEnd.Before(dayStart(now.In(a.location))) {
+				if !candidateEnd.Before(model.DayStart(now.In(a.location))) {
 					allPast = false
 					break
 				}
@@ -299,8 +299,6 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 	team, teamEvidence := extractTeam(text)
 	fee, feeEvidence := extractFee(text)
 	content, contentEvidence := extractContent(text, a.positive)
-	_ = teamEvidence
-	_ = contentEvidence
 
 	fitReason := recommendationReason(text)
 	eligibility := ""
@@ -514,7 +512,7 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 		base.RegistrationPhase, base.StatusEvidence = model.RegistrationUnknown, ""
 		delete(base.Facts, model.FactRegistrationState)
 	}
-	if base.RegistrationEnd != nil && base.RegistrationEnd.Before(dayStart(now.In(a.location))) && base.RegistrationPhase == model.RegistrationOpen {
+	if base.RegistrationEnd != nil && base.RegistrationEnd.Before(model.DayStart(now.In(a.location))) && base.RegistrationPhase == model.RegistrationOpen {
 		base.RegistrationPhase = model.RegistrationClosed
 		if fact, exists := base.Facts[model.FactRegistrationState]; exists {
 			fact.Value, fact.Raw = string(model.RegistrationClosed), string(model.RegistrationClosed)
@@ -568,59 +566,56 @@ func EntityKey(name, organizer string) string {
 }
 
 func extractDates(text string, loc *time.Location) (*time.Time, string, *time.Time, string) {
-	if match := dateRangePattern.FindStringSubmatch(text); len(match) == 3 {
-		return parseDate(match[1], loc), strings.TrimSpace(match[1]), parseDate(match[2], loc), strings.TrimSpace(match[2])
-	}
-	var start, end *time.Time
-	var startRaw, endRaw string
-	if match := startPattern.FindStringSubmatch(text); len(match) == 2 {
-		start, startRaw = parseDate(match[1], loc), strings.TrimSpace(match[1])
-	}
-	if match := endPattern.FindStringSubmatch(text); len(match) == 2 {
-		end, endRaw = parseDate(match[1], loc), strings.TrimSpace(match[1])
-	}
-	looseMatches := looseEndPattern.FindAllStringSubmatch(text, -1)
-	uniqueEnds := map[int64]string{}
-	for _, match := range looseMatches {
-		if len(match) != 2 {
-			continue
-		}
-		if parsed := parseDate(match[1], loc); parsed != nil {
-			uniqueEnds[parsed.Unix()] = strings.TrimSpace(match[1])
-		}
-	}
-	if len(uniqueEnds) == 1 {
-		for timestamp, raw := range uniqueEnds {
-			value := time.Unix(timestamp, 0).In(loc)
-			end, endRaw = &value, raw
-		}
-	} else if len(uniqueEnds) > 1 {
-		// Conflicting registration deadlines on one page are not safe enough for
-		// countdown reminders. Keep the field unpublished until a later source
-		// resolves the conflict.
+	start, startRaw, end, endRaw := extractDateRange(text, loc, dateRangePattern, startPattern, endPattern)
+	uniqueEnds := looseRegistrationEnds(text, loc)
+	switch len(uniqueEnds) {
+	case 1:
+		end, endRaw = uniqueEnds[0].When, uniqueEnds[0].Raw
+	case 0:
+		// no loose deadline found; keep whatever the strict patterns produced
+	default:
+		// Conflicting registration deadlines on one page are not safe enough
+		// for countdown reminders. Keep the field unpublished until a later
+		// source resolves the conflict.
 		end, endRaw = nil, ""
 	}
 	return start, startRaw, end, endRaw
 }
 
 func extractCompetitionDates(text string, loc *time.Location) (*time.Time, string, *time.Time, string) {
-	if match := competitionRangePattern.FindStringSubmatch(text); len(match) == 3 {
+	return extractDateRange(text, loc, competitionRangePattern, competitionStartPattern, competitionEndPattern)
+}
+
+// extractDateRange parses a (start, end) date pair from text using a range
+// pattern first, then falling back to individual start/end patterns. It is
+// shared by registration and competition date extraction so the two paths
+// cannot drift in parsing behavior.
+func extractDateRange(text string, loc *time.Location, rangePattern, startPat, endPat *regexp.Regexp) (*time.Time, string, *time.Time, string) {
+	if match := rangePattern.FindStringSubmatch(text); len(match) == 3 {
 		return parseDate(match[1], loc), strings.TrimSpace(match[1]), parseDate(match[2], loc), strings.TrimSpace(match[2])
 	}
 	var start, end *time.Time
 	var startRaw, endRaw string
-	if match := competitionStartPattern.FindStringSubmatch(text); len(match) == 2 {
+	if match := startPat.FindStringSubmatch(text); len(match) == 2 {
 		start, startRaw = parseDate(match[1], loc), strings.TrimSpace(match[1])
 	}
-	if match := competitionEndPattern.FindStringSubmatch(text); len(match) == 2 {
+	if match := endPat.FindStringSubmatch(text); len(match) == 2 {
 		end, endRaw = parseDate(match[1], loc), strings.TrimSpace(match[1])
 	}
 	return start, startRaw, end, endRaw
 }
 
-func registrationEndDates(text string, loc *time.Location) []*time.Time {
+type datedEvidence struct {
+	When *time.Time
+	Raw  string
+}
+
+// looseRegistrationEnds collects every registration deadline hint on the
+// page using the loose pattern. The caller decides whether a single value
+// can be trusted or conflicting values must be discarded.
+func looseRegistrationEnds(text string, loc *time.Location) []datedEvidence {
 	seen := map[int64]bool{}
-	var result []*time.Time
+	var result []datedEvidence
 	for _, match := range looseEndPattern.FindAllStringSubmatch(text, -1) {
 		if len(match) != 2 {
 			continue
@@ -630,7 +625,16 @@ func registrationEndDates(text string, loc *time.Location) []*time.Time {
 			continue
 		}
 		seen[parsed.Unix()] = true
-		result = append(result, parsed)
+		result = append(result, datedEvidence{When: parsed, Raw: strings.TrimSpace(match[1])})
+	}
+	return result
+}
+
+func registrationEndDates(text string, loc *time.Location) []*time.Time {
+	entries := looseRegistrationEnds(text, loc)
+	result := make([]*time.Time, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, entry.When)
 	}
 	return result
 }
@@ -958,10 +962,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return "暂未公布"
-}
-
-func dayStart(value time.Time) time.Time {
-	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, value.Location())
 }
 
 func YearFromText(text string) int {

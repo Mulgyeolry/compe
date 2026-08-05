@@ -91,3 +91,27 @@ func TestRenderUserDeliveryDoesNotEmitBrokenLocalActionLinks(t *testing.T) {
 		t.Fatalf("local delivery exposed broken action links: %s", body)
 	}
 }
+
+func TestRenderSourceAlertListsEveryProblem(t *testing.T) {
+	subject, body, err := RenderSourceAlert([]SourceHealthProblem{
+		{ID: "ccf-csp", Name: "CCF CSP 官网", FailureCount: 5, FailureLimit: 3},
+		{ID: "tianchi", Name: "阿里云天池", FailureCount: 3, FailureLimit: 3},
+	}, "2026-08-05 20:00:00 CST")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(subject, "数据源连续失败告警") {
+		t.Fatalf("unexpected subject %q", subject)
+	}
+	for _, marker := range []string{"CCF CSP 官网", "阿里云天池", "连续失败 5 次", "连续失败 3 次", "2026-08-05 20:00:00"} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("source alert body missing %q: %s", marker, body)
+		}
+	}
+}
+
+func TestRenderSourceAlertRejectsEmptyProblems(t *testing.T) {
+	if _, _, err := RenderSourceAlert(nil, "now"); err == nil {
+		t.Fatal("empty problem list must be rejected")
+	}
+}

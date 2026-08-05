@@ -2,6 +2,7 @@ package fetcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -100,5 +101,95 @@ func TestPDFSegmentsPreservePageNumbers(t *testing.T) {
 	segments := buildPDFSegments("第一页赛事介绍\f第二页报名截止时间为2026年9月20日")
 	if len(segments) != 2 || segments[0].Page != 1 || segments[1].Page != 2 || !strings.Contains(segments[1].Text, "报名截止") {
 		t.Fatalf("unexpected PDF segments: %#v", segments)
+	}
+}
+
+func TestAntiBotDetectedRecognizesChallengePages(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		blocked bool
+	}{
+		{"normal announcement", `<html><title>2026 ICPC 报名通知</title><p>欢迎报名</p>`, false},
+		{"cloudflare just a moment", `<html><body>Checking your browser... Just a moment</body>`, true},
+		{"chinese captcha", `<html><body>请完成验证码，以继续访问</body>`, true},
+		{"js challenge", `<html><body>Please enable JavaScript to continue</body>`, true},
+		{"security verification", `<html><body>当前环境有风险，请完成安全验证</body>`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := antiBotDetected([]byte(tc.body)); got != tc.blocked {
+				t.Fatalf("antiBotDetected() = %v, want %v", got, tc.blocked)
+			}
+		})
+	}
+}
+
+func TestFetchSurfacesErrAntiBotForChallengePage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, `<html><body>请开启 JavaScript 以继续</body></html>`)
+	}))
+	defer server.Close()
+	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1 << 20}
+	_, err := collector.Fetch(context.Background(), server.URL)
+	if !errors.Is(err, ErrAntiBot) {
+		t.Fatalf("Fetch() error = %v, want ErrAntiBot", err)
+	}
+}
+
+func TestRetryableStatus(t *testing.T) {
+	cases := map[int]bool{
+		http.StatusOK:                  false,
+		http.StatusNotFound:            false,
+		http.StatusForbidden:           false,
+		http.StatusTooManyRequests:     true,
+		http.StatusRequestTimeout:      true,
+		http.StatusInternalServerError: true,
+		http.StatusBadGateway:          true,
+	}
+	for status, want := range cases {
+		if got := retryableStatus(status); got != want {
+			t.Fatalf("retryableStatus(%d) = %v, want %v", status, got, want)
+		}
+	}
+}
+
+// TestFetchDoesNotMistakeResourceURLsForAntiBot guards against a regression
+// where "安全验证" / "验证码" appearing in a script or stylesheet URL on an
+// otherwise legitimate page caused a false ErrAntiBot. Detection must run on
+// the visible page text, never on the raw HTML.
+func TestFetchDoesNotMistakeResourceURLsForAntiBot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, `<html><head>
+<link rel="stylesheet" href="/static/js/security_verify/js/index.css">
+<script src="/static/js/captcha_verify.js"></script>
+</head><body><article>2026 CCF CCSP 竞赛报名通知，报名时间 2026-09-15 至 2026-10-12。</article></body></html>`)
+	}))
+	defer server.Close()
+	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1 << 20}
+	doc, err := collector.Fetch(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("Fetch() unexpectedly rejected legitimate page: %v", err)
+	}
+	if !strings.Contains(doc.Text, "CCSP") {
+		t.Fatalf("expected page body to be extracted, got %q", doc.Text)
+	}
+}
+
+// TestFetchBlocksChallengePageInVisibleText confirms a page whose visible
+// text really is a challenge (not just a resource URL) is still rejected.
+func TestFetchBlocksChallengePageInVisibleText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, `<html><head><script src="/static/app.js"></script></head>
+<body><p>请完成安全验证，以继续访问该页面</p></body></html>`)
+	}))
+	defer server.Close()
+	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1 << 20}
+	_, err := collector.Fetch(context.Background(), server.URL)
+	if !errors.Is(err, ErrAntiBot) {
+		t.Fatalf("Fetch() error = %v, want ErrAntiBot", err)
 	}
 }

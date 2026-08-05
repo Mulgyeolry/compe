@@ -28,6 +28,34 @@ func TestRetentionCanBeExplicitlyDisabled(t *testing.T) {
 	}
 }
 
+func TestFetchRetriesAndAlertDefaults(t *testing.T) {
+	cfg := Config{}
+	applyDefaults(&cfg)
+	if cfg.Fetch.MaxRetries != 2 {
+		t.Fatalf("default fetch.max_retries = %d, want 2", cfg.Fetch.MaxRetries)
+	}
+	if cfg.Alert.ConsecutiveFailureLimit != 3 {
+		t.Fatalf("default alert.consecutive_failure_limit = %d, want 3", cfg.Alert.ConsecutiveFailureLimit)
+	}
+	if cfg.Discovery.AnnouncementFreshnessDays != 90 {
+		t.Fatalf("default discovery.announcement_freshness_days = %d, want 90", cfg.Discovery.AnnouncementFreshnessDays)
+	}
+}
+
+func TestInvalidFetchRetriesIsRejected(t *testing.T) {
+	cfg := Config{Fetch: Fetch{MaxRetries: 11}, Sources: []Source{{ID: "s", Name: "s", Kind: "page", URL: "https://example.com"}}}
+	if err := validate(&cfg); err == nil {
+		t.Fatal("fetch.max_retries=11 must be rejected")
+	}
+}
+
+func TestInvalidAlertThresholdIsRejected(t *testing.T) {
+	cfg := Config{Alert: Alert{ConsecutiveFailureLimit: 0}, Sources: []Source{{ID: "s", Name: "s", Kind: "page", URL: "https://example.com"}}}
+	if err := validate(&cfg); err == nil {
+		t.Fatal("alert.consecutive_failure_limit=0 must be rejected")
+	}
+}
+
 func TestWebConfigurationRequiresSecretsAndAbsoluteURL(t *testing.T) {
 	path := filepath.Join("..", "..", "sources.example.yaml")
 	t.Setenv("WEB_LISTEN_ADDR", ":8080")

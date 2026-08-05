@@ -27,6 +27,28 @@ type Fetch struct {
 	TimeoutSeconds int   `yaml:"timeout_seconds"`
 	MaxBytes       int64 `yaml:"max_bytes"`
 	MaxCandidates  int   `yaml:"max_candidates_per_source"`
+	// MaxRetries is the number of additional attempts made for transient
+	// network errors or 429/5xx responses. Retries use exponential backoff.
+	MaxRetries int `yaml:"max_retries"`
+}
+
+// Discovery controls how newly seen competitions are judged fresh enough to
+// notify about when their title carries no explicit year. A competition whose
+// title lacks a year is still notified if the page was first seen or published
+// within AnnouncementFreshnessDays, which distinguishes a current edition from
+// an archived page from a previous year.
+type Discovery struct {
+	AnnouncementFreshnessDays int `yaml:"announcement_freshness_days"`
+}
+
+// Alert controls operator notifications when a data source becomes unhealthy.
+// A source is considered failed when discovery or candidate fetch errors, and
+// the operator is notified only after the source has failed for
+// ConsecutiveFailureLimit consecutive scan cycles so a single flake does not
+// page anyone.
+type Alert struct {
+	Enabled                 bool `yaml:"enabled"`
+	ConsecutiveFailureLimit int  `yaml:"consecutive_failure_limit"`
 }
 
 type Keywords struct {
@@ -71,6 +93,8 @@ type Config struct {
 	HighDomains   []string       `yaml:"high_trust_domains"`
 	MediumDomains []string       `yaml:"medium_trust_domains"`
 	Fetch         Fetch          `yaml:"fetch"`
+	Alert         Alert          `yaml:"alert"`
+	Discovery     Discovery      `yaml:"discovery"`
 	Keywords      Keywords       `yaml:"keywords"`
 	Enrichment    Enrichment     `yaml:"enrichment"`
 	Retention     Retention      `yaml:"retention"`
@@ -120,6 +144,15 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Fetch.MaxCandidates == 0 {
 		cfg.Fetch.MaxCandidates = 40
+	}
+	if cfg.Fetch.MaxRetries == 0 {
+		cfg.Fetch.MaxRetries = 2
+	}
+	if cfg.Alert.ConsecutiveFailureLimit == 0 {
+		cfg.Alert.ConsecutiveFailureLimit = 3
+	}
+	if cfg.Discovery.AnnouncementFreshnessDays == 0 {
+		cfg.Discovery.AnnouncementFreshnessDays = 90
 	}
 	if cfg.Enrichment.MaxSources == 0 {
 		cfg.Enrichment.MaxSources = 5
@@ -204,6 +237,15 @@ func validate(cfg *Config) error {
 		if len(cfg.Enrichment.AllowedDomains) == 0 {
 			return errors.New("enrichment.allowed_domains must not be empty when enrichment is enabled")
 		}
+	}
+	if cfg.Fetch.MaxRetries < 0 || cfg.Fetch.MaxRetries > 10 {
+		return errors.New("fetch.max_retries must be between 0 and 10")
+	}
+	if cfg.Alert.ConsecutiveFailureLimit < 1 || cfg.Alert.ConsecutiveFailureLimit > 30 {
+		return errors.New("alert.consecutive_failure_limit must be between 1 and 30")
+	}
+	if cfg.Discovery.AnnouncementFreshnessDays < 1 || cfg.Discovery.AnnouncementFreshnessDays > 3650 {
+		return errors.New("discovery.announcement_freshness_days must be between 1 and 3650")
 	}
 	if cfg.Retention.Enabled {
 		if cfg.Retention.ObservationDays < 7 || cfg.Retention.ObservationDays > 3650 {

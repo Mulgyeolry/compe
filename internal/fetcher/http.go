@@ -27,10 +27,76 @@ type Collector interface {
 	Fetch(context.Context, string) (model.Document, error)
 }
 
+// ErrAntiBot marks a response that was intercepted by an anti-bot challenge
+// (CAPTCHA, JavaScript proof-of-work, IP block page) rather than a genuine
+// content or server error. Callers treat it as "do not retry blindly and do
+// not waste analysis on this page".
+var ErrAntiBot = errors.New("request blocked by anti-bot protection")
+
+// retryableStatus returns true when the HTTP status indicates a transient
+// failure that may succeed on a later attempt. 4xx client errors (other than
+// 408/429) are final and are not retried.
+func retryableStatus(statusCode int) bool {
+	switch {
+	case statusCode == http.StatusRequestTimeout, statusCode == http.StatusTooManyRequests:
+		return true
+	case statusCode >= 500 && statusCode <= 599:
+		return true
+	default:
+		return false
+	}
+}
+
+// antiBotPatterns match the page bodies that known bot-protection layers
+// return to a non-browser client. They are kept deliberately conservative:
+// a genuine competition announcement rarely contains these exact markers.
+var antiBotPatterns = []string{
+	"just a moment",
+	"cf-chl",
+	"_cf_chl_opt",
+	"请开启javascript",
+	"请启用javascript",
+	"enable javascript to continue",
+	"验证码",
+	"安全验证",
+	"人机验证",
+	"当前环境有风险",
+	"unusual traffic",
+}
+
+// antiBotDetected reports whether a successful (2xx) response body is actually
+// an anti-bot challenge page. Detection is performed on the raw bytes so it
+// works before any HTML extraction. Markers are matched both verbatim and
+// against a whitespace-stripped copy so that phrasing variations such as
+// "请开启 JavaScript" and "请开启javascript" are both recognised.
+func antiBotDetected(raw []byte) bool {
+	lower := bytes.ToLower(raw)
+	// A stripped copy is built lazily only when a verbatim match could
+	// plausibly need it; the common case (plain announcements) is cheap.
+	stripped := bytes.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			return -1
+		default:
+			return r
+		}
+	}, lower)
+	for _, marker := range antiBotPatterns {
+		if bytes.Contains(lower, []byte(marker)) {
+			return true
+		}
+		if stripped != nil && bytes.Contains(stripped, []byte(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
 type HTTPCollector struct {
 	client     *http.Client
 	searxngURL string
 	maxBytes   int64
+	maxRetries int
 }
 
 func NewHTTPCollector(cfg config.Config) *HTTPCollector {
@@ -46,6 +112,68 @@ func NewHTTPCollector(cfg config.Config) *HTTPCollector {
 		},
 		searxngURL: strings.TrimRight(cfg.SearxngURL, "/"),
 		maxBytes:   cfg.Fetch.MaxBytes,
+		maxRetries: cfg.Fetch.MaxRetries,
+	}
+}
+
+// doRequest executes the request with exponential-backoff retries. It retries
+// transient network errors and retryable HTTP statuses, and surfaces ErrAntiBot
+// when a 2xx response is actually an anti-bot challenge. The request body is
+// nil for every caller, so a clone per attempt is unnecessary; callers must
+// construct a fresh request each round if they need retry support.
+func (c *HTTPCollector) doRequest(ctx context.Context, target string, headers map[string]string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(1<<(attempt-1)) * time.Second
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, err
+		}
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+		resp, err := c.client.Do(req)
+		if err != nil {
+			lastErr = err
+			// Network errors are transient unless the context was cancelled.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		if resp.StatusCode/100 == 2 {
+			return resp, nil
+		}
+		if !retryableStatus(resp.StatusCode) || attempt == c.maxRetries {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+			resp.Body.Close()
+			if antiBotDetected(body) {
+				return nil, fmt.Errorf("%w (%s)", ErrAntiBot, resp.Status)
+			}
+			return nil, fmt.Errorf("request returned %s", resp.Status)
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 0))
+		resp.Body.Close()
+		lastErr = fmt.Errorf("request returned %s", resp.Status)
+	}
+	return nil, lastErr
+}
+
+// botHeaders are the request headers shared by every outgoing HTTP request.
+// A descriptive User-Agent keeps the crawler honest while still being treated
+// like a real client by naive UA filtering.
+func botHeaders() map[string]string {
+	return map[string]string{
+		"User-Agent":      "competition-assistant/1.0 (+competition monitoring; daily)",
+		"Accept":          "text/html,application/xhtml+xml,application/pdf,application/rss+xml;q=0.9,*/*;q=0.8",
+		"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 	}
 }
 
@@ -118,19 +246,11 @@ func candidateLinkPriority(title string) int {
 }
 
 func (c *HTTPCollector) discoverRSS(ctx context.Context, source config.Source) ([]model.Candidate, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source.URL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "competition-assistant/1.0")
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(ctx, source.URL, botHeaders())
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("rss returned %s", resp.Status)
-	}
 	feed, err := gofeed.NewParser().Parse(io.LimitReader(resp.Body, c.maxBytes))
 	if err != nil {
 		return nil, err
@@ -148,19 +268,11 @@ func (c *HTTPCollector) discoverRSS(ctx context.Context, source config.Source) (
 func (c *HTTPCollector) discoverSearch(ctx context.Context, source config.Source) ([]model.Candidate, error) {
 	query := strings.ReplaceAll(source.Query, "{year}", strconv.Itoa(time.Now().Year()))
 	endpoint := c.searxngURL + "/search?format=json&q=" + url.QueryEscape(query)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "competition-assistant/1.0")
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(ctx, endpoint, botHeaders())
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("searxng returned %s", resp.Status)
-	}
 	var payload struct {
 		Results []struct {
 			Title   string `json:"title"`
@@ -187,20 +299,11 @@ func (c *HTTPCollector) Fetch(ctx context.Context, target string) (model.Documen
 }
 
 func (c *HTTPCollector) fetchHTML(ctx context.Context, target string) (model.Document, *goquery.Document, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return model.Document{}, nil, err
-	}
-	req.Header.Set("User-Agent", "competition-assistant/1.0 (+competition monitoring; daily)")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/pdf,application/rss+xml;q=0.9,*/*;q=0.8")
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(ctx, target, botHeaders())
 	if err != nil {
 		return model.Document{}, nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return model.Document{}, nil, fmt.Errorf("fetch %s returned %s", target, resp.Status)
-	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBytes+1))
 	if err != nil {
 		return model.Document{}, nil, err
@@ -226,6 +329,12 @@ func (c *HTTPCollector) fetchHTML(ctx context.Context, target string) (model.Doc
 	parsed.Find("script,style,noscript,svg,nav,footer,aside").Remove()
 	title := normalizeSpace(parsed.Find("title").First().Text())
 	rawText := normalizeSpace(parsed.Find("body").Text())
+	// Anti-bot detection runs on the visible page text, never on the raw
+	// HTML, so resource URLs or script names that merely mention "验证码" or
+	// "安全验证" do not cause false positives on legitimate pages.
+	if antiBotDetected([]byte(rawText)) {
+		return model.Document{}, nil, fmt.Errorf("%w (%s)", ErrAntiBot, canonicalURL(target))
+	}
 	mainText, segments, listing := extractMainContent(parsed)
 	if mainText == "" {
 		mainText = rawText

@@ -231,6 +231,44 @@ func RenderTest(now time.Time) (string, string, error) {
 	return "[比赛资讯助手] 测试邮件", body.String(), nil
 }
 
+// SourceHealthProblem is one source that has failed for too many consecutive
+// scan cycles and therefore warrants an operator alert.
+type SourceHealthProblem struct {
+	ID           string
+	Name         string
+	FailureCount int
+	FailureLimit int
+}
+
+// RenderSourceAlert builds an operator notification listing every data source
+// that has exceeded its consecutive-failure threshold.
+func RenderSourceAlert(problems []SourceHealthProblem, timeLabel string) (string, string, error) {
+	if len(problems) == 0 {
+		return "", "", errors.New("cannot render a source alert with no problems")
+	}
+	var body bytes.Buffer
+	if err := sourceAlertTemplate.Execute(&body, struct {
+		Problems []SourceHealthProblem
+		Time     string
+	}{Problems: problems, Time: timeLabel}); err != nil {
+		return "", "", err
+	}
+	return "[比赛资讯助手] 数据源连续失败告警", body.String(), nil
+}
+
+var sourceAlertTemplate = template.Must(template.New("source-alert").Parse(`<!doctype html>
+<html lang="zh-CN"><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;color:#1f2937;line-height:1.65;max-width:640px;margin:auto;background:#f8fafc;padding:20px">
+<div style="background:#ffffff;border-radius:14px;padding:24px;border:1px solid #fecaca">
+<h2 style="margin-top:0;color:#b91c1c">数据源连续失败告警</h2>
+<p>以下数据源已连续多次扫描失败，比赛动态可能不再更新：</p>
+{{range .Problems}}<section style="border:1px solid #fecaca;border-radius:8px;padding:14px;margin:12px 0;background:#fff7f7">
+<p style="margin:0 0 6px"><strong>{{.Name}}</strong> <span style="color:#64748b;font-size:12px">({{.ID}})</span></p>
+<p style="margin:0;color:#b91c1c">连续失败 {{.FailureCount}} 次（阈值 {{.FailureLimit}} 次）</p>
+</section>{{end}}
+<p style="color:#64748b;font-size:12px">扫描时间：{{.Time}}</p>
+<p style="color:#64748b;font-size:12px">请检查对应网站是否更新了反爬策略、变更了页面结构，或需要更换数据源。</p>
+</div></body></html>`))
+
 func statusLabel(status model.Status) string {
 	switch status {
 	case model.StatusPreview:
