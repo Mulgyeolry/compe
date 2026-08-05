@@ -488,6 +488,78 @@ func fixedNow() time.Time {
 	return time.Date(2026, 8, 3, 8, 0, 0, 0, time.FixedZone("CST", 8*3600))
 }
 
+// TestCancelledNotificationIsRestoredOnReoptIn exercises the real service
+// flow: opting in enqueues a start notice, opting out cancels it, and opting
+// back in restores it to pending instead of leaving it cancelled.
+func TestCancelledNotificationIsRestoredOnReoptIn(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.Sources = nil
+	database := openStore(t, cfg.DBPath)
+	defer database.Close()
+	sender := &memorySender{}
+	app := service.New(cfg, database, fetcher.NewHTTPCollector(cfg), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	user := enableAllCategoryTestUser(t, database, app, "restore@example.com", fixedNow())
+	app.SetNow(fixedNow)
+
+	// Ensure start notifications are enabled for this user.
+	preferences, err := database.GetUserPreferences(context.Background(), user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferences.NotifyStarted = true
+	if err := database.SaveUserPreferences(context.Background(), preferences, fixedNow()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create an ongoing competition.
+	now := fixedNow()
+	if _, _, err := database.UpsertCompetition(context.Background(), model.Competition{
+		EntityKey:   "ongoing-2026",
+		Name:        "2026 全国大学生软件开发大赛",
+		Status:      model.StatusOngoing,
+		OfficialURL: "https://contest.example.com/2026",
+		Trust:       model.TrustHigh,
+	}, "test-src", now); err != nil {
+		t.Fatal(err)
+	}
+	competition, err := database.GetCompetition(context.Background(), "ongoing-2026")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Opt in: enqueues the start notice as pending.
+	if err := app.SetUserCompetitionDecision(context.Background(), user.ID, competition.ID, model.ParticipationParticipating); err != nil {
+		t.Fatal(err)
+	}
+	assertPendingCount(t, database, user.ID, 1)
+	// Opt out: the store cancels the pending notice.
+	if err := app.SetUserCompetitionDecision(context.Background(), user.ID, competition.ID, model.ParticipationDeclined); err != nil {
+		t.Fatal(err)
+	}
+	assertPendingCount(t, database, user.ID, 0)
+
+	// Opt back in: the cancelled notice must be restored to pending (the
+	// regression under test); before the fix it stayed cancelled and this
+	// assertion failed.
+	if err := app.SetUserCompetitionDecision(context.Background(), user.ID, competition.ID, model.ParticipationParticipating); err != nil {
+		t.Fatal(err)
+	}
+	assertPendingCount(t, database, user.ID, 1)
+}
+
+// assertPendingCount verifies the number of pending notification groups for a
+// user, which reflects whether the cancelled notice was restored.
+func assertPendingCount(t *testing.T, database *store.Store, userID int64, want int) {
+	t.Helper()
+	items, err := database.ListUserPendingItems(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != want {
+		t.Fatalf("pending notification groups = %d, want %d", len(items), want)
+	}
+}
+
 // TestYearlessFreshlyObservedCompetitionIsIngested is the regression guard for
 // the FirstSeen fallback. A brand-new competition with no year, no dates and
 // no publish date must not be rejected by isCurrentEdition just because its

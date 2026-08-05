@@ -391,9 +391,28 @@ func (s *Store) EnqueueUserCompetitionEvents(ctx context.Context, competitionID 
 		if dispatch.UserID < 1 || dispatch.Event.Type == "" || dispatch.Event.Key == "" {
 			continue
 		}
-		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO user_notifications(
+		// A previously cancelled notification (e.g. the user disabled the
+		// preference or declined participation) is restored to pending when the
+		// user re-enables the preference or opts back in. pending is left
+		// untouched to avoid duplicates, and sent/failed are never reset so a
+		// delivered notice is not resent and a retry schedule is not clobbered.
+		// A previously cancelled notification (e.g. the user disabled the
+		// preference or declined participation) is restored to pending when the
+		// user re-enables the preference or opts back in. pending is left
+		// untouched to avoid duplicates, and sent/failed are never reset so a
+		// delivered notice is not resent and a retry schedule is not clobbered.
+		result, err := tx.ExecContext(ctx, `INSERT INTO user_notifications(
 user_id,competition_id,event_type,event_key,delivery_group,status,last_error,due_at,created_at)
-VALUES(?,?,?,?,?,'pending','',?,?)`, dispatch.UserID, competitionID, dispatch.Event.Type, dispatch.Event.Key,
+VALUES(?,?,?,?,?,'pending','',?,?)
+ON CONFLICT(user_id,competition_id,event_type,event_key) DO UPDATE SET
+	delivery_group=excluded.delivery_group,
+	status='pending',
+	last_error='',
+	attempt_count=0,
+	due_at=excluded.due_at,
+	created_at=excluded.created_at,
+	sent_at=NULL
+WHERE user_notifications.status='cancelled'`, dispatch.UserID, competitionID, dispatch.Event.Type, dispatch.Event.Key,
 			dispatch.GroupKey, dispatch.DueAt.Unix(), now.Unix())
 		if err != nil {
 			return 0, err
