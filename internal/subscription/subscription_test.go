@@ -158,3 +158,81 @@ func TestStructuredKeywordAndAliasMatching(t *testing.T) {
 		t.Fatal("unrelated keyword matched")
 	}
 }
+
+// startedEventCompetition returns a competition that passes the profile filters
+// (development category, high trust, ongoing) and carries a start event.
+func startedEventCompetition() model.Competition {
+	return model.Competition{
+		Name:        "2026 全国大学生软件开发大赛",
+		Content:     "面向全国高校的软件开发比赛",
+		Status:      model.StatusOngoing,
+		OfficialURL: "https://contest.example.com/2026",
+		Trust:       model.TrustHigh,
+	}
+}
+
+// TestStartedNoticeRespectsNotifyStartedDisabled verifies the regression: a
+// user who participates but has NOT enabled start notifications must not
+// receive a competition_started event. The old code special-cased
+// competition_started so it was always enabled, bypassing NotifyStarted.
+func TestStartedNoticeRespectsNotifyStartedDisabled(t *testing.T) {
+	competition := startedEventCompetition()
+	preferences := model.UserPreferences{
+		Categories:    []string{"development"},
+		MinTrust:      model.TrustMedium,
+		NotifyStarted: false,
+	}
+	events := MatchingEventsForUser(preferences, competition, Profile(competition),
+		[]model.Event{{Type: "competition_started", Key: "started"}}, model.ParticipationParticipating, time.Now())
+	if len(events) != 0 {
+		t.Fatalf("start notice delivered despite NotifyStarted=false: %#v", events)
+	}
+}
+
+// TestStartedNoticeDeliveredWhenEnabledAndParticipating verifies that a
+// participating user with start notifications enabled receives the event.
+func TestStartedNoticeDeliveredWhenEnabledAndParticipating(t *testing.T) {
+	competition := startedEventCompetition()
+	preferences := model.UserPreferences{
+		Categories:    []string{"development"},
+		MinTrust:      model.TrustMedium,
+		NotifyStarted: true,
+	}
+	events := MatchingEventsForUser(preferences, competition, Profile(competition),
+		[]model.Event{{Type: "competition_started", Key: "started"}}, model.ParticipationParticipating, time.Now())
+	if len(events) != 1 || events[0].Type != "competition_started" {
+		t.Fatalf("expected one start notice, got %#v", events)
+	}
+}
+
+// TestStartedNoticeBlockedForUndecidedUser verifies the fix did not break the
+// participation gate: an enabled but undecided user still gets no start notice.
+func TestStartedNoticeBlockedForUndecidedUser(t *testing.T) {
+	competition := startedEventCompetition()
+	preferences := model.UserPreferences{
+		Categories:    []string{"development"},
+		MinTrust:      model.TrustMedium,
+		NotifyStarted: true,
+	}
+	events := MatchingEventsForUser(preferences, competition, Profile(competition),
+		[]model.Event{{Type: "competition_started", Key: "started"}}, model.ParticipationUndecided, time.Now())
+	if len(events) != 0 {
+		t.Fatalf("start notice delivered to an undecided user: %#v", events)
+	}
+}
+
+// TestStartedNoticeBlockedForDeclinedUser verifies a user who explicitly
+// declined does not receive the start notice.
+func TestStartedNoticeBlockedForDeclinedUser(t *testing.T) {
+	competition := startedEventCompetition()
+	preferences := model.UserPreferences{
+		Categories:    []string{"development"},
+		MinTrust:      model.TrustMedium,
+		NotifyStarted: true,
+	}
+	events := MatchingEventsForUser(preferences, competition, Profile(competition),
+		[]model.Event{{Type: "competition_started", Key: "started"}}, model.ParticipationDeclined, time.Now())
+	if len(events) != 0 {
+		t.Fatalf("start notice delivered to a declining user: %#v", events)
+	}
+}

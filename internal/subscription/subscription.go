@@ -155,7 +155,7 @@ func MatchingEventsForUser(preferences model.UserPreferences, competition model.
 	}
 	result := make([]model.Event, 0, len(events))
 	for _, event := range events {
-		enabled := event.Type == "competition_started" || eventEnabled(preferences, event.Type)
+		enabled := eventEnabled(preferences, event.Type)
 		if enabled && EventDeliverable(competition, event.Type, decision, now) {
 			result = append(result, event)
 		}
