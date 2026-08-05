@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -37,12 +38,16 @@ func TestMergeAIChunkResultsRejectsConflictingFactValues(t *testing.T) {
 	second.Facts.RegistrationEnd = AIFact{Value: "2026年9月20日", Evidence: "报名截止2026年9月20日", Edition: "2026", Confidence: "high"}
 	second.RawResponses = []string{"second"}
 	second.SegmentIDs = []string{"html-2"}
-	merged := mergeAIChunkResults([]AIResult{first, second})
+	merged, conflicted := mergeAIChunkResults([]AIResult{first, second})
 	if merged.Facts.RegistrationEnd.Value != "" {
 		t.Fatalf("conflicting deadline survived: %#v", merged.Facts.RegistrationEnd)
 	}
-	if len(merged.Rejections) != 1 || merged.Rejections[0].Field != "facts.registration_end" {
+	if len(merged.Rejections) != 1 || merged.Rejections[0].Field != "facts.registration_end" ||
+		!strings.Contains(merged.Rejections[0].Reason, "unresolved") {
 		t.Fatalf("conflict was not audited: %#v", merged.Rejections)
+	}
+	if len(conflicted) != 1 || conflicted[0] != "facts.registration_end" {
+		t.Fatalf("conflicted fields not reported: %v", conflicted)
 	}
 	if len(merged.RawResponses) != 2 || len(merged.SegmentIDs) != 2 {
 		t.Fatalf("chunk audit data missing: %#v", merged)

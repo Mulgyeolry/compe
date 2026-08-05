@@ -28,6 +28,29 @@ func IsPendingCandidateError(err error) bool {
 	return errors.As(err, &target)
 }
 
+// PartialEnrichmentError reports an extraction that produced usable results
+// even though not every selected segment was fully analyzed. Callers must
+// treat the accompanying AIResult as acceptable for stable fields but must
+// schedule a retry before any lifecycle conclusion is trusted. A plain error
+// means not enough results were available to use anything.
+type PartialEnrichmentError struct {
+	// FailedSegments lists the IDs of the segments whose extraction failed.
+	FailedSegments []string
+	// ConflictedFields lists single-value fact fields whose cross-segment
+	// consensus was a tie and therefore could not be resolved.
+	ConflictedFields []string
+}
+
+func (e *PartialEnrichmentError) Error() string {
+	return fmt.Sprintf("llm extraction partially deferred: %d failed segment(s), %d unresolved field(s)",
+		len(e.FailedSegments), len(e.ConflictedFields))
+}
+
+func IsPartialEnrichmentError(err error) bool {
+	var target *PartialEnrichmentError
+	return errors.As(err, &target)
+}
+
 type AIDocumentType string
 
 const (

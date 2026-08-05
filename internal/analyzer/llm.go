@@ -141,8 +141,6 @@ func (l *LLM) Enrich(ctx context.Context, candidate model.Candidate, doc model.D
 		raw    string
 		err    error
 	}
-	requestCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	jobs := make(chan int)
 	results := make(chan chunkResult, len(segments))
 	workerCount := min(2, len(segments))
@@ -152,11 +150,11 @@ func (l *LLM) Enrich(ctx context.Context, candidate model.Candidate, doc model.D
 		go func() {
 			defer workers.Done()
 			for index := range jobs {
-				result, raw, err := l.enrichSegment(requestCtx, candidate, doc, segments[index])
+				// Each segment owns its own 120s timeout inside
+				// enrichSegment. A failing segment must not cancel its
+				// siblings: the results are gathered and merged afterwards.
+				result, raw, err := l.enrichSegment(ctx, candidate, doc, segments[index])
 				results <- chunkResult{index: index, result: result, raw: raw, err: err}
-				if err != nil {
-					cancel()
-				}
 			}
 		}()
 	}
@@ -165,7 +163,7 @@ func (l *LLM) Enrich(ctx context.Context, candidate model.Candidate, doc model.D
 		for index := range segments {
 			select {
 			case jobs <- index:
-			case <-requestCtx.Done():
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -176,27 +174,79 @@ func (l *LLM) Enrich(ctx context.Context, candidate model.Candidate, doc model.D
 	}()
 	collected := make([]chunkResult, 0, len(segments))
 	for result := range results {
-		if result.err != nil {
-			l.recordFailure()
-			return AIResult{}, result.err
-		}
 		collected = append(collected, result)
 	}
+	// A parent-context cancellation must terminate the whole extraction and
+	// surface as a plain context error, never as usable partial results.
+	if err := ctx.Err(); err != nil {
+		return AIResult{}, err
+	}
 	if len(collected) != len(segments) {
-		if err := ctx.Err(); err != nil {
-			return AIResult{}, err
-		}
 		return AIResult{}, fmt.Errorf("llm analyzed %d of %d document segments", len(collected), len(segments))
 	}
 	sort.Slice(collected, func(i, j int) bool { return collected[i].index < collected[j].index })
-	parts := make([]AIResult, 0, len(collected))
+	parts := make([]AIResult, 0, len(segments))
+	var failedSegments []string
+	successCount := 0
 	for _, item := range collected {
+		if item.err != nil {
+			failedSegments = append(failedSegments, segments[item.index].ID)
+			continue
+		}
+		successCount++
 		item.result.RawResponses = []string{item.raw}
 		item.result.SegmentIDs = []string{segments[item.index].ID}
 		parts = append(parts, item.result)
 	}
+	if successCount == 0 || successCount*2 < len(segments) {
+		// Not enough successful segments to trust any result. Record a single
+		// failure (not one per failed segment) and reject the whole page.
+		l.recordFailure()
+		return AIResult{}, fmt.Errorf("llm analyzed %d of %d document segments: failed segments %v",
+			successCount, len(segments), failedSegments)
+	}
 	l.recordSuccess()
-	return mergeAIChunkResults(parts), nil
+	merged, conflictedFields := mergeAIChunkResults(parts)
+	// Attach audit entries for every failed segment so a partial result can be
+	// inspected and, crucially, retried on the next scan.
+	for _, item := range collected {
+		if item.err == nil {
+			continue
+		}
+		segmentID := segments[item.index].ID
+		reason := truncateRunes(item.err.Error(), 500)
+		merged.Rejections = append(merged.Rejections, model.AnalysisRejection{
+			Field:  "segments." + segmentID,
+			Reason: "segment extraction failed",
+			Value:  reason,
+		})
+		if strings.TrimSpace(item.raw) != "" {
+			merged.RawResponses = append(merged.RawResponses, truncateRunes(item.raw, 16000))
+		}
+		merged.SegmentIDs = append(merged.SegmentIDs, segmentID)
+	}
+	// A failed segment may have contained the updated registration deadline or
+	// start state. Withhold lifecycle facts and events until a later scan can
+	// fully analyze the document, so no notice is sent prematurely.
+	withholdLifecycle := len(failedSegments) > 0
+	// Unresolved ties over identity or lifecycle facts are equally unsafe:
+	// they must not advance any lifecycle state either.
+	if !withholdLifecycle && lifecycleFactConflict(conflictedFields) {
+		withholdLifecycle = true
+	}
+	if withholdLifecycle {
+		clearLifecycleFacts(&merged)
+		merged.Rejections = append(merged.Rejections, model.AnalysisRejection{
+			Field:  "lifecycle",
+			Reason: "lifecycle facts and events withheld because selected segments were not fully analyzed",
+		})
+	}
+	// Return an untyped nil error on complete success so callers never observe
+	// a typed-nil *PartialEnrichmentError as a non-nil error.
+	if len(failedSegments) > 0 || len(conflictedFields) > 0 {
+		return merged, &PartialEnrichmentError{FailedSegments: failedSegments, ConflictedFields: conflictedFields}
+	}
+	return merged, nil
 }
 
 func (l *LLM) enrichSegment(ctx context.Context, candidate model.Candidate, doc model.Document, segment model.DocumentSegment) (AIResult, string, error) {
@@ -364,17 +414,21 @@ func selectAnalysisSegments(candidate model.Candidate, doc model.Document, limit
 	return selected
 }
 
-func mergeAIChunkResults(parts []AIResult) AIResult {
+// mergeAIChunkResults combines per-segment extractions into one result using
+// deterministic cross-segment consensus for every single-value fact field.
+// The returned slice names the fields whose different values tied and therefore
+// could not be resolved. The result must not depend on the order of parts.
+func mergeAIChunkResults(parts []AIResult) (AIResult, []string) {
 	if len(parts) == 0 {
-		return AIResult{}
+		return AIResult{}, nil
 	}
 	merged := AIResult{SchemaVersion: AIAnalyzerVersion}
 	documentTypes := make(map[AIDocumentType]int)
 	sourceRoles := make(map[AISourceRole]int)
-	conflicted := make(map[string]bool)
 	eventSeen := make(map[string]bool)
 	rejectionReasons := make(map[string]bool)
 	computerRelatedVotes, announcementVotes, fitTotal := 0, 0, 0
+	var conflictedFields []string
 	for _, part := range parts {
 		documentTypes[part.DocumentType]++
 		sourceRoles[part.SourceRole]++
@@ -385,24 +439,35 @@ func mergeAIChunkResults(parts []AIResult) AIResult {
 			announcementVotes++
 		}
 		fitTotal += min(100, max(0, part.FitScore))
-		mergeChunkFact("recommendation", &merged.Recommendation, part.Recommendation, conflicted, &merged.Rejections)
-		mergeChunkFact("identity.name", &merged.Identity.Name, part.Identity.Name, conflicted, &merged.Rejections)
-		mergeChunkFact("identity.series", &merged.Identity.Series, part.Identity.Series, conflicted, &merged.Rejections)
-		mergeChunkFact("identity.edition", &merged.Identity.Edition, part.Identity.Edition, conflicted, &merged.Rejections)
-		mergeChunkFact("identity.organizer", &merged.Identity.Organizer, part.Identity.Organizer, conflicted, &merged.Rejections)
-		mergeChunkFact("identity.track", &merged.Identity.Track, part.Identity.Track, conflicted, &merged.Rejections)
-		mergeChunkFact("identity.group", &merged.Identity.Group, part.Identity.Group, conflicted, &merged.Rejections)
-		mergeChunkFact("identity.scope", &merged.Identity.Scope, part.Identity.Scope, conflicted, &merged.Rejections)
-		mergeChunkFact("identity.region", &merged.Identity.Region, part.Identity.Region, conflicted, &merged.Rejections)
-		mergeChunkFact("facts.published_at", &merged.Facts.PublishedAt, part.Facts.PublishedAt, conflicted, &merged.Rejections)
-		mergeChunkFact("facts.registration_start", &merged.Facts.RegistrationStart, part.Facts.RegistrationStart, conflicted, &merged.Rejections)
-		mergeChunkFact("facts.registration_end", &merged.Facts.RegistrationEnd, part.Facts.RegistrationEnd, conflicted, &merged.Rejections)
-		mergeChunkFact("facts.competition_start", &merged.Facts.CompetitionStart, part.Facts.CompetitionStart, conflicted, &merged.Rejections)
-		mergeChunkFact("facts.competition_end", &merged.Facts.CompetitionEnd, part.Facts.CompetitionEnd, conflicted, &merged.Rejections)
-		mergeChunkFact("facts.team_requirement", &merged.Facts.TeamRequirement, part.Facts.TeamRequirement, conflicted, &merged.Rejections)
-		mergeChunkFact("facts.fee", &merged.Facts.Fee, part.Facts.Fee, conflicted, &merged.Rejections)
-		mergeChunkFact("facts.eligibility", &merged.Facts.Eligibility, part.Facts.Eligibility, conflicted, &merged.Rejections)
-		mergeChunkFact("facts.competition_contents", &merged.Facts.CompetitionContents, part.Facts.CompetitionContents, conflicted, &merged.Rejections)
+	}
+	singleValueFacts := []singleValueFact{
+		{Field: "recommendation", Get: func(p AIResult) AIFact { return p.Recommendation }, Set: func(r *AIResult, f AIFact) { r.Recommendation = f }},
+		{Field: "identity.name", Get: func(p AIResult) AIFact { return p.Identity.Name }, Set: func(r *AIResult, f AIFact) { r.Identity.Name = f }},
+		{Field: "identity.series", Get: func(p AIResult) AIFact { return p.Identity.Series }, Set: func(r *AIResult, f AIFact) { r.Identity.Series = f }},
+		{Field: "identity.edition", Get: func(p AIResult) AIFact { return p.Identity.Edition }, Set: func(r *AIResult, f AIFact) { r.Identity.Edition = f }},
+		{Field: "identity.organizer", Get: func(p AIResult) AIFact { return p.Identity.Organizer }, Set: func(r *AIResult, f AIFact) { r.Identity.Organizer = f }},
+		{Field: "identity.track", Get: func(p AIResult) AIFact { return p.Identity.Track }, Set: func(r *AIResult, f AIFact) { r.Identity.Track = f }},
+		{Field: "identity.group", Get: func(p AIResult) AIFact { return p.Identity.Group }, Set: func(r *AIResult, f AIFact) { r.Identity.Group = f }},
+		{Field: "identity.scope", Get: func(p AIResult) AIFact { return p.Identity.Scope }, Set: func(r *AIResult, f AIFact) { r.Identity.Scope = f }},
+		{Field: "identity.region", Get: func(p AIResult) AIFact { return p.Identity.Region }, Set: func(r *AIResult, f AIFact) { r.Identity.Region = f }},
+		{Field: "facts.published_at", Get: func(p AIResult) AIFact { return p.Facts.PublishedAt }, Set: func(r *AIResult, f AIFact) { r.Facts.PublishedAt = f }},
+		{Field: "facts.registration_start", Get: func(p AIResult) AIFact { return p.Facts.RegistrationStart }, Set: func(r *AIResult, f AIFact) { r.Facts.RegistrationStart = f }},
+		{Field: "facts.registration_end", Get: func(p AIResult) AIFact { return p.Facts.RegistrationEnd }, Set: func(r *AIResult, f AIFact) { r.Facts.RegistrationEnd = f }},
+		{Field: "facts.competition_start", Get: func(p AIResult) AIFact { return p.Facts.CompetitionStart }, Set: func(r *AIResult, f AIFact) { r.Facts.CompetitionStart = f }},
+		{Field: "facts.competition_end", Get: func(p AIResult) AIFact { return p.Facts.CompetitionEnd }, Set: func(r *AIResult, f AIFact) { r.Facts.CompetitionEnd = f }},
+		{Field: "facts.team_requirement", Get: func(p AIResult) AIFact { return p.Facts.TeamRequirement }, Set: func(r *AIResult, f AIFact) { r.Facts.TeamRequirement = f }},
+		{Field: "facts.fee", Get: func(p AIResult) AIFact { return p.Facts.Fee }, Set: func(r *AIResult, f AIFact) { r.Facts.Fee = f }},
+		{Field: "facts.eligibility", Get: func(p AIResult) AIFact { return p.Facts.Eligibility }, Set: func(r *AIResult, f AIFact) { r.Facts.Eligibility = f }},
+		{Field: "facts.competition_contents", Get: func(p AIResult) AIFact { return p.Facts.CompetitionContents }, Set: func(r *AIResult, f AIFact) { r.Facts.CompetitionContents = f }},
+	}
+	for _, field := range singleValueFacts {
+		winner, conflict := consensusFact(field.Field, parts, field.Get, &merged.Rejections)
+		field.Set(&merged, winner)
+		if conflict {
+			conflictedFields = append(conflictedFields, field.Field)
+		}
+	}
+	for _, part := range parts {
 		for _, event := range part.Events {
 			key := string(event.Type) + "|" + event.Edition + "|" + normalize(event.Evidence)
 			if !eventSeen[key] {
@@ -422,31 +487,143 @@ func mergeAIChunkResults(parts []AIResult) AIResult {
 			merged.RejectionReason += reason
 		}
 	}
+	sort.Strings(conflictedFields)
 	merged.ComputerRelated = computerRelatedVotes*2 >= len(parts)
 	merged.CompetitionAnnouncement = announcementVotes*2 >= len(parts)
 	merged.FitScore = fitTotal / len(parts)
 	merged.DocumentType = modeDocumentType(documentTypes)
 	merged.SourceRole = modeSourceRole(sourceRoles)
-	return merged
+	return merged, conflictedFields
 }
 
-func mergeChunkFact(field string, target *AIFact, incoming AIFact, conflicted map[string]bool, rejections *[]model.AnalysisRejection) {
-	if incoming.Value == "" || conflicted[field] {
-		return
-	}
-	if target.Value == "" {
-		*target = incoming
-		return
-	}
-	if normalizeIdentity(target.Value) == normalizeIdentity(incoming.Value) {
-		if confidenceRank(incoming.Confidence) > confidenceRank(target.Confidence) {
-			*target = incoming
+// singleValueFact describes one single-value AIFact field so consensus merging
+// can operate on every field explicitly without reflection.
+type singleValueFact struct {
+	Field string
+	Get   func(AIResult) AIFact
+	Set   func(*AIResult, AIFact)
+}
+
+// factCandidate groups the non-empty values a single fact field produced, along
+// with the evidence they came from, so a cross-segment majority can be found.
+type factCandidate struct {
+	key        string
+	value      string
+	edition    string
+	evidence   string
+	confidence string
+	count      int
+}
+
+// consensusFact collects every non-empty value for one field across segments,
+// groups them by normalized value + edition, and adopts the group with the
+// strict majority. A tie between distinct top groups clears the field and is
+// reported as an unresolved conflict. Selection never depends on part order.
+func consensusFact(field string, parts []AIResult, get func(AIResult) AIFact, rejections *[]model.AnalysisRejection) (AIFact, bool) {
+	groups := make(map[string]*factCandidate)
+	order := make([]string, 0)
+	for _, part := range parts {
+		fact := get(part)
+		if fact.Value == "" {
+			continue
 		}
-		return
+		value := normalizeIdentity(fact.Value)
+		edition := normalizeIdentity(fact.Edition)
+		if edition == "" {
+			if year := yearIn(fact.Evidence); year != 0 {
+				edition = fmt.Sprintf("%d", year)
+			}
+		}
+		key := value + "\x00" + edition
+		candidate, ok := groups[key]
+		if !ok {
+			candidate = &factCandidate{key: key, value: fact.Value, edition: fact.Edition, evidence: fact.Evidence, confidence: fact.Confidence}
+			groups[key] = candidate
+			order = append(order, key)
+		}
+		candidate.count++
+		if confidenceRank(fact.Confidence) > confidenceRank(candidate.confidence) {
+			candidate.confidence = fact.Confidence
+		}
+		if len(normalize(fact.Evidence)) > len(normalize(candidate.evidence)) {
+			candidate.evidence = fact.Evidence
+		}
 	}
-	conflicted[field] = true
-	*rejections = append(*rejections, model.AnalysisRejection{Field: field, Reason: "different document segments produced conflicting values", Value: target.Value + " | " + incoming.Value})
-	*target = AIFact{}
+	if len(groups) == 0 {
+		return AIFact{}, false
+	}
+	// Deterministic tie-breaking so results never depend on map iteration order.
+	sort.Strings(order)
+	bestKey, bestCount := order[0], 0
+	for _, key := range order {
+		count := groups[key].count
+		if count > bestCount {
+			bestKey, bestCount = key, count
+		}
+	}
+	ties := false
+	for _, key := range order {
+		if key != bestKey && groups[key].count == bestCount {
+			ties = true
+			break
+		}
+	}
+	if ties {
+		// Multiple distinct values share the top vote count: unresolved conflict.
+		var summary []string
+		for _, key := range order {
+			summary = append(summary, fmt.Sprintf("%s x%d", groups[key].value, groups[key].count))
+		}
+		*rejections = append(*rejections, model.AnalysisRejection{
+			Field:  field,
+			Reason: "unresolved conflicting values across document segments",
+			Value:  strings.Join(summary, ", "),
+		})
+		return AIFact{}, true
+	}
+	// A strict majority exists. Record that minority values were discarded.
+	if bestCount < len(parts) {
+		var discarded []string
+		for _, key := range order {
+			if key != bestKey {
+				discarded = append(discarded, fmt.Sprintf("%s x%d", groups[key].value, groups[key].count))
+			}
+		}
+		sort.Strings(discarded)
+		*rejections = append(*rejections, model.AnalysisRejection{
+			Field:  field,
+			Reason: "minority conflicting values discarded by cross-segment consensus",
+			Value:  strings.Join(discarded, ", "),
+		})
+	}
+	best := groups[bestKey]
+	// Confidence only selects the representative evidence for the winning value;
+	// it never lets a single high-confidence claim outvote a two-segment majority.
+	return AIFact{Value: best.value, Evidence: best.evidence, Edition: best.edition, Confidence: best.confidence}, false
+}
+
+// lifecycleFactConflict reports whether any unresolved conflict touches the
+// identity or lifecycle date facts that gate lifecycle state transitions.
+func lifecycleFactConflict(fields []string) bool {
+	for _, field := range fields {
+		switch field {
+		case "identity.name", "identity.series", "identity.edition",
+			"facts.registration_start", "facts.registration_end",
+			"facts.competition_start", "facts.competition_end":
+			return true
+		}
+	}
+	return false
+}
+
+// clearLifecycleFacts removes the lifecycle date facts and all events from a
+// partially analyzed result so no premature notice is sent.
+func clearLifecycleFacts(result *AIResult) {
+	result.Facts.RegistrationStart = AIFact{}
+	result.Facts.RegistrationEnd = AIFact{}
+	result.Facts.CompetitionStart = AIFact{}
+	result.Facts.CompetitionEnd = AIFact{}
+	result.Events = nil
 }
 
 func confidenceRank(value string) int {

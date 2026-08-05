@@ -179,9 +179,10 @@ func (a *Analyzer) Analyze(ctx context.Context, candidate model.Candidate, doc m
 		if !classificationCanUpdateCanonical(classification) {
 			return competition, false, nil
 		}
-		result, err := a.llm.Enrich(ctx, candidate, doc)
-		if err != nil {
-			return pendingCompetition(competition, doc, now, []string{raw}, fmt.Errorf("llm extraction deferred: %w", err))
+		result, extractionErr := a.llm.Enrich(ctx, candidate, doc)
+		partialError := IsPartialEnrichmentError(extractionErr)
+		if extractionErr != nil && !partialError {
+			return pendingCompetition(competition, doc, now, []string{raw}, fmt.Errorf("llm extraction deferred: %w", extractionErr))
 		}
 		applyClassification(&result, classification)
 		result.RawResponses = append([]string{truncateRunes(raw, 16000)}, result.RawResponses...)
@@ -195,6 +196,17 @@ func (a *Analyzer) Analyze(ctx context.Context, candidate model.Candidate, doc m
 		}
 		competition = a.mergeAI(competition, result, doc, now)
 		competition.ExtractionAudit = buildAnalysisAudit(result, doc, now, a.llm.ModelName(), competition.Facts)
+		if partialError {
+			// A partially analyzed result retains stable fields but must not be
+			// treated as a complete success: the failed segments (or unresolved
+			// ties) must be re-analyzed on the next scan before lifecycle state
+			// can be trusted. Signal the retry without clearing the preserved
+			// fields via pendingCompetition.
+			competition.ExtractionAudit.Error = extractionErr.Error()
+			return competition, true, &PendingCandidateError{
+				Err: fmt.Errorf("llm extraction partially deferred: %w", extractionErr),
+			}
+		}
 		if !result.ComputerRelated {
 			return competition, false, nil
 		}
@@ -519,6 +531,11 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 			base.Facts[model.FactRegistrationState] = fact
 		}
 	}
+	// Status is derived solely from the AI-validated phases, never from the
+	// rule-based fallback. Clearing it before NormalizeLifecycle prevents a
+	// legacy status from resurrecting phases when events were withheld (e.g. on
+	// a partially analyzed result).
+	base.Status = model.StatusUnknown
 	model.NormalizeLifecycle(&base)
 	base.EntityKey = EntityKey(base.Name, base.Organizer)
 	return base
