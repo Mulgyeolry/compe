@@ -136,7 +136,20 @@ func newTestFetchCollector(t *testing.T, serverURL string) *HTTPCollector {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewUnsafeHTTPCollectorForTest(parsed)
+	return &HTTPCollector{
+		client: &http.Client{
+			Timeout:       20 * time.Second,
+			CheckRedirect: publicCheckRedirect,
+			Transport:     &routeTransport{to: parsed},
+		},
+		serviceClient: &http.Client{
+			Timeout:       20 * time.Second,
+			CheckRedirect: serviceCheckRedirect,
+		},
+		searxngURL: parsed.String(),
+		maxBytes:   5 << 20,
+		maxRetries: 2,
+	}
 }
 
 // testBaseURL is a public-style base used as the fetch target in HTML/PDF tests;

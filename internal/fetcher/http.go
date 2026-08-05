@@ -305,53 +305,6 @@ func NewHTTPCollector(cfg config.Config) *HTTPCollector {
 	}
 }
 
-// routeToServer forwards every public request to target (an httptest server)
-// while preserving the original path and query and keeping the original host
-// on the response, so the SSRF pre-filter on extracted links sees a public
-// hostname. It is used only by NewHTTPCollectorForTest.
-type routeToServer struct{ to *url.URL }
-
-func (r *routeToServer) RoundTrip(req *http.Request) (*http.Response, error) {
-	proxy := *r.to
-	proxy.Path = req.URL.Path
-	proxy.RawQuery = req.URL.RawQuery
-	cloned := req.Clone(req.Context())
-	cloned.URL = &proxy
-	resp, err := http.DefaultTransport.RoundTrip(cloned)
-	if err != nil {
-		return nil, err
-	}
-	resp.Request = req
-	return resp, nil
-}
-
-// NewUnsafeHTTPCollectorForTest builds a collector whose public client routes
-// every request to target (typically an httptest server) instead of using the
-// SSRF-protected transport. It is ONLY for service-level tests that must reach
-// a local test server on a private address. The name is intentionally loud so
-// it cannot be mistaken for a production-safe constructor; production code must
-// use NewHTTPCollector and must never select this one via configuration or
-// environment variables.
-func NewUnsafeHTTPCollectorForTest(target *url.URL) *HTTPCollector {
-	return &HTTPCollector{
-		client: &http.Client{
-			Timeout:       20 * time.Second,
-			CheckRedirect: publicCheckRedirect,
-			Transport:     &routeToServer{to: target},
-		},
-		serviceClient: &http.Client{
-			Timeout:       20 * time.Second,
-			CheckRedirect: serviceCheckRedirect,
-		},
-		searxngURL: target.String(),
-		maxBytes:   5 << 20,
-		maxRetries: 2,
-	}
-}
-
-// doRequest executes a public, SSRF-protected request with exponential-backoff
-// retries. It is used for all untrusted targets (page/RSS sources, Fetch,
-// search-result candidates). See doRequestWithClient for the retry loop.
 // doRequest executes a public, SSRF-protected request. The initial target is
 // validated before any retry or dial, so an unsafe URL is rejected before any
 // network I/O.

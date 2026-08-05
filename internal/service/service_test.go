@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -62,13 +61,13 @@ func (m *memorySender) count() int {
 }
 
 func TestCSPRegistrationAndDuplicateSuppression(t *testing.T) {
-	page := `<html><head><title>第43次 CCF CSP 认证报名通知</title></head><body>
-<p>主办方：中国计算机学会。</p><p>报名已经开始。</p><p>报名时间：2026年8月3日 09:00至2026年8月20日 23:59。</p>
-<p>可单人参赛。比赛内容为算法和程序设计。</p></body></html>`
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, page) }))
-	defer server.Close()
+	doc := model.Document{
+		Title: "第43次 CCF CSP 认证报名通知",
+		URL:   testPageBase,
+		Text:  "主办方：中国计算机学会。报名已经开始。报名时间：2026年8月3日 09:00至2026年8月20日 23:59。可单人参赛。比赛内容为算法和程序设计。",
+	}
 
-	app, database, sender := newPageService(t, server.URL, "csp", "CCF CSP", "high")
+	app, database, sender := newPageService(t, func() model.Document { return doc }, "csp", "CCF CSP", "high")
 	defer database.Close()
 	ctx := context.Background()
 	if err := app.Run(ctx); err != nil {
@@ -86,16 +85,12 @@ func TestCSPRegistrationAndDuplicateSuppression(t *testing.T) {
 }
 
 func TestPreviewBecomesRegistration(t *testing.T) {
-	var mu sync.RWMutex
-	page := `<html><head><title>2026 华为 ICT 大赛</title></head><body><p>主办方：华为技术有限公司。</p>
-<p>新一届赛事即将启动，预计2026年9月开放报名，敬请期待。</p><p>比赛聚焦云计算和人工智能。</p></body></html>`
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		mu.RLock()
-		defer mu.RUnlock()
-		_, _ = io.WriteString(w, page)
-	}))
-	defer server.Close()
-	app, database, sender := newPageService(t, server.URL, "huawei", "华为 ICT", "high")
+	doc := model.Document{
+		Title: "2026 华为 ICT 大赛",
+		URL:   testPageBase,
+		Text:  "主办方：华为技术有限公司。新一届赛事即将启动，预计2026年9月开放报名，敬请期待。比赛聚焦云计算和人工智能。",
+	}
+	app, database, sender := newPageService(t, func() model.Document { return doc }, "huawei", "华为 ICT", "high")
 	defer database.Close()
 	ctx := context.Background()
 	if err := app.Run(ctx); err != nil {
@@ -104,10 +99,7 @@ func TestPreviewBecomesRegistration(t *testing.T) {
 	if sender.count() != 1 || !strings.Contains(sender.mails[0].body, "目前是预告，尚未正式开放报名。") {
 		t.Fatalf("preview notice missing: %#v", sender.mails)
 	}
-	mu.Lock()
-	page = `<html><head><title>2026 华为 ICT 大赛</title></head><body><p>主办方：华为技术有限公司。</p>
-<p>现已开放报名，报名时间：2026年8月4日至2026年10月20日。</p><p>每支队伍3人，比赛聚焦云计算和人工智能。</p></body></html>`
-	mu.Unlock()
+	doc.Text = "主办方：华为技术有限公司。现已开放报名，报名时间：2026年8月4日至2026年10月20日。每支队伍3人，比赛聚焦云计算和人工智能。"
 	if err := app.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -121,36 +113,43 @@ func TestPreviewBecomesRegistration(t *testing.T) {
 }
 
 func TestSearchFindsAgentCompetitionAndFiltersIrrelevantPage(t *testing.T) {
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	defer server.Close()
-	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// The result URL uses a public-style hostname; the test collector
-		// routes it back to the httptest server.
-		_, _ = io.WriteString(w, `{"results":[{"title":"2026 高校 AI Agent 应用创新赛报名通知","url":"https://contest.example.com/agent","content":"面向大学生的智能体和RAG应用比赛，现已开放报名"}]}`)
-	})
-	mux.HandleFunc("/agent", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `<html><head><title>2026 高校 AI Agent 应用创新赛</title></head><body><p>主办方：示范大学计算机学院。</p><p>现已开放报名，报名时间：2026年8月1日至2026年9月30日。</p><p>允许组队参赛，围绕AI Agent和RAG开发应用。</p></body></html>`)
-	})
+	agentDoc := model.Document{
+		Title: "2026 高校 AI Agent 应用创新赛",
+		URL:   testPageBase + "/agent",
+		Text:  "主办方：示范大学计算机学院。现已开放报名，报名时间：2026年8月1日至2026年9月30日。允许组队参赛，围绕AI Agent和RAG开发应用。",
+	}
+	cookingDoc := model.Document{
+		Title: "校园烹饪与厨艺大赛报名通知",
+		URL:   testPageBase + "/cooking",
+		Text:  "欢迎参加厨艺比赛，报名中。",
+	}
+	collector := &scriptedCollector{
+		discover: func(_ context.Context, source config.Source) ([]model.Candidate, error) {
+			if source.ID == "agent-search" {
+				return []model.Candidate{{SourceID: source.ID, SourceName: source.Name, Title: "2026 高校 AI Agent 应用创新赛报名通知", URL: agentDoc.URL, Snippet: "面向大学生的智能体和RAG应用比赛，现已开放报名"}}, nil
+			}
+			return []model.Candidate{{SourceID: source.ID, SourceName: source.Name, Title: cookingDoc.Title, URL: cookingDoc.URL, Snippet: cookingDoc.Text}}, nil
+		},
+		fetch: func(_ context.Context, target string) (model.Document, error) {
+			if target == agentDoc.URL {
+				return agentDoc, nil
+			}
+			return cookingDoc, nil
+		},
+	}
 
-	parsed, _ := url.Parse(server.URL)
 	cfg := baseConfig(t)
-	cfg.SearxngURL = server.URL
-	// The httptest host and the public-style search-result host are both
-	// medium-trust so the search-found agent competition is ingested.
-	cfg.MediumDomains = []string{parsed.Hostname(), "contest.example.com"}
+	// The search-result host is medium-trust so the search-found agent
+	// competition is ingested.
+	cfg.MediumDomains = []string{"contest.example.com"}
 	cfg.Sources = []config.Source{
 		{ID: "agent-search", Name: "Agent discovery", Kind: "search", Query: "AI Agent 比赛 报名", Limit: 10},
 		{ID: "cooking", Name: "烹饪比赛", Kind: "page", URL: testPageBase + "/cooking", Trust: "high", Limit: 5},
 	}
-	mux.HandleFunc("/cooking", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `<html><head><title>校园烹饪与厨艺大赛报名通知</title></head><body>欢迎参加厨艺比赛，报名中。</body></html>`)
-	})
 	database := openStore(t, cfg.DBPath)
 	defer database.Close()
 	sender := &memorySender{}
-	app := service.New(cfg, database, newTestCollector(t, server.URL), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := service.New(cfg, database, collector, analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableAllCategoryTestUser(t, database, app, "agent@example.com", fixedNow())
 	app.SetNow(fixedNow)
 	if err := app.Run(context.Background()); err != nil {
@@ -166,11 +165,12 @@ func TestSearchFindsAgentCompetitionAndFiltersIrrelevantPage(t *testing.T) {
 }
 
 func TestRegistrationMailFailureIsRetriedWithoutDuplicate(t *testing.T) {
-	page := `<html><head><title>2026 云原生软件开发挑战赛</title></head><body><p>主办方：示范云计算协会。</p>
-<p>报名中，报名时间：2026年8月1日至2026年8月10日。</p><p>组队参赛，使用Go后端和Kubernetes开发云原生应用。</p></body></html>`
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, page) }))
-	defer server.Close()
-	app, database, sender := newPageService(t, server.URL, "cloud", "云原生比赛", "high")
+	doc := model.Document{
+		Title: "2026 云原生软件开发挑战赛",
+		URL:   testPageBase,
+		Text:  "主办方：示范云计算协会。报名中，报名时间：2026年8月1日至2026年8月10日。组队参赛，使用Go后端和Kubernetes开发云原生应用。",
+	}
+	app, database, sender := newPageService(t, func() model.Document { return doc }, "cloud", "云原生比赛", "high")
 	defer database.Close()
 	ctx := context.Background()
 	sender.fail = true
@@ -203,20 +203,20 @@ func TestRegistrationMailFailureIsRetriedWithoutDuplicate(t *testing.T) {
 
 func TestLLMFailureStoresAndNotifiesPendingHighConfidenceCompetition(t *testing.T) {
 	var llmCalls int
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	defer server.Close()
-	mux.HandleFunc("/competition", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `<html><head><title>2026 CCF CSP 报名通知</title></head><body><p>报名已经开始。</p><p>报名时间：2026年8月3日至2026年8月30日。</p><p>算法和程序设计认证。</p></body></html>`)
-	})
-	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		llmCalls++
 		http.Error(w, "simulated model outage", http.StatusServiceUnavailable)
-	})
+	}))
+	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_MODEL", "test-model")
-	app, database, sender := newPageService(t, server.URL+"/competition", "csp-llm", "CCF CSP", "high")
+	doc := model.Document{
+		Title: "2026 CCF CSP 报名通知",
+		URL:   testPageBase,
+		Text:  "报名已经开始。报名时间：2026年8月3日至2026年8月30日。算法和程序设计认证。",
+	}
+	app, database, sender := newPageService(t, func() model.Document { return doc }, "csp-llm", "CCF CSP", "high")
 	defer database.Close()
 	if err := app.Run(context.Background()); err != nil {
 		t.Fatal(err)
@@ -227,14 +227,31 @@ func TestLLMFailureStoresAndNotifiesPendingHighConfidenceCompetition(t *testing.
 }
 
 func TestConflictingOfficialDatesAreNotScheduled(t *testing.T) {
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	defer server.Close()
-	page := func(deadline string) string {
-		return `<html><head><title>2026 软件开发创新赛</title></head><body><p>主办方：示范计算机协会。</p><p>报名中，报名时间：2026年8月1日至` + deadline + `。</p><p>组队参加软件开发比赛。</p></body></html>`
+	docA := model.Document{
+		Title: "2026 软件开发创新赛",
+		URL:   testPageBase + "/a",
+		Text:  "主办方：示范计算机协会。报名中，报名时间：2026年8月1日至2026年8月10日。组队参加软件开发比赛。",
 	}
-	mux.HandleFunc("/a", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, page("2026年8月10日")) })
-	mux.HandleFunc("/b", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, page("2026年8月12日")) })
+	docB := model.Document{
+		Title: "2026 软件开发创新赛",
+		URL:   testPageBase + "/b",
+		Text:  "主办方：示范计算机协会。报名中，报名时间：2026年8月1日至2026年8月12日。组队参加软件开发比赛。",
+	}
+	collector := &scriptedCollector{
+		discover: func(_ context.Context, source config.Source) ([]model.Candidate, error) {
+			doc := docA
+			if source.ID == "official-b" {
+				doc = docB
+			}
+			return []model.Candidate{{SourceID: source.ID, SourceName: source.Name, Title: doc.Title, URL: doc.URL, Snippet: doc.Text}}, nil
+		},
+		fetch: func(_ context.Context, target string) (model.Document, error) {
+			if target == docB.URL {
+				return docB, nil
+			}
+			return docA, nil
+		},
+	}
 	cfg := baseConfig(t)
 	cfg.Sources = []config.Source{
 		{ID: "official-a", Name: "官方来源 A", Kind: "page", URL: testPageBase + "/a", Trust: "high", Limit: 5},
@@ -243,7 +260,7 @@ func TestConflictingOfficialDatesAreNotScheduled(t *testing.T) {
 	database := openStore(t, cfg.DBPath)
 	defer database.Close()
 	sender := &memorySender{}
-	app := service.New(cfg, database, newTestCollector(t, server.URL), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := service.New(cfg, database, collector, analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableAllCategoryTestUser(t, database, app, "conflict@example.com", fixedNow())
 	app.SetNow(fixedNow)
 	if err := app.Run(context.Background()); err != nil {
@@ -259,11 +276,11 @@ func TestConflictingOfficialDatesAreNotScheduled(t *testing.T) {
 }
 
 func TestMultiUserCategoryMatching(t *testing.T) {
-	page := `<html><head><title>第43次 CCF CSP 认证报名通知</title></head><body>
-<p>主办方：中国计算机学会。</p><p>报名已经开始。</p><p>报名时间：2026年8月3日至2026年8月20日。</p>
-<p>可单人参赛。比赛内容为算法和程序设计。</p></body></html>`
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, page) }))
-	defer server.Close()
+	doc := model.Document{
+		Title: "第43次 CCF CSP 认证报名通知",
+		URL:   testPageBase,
+		Text:  "主办方：中国计算机学会。报名已经开始。报名时间：2026年8月3日至2026年8月20日。可单人参赛。比赛内容为算法和程序设计。",
+	}
 	cfg := baseConfig(t)
 	cfg.Sources = []config.Source{{ID: "csp", Name: "CCF CSP", Kind: "page", URL: testPageBase, Trust: "high", Limit: 10}}
 	database := openStore(t, cfg.DBPath)
@@ -272,7 +289,7 @@ func TestMultiUserCategoryMatching(t *testing.T) {
 	algorithmUser := createTestUser(t, database, "algorithm@example.com", "algorithm", now)
 	_ = createTestUser(t, database, "cloud@example.com", "cloud_native", now)
 	sender := &memorySender{}
-	app := service.New(cfg, database, newTestCollector(t, server.URL), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := service.New(cfg, database, pageCollector(func() model.Document { return doc }), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	manager, err := authn.New("0123456789abcdef0123456789abcdef")
 	if err != nil {
 		t.Fatal(err)
@@ -457,40 +474,66 @@ func enableAllCategoryTestUser(t *testing.T, database *store.Store, app *service
 	return user
 }
 
-func newPageService(t *testing.T, pageURL, id, name, trust string) (*service.Service, *store.Store, *memorySender) {
+func newPageService(t *testing.T, doc func() model.Document, id, name, trust string) (*service.Service, *store.Store, *memorySender) {
 	t.Helper()
 	cfg := baseConfig(t)
-	// The source URL uses a public-style host carrying the page path; the test
-	// collector routes it to the httptest server at pageURL.
-	parsedURL, err := url.Parse(pageURL)
-	if err != nil {
-		t.Fatal(err)
+	sourceURL := doc().URL
+	if sourceURL == "" {
+		sourceURL = testPageBase
 	}
-	sourceURL := testPageBase + parsedURL.Path
 	cfg.Sources = []config.Source{{ID: id, Name: name, Kind: "page", URL: sourceURL, Trust: trust, Limit: 10}}
 	database := openStore(t, cfg.DBPath)
 	sender := &memorySender{}
-	app := service.New(cfg, database, newTestCollector(t, pageURL), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := service.New(cfg, database, pageCollector(doc), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableAllCategoryTestUser(t, database, app, "fixture@example.com", fixedNow())
 	app.SetNow(fixedNow)
 	return app, database, sender
 }
 
 // testPageBase is a public-style base host used as the source URL in service
-// tests; newTestCollector routes it to the httptest server.
+// tests.
 const testPageBase = "https://contest.example.com"
 
-// newTestCollector builds a fetcher.Collector whose public client routes every
-// request to the given (httptest) server URL. This lets service tests reach a
-// local test server that the production SSRF-protected collector would reject
-// as a private address. It is test-only and must never be used in production.
-func newTestCollector(t *testing.T, targetURL string) fetcher.Collector {
-	t.Helper()
-	parsed, err := url.Parse(targetURL)
-	if err != nil {
-		t.Fatal(err)
+// scriptedCollector is a test-only fetcher.Collector that returns scripted
+// candidates and documents directly instead of parsing HTML, RSS or PDF. The
+// fetcher's own HTML/RSS/PDF behavior is covered by internal/fetcher tests.
+type scriptedCollector struct {
+	discover func(context.Context, config.Source) ([]model.Candidate, error)
+	fetch    func(context.Context, string) (model.Document, error)
+}
+
+func (c *scriptedCollector) Discover(ctx context.Context, source config.Source) ([]model.Candidate, error) {
+	return c.discover(ctx, source)
+}
+
+func (c *scriptedCollector) Fetch(ctx context.Context, target string) (model.Document, error) {
+	return c.fetch(ctx, target)
+}
+
+// pageCollector scripts a single non-listing "page" source: Discover emits one
+// candidate built from the page document and Fetch always returns the current
+// page document, so tests can change it between runs with a closure.
+func pageCollector(doc func() model.Document) fetcher.Collector {
+	return &scriptedCollector{
+		discover: func(_ context.Context, source config.Source) ([]model.Candidate, error) {
+			current := doc()
+			if current.IsListing {
+				return nil, nil
+			}
+			return []model.Candidate{{SourceID: source.ID, SourceName: source.Name, Title: current.Title, URL: current.URL, Snippet: truncateText(current.Text, 500)}}, nil
+		},
+		fetch: func(_ context.Context, _ string) (model.Document, error) {
+			return doc(), nil
+		},
 	}
-	return fetcher.NewUnsafeHTTPCollectorForTest(parsed)
+}
+
+func truncateText(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
 }
 
 func baseConfig(t *testing.T) config.Config {
@@ -595,13 +638,13 @@ func assertPendingCount(t *testing.T, database *store.Store, userID int64, want 
 // earliest observation time, so the freshness fallback has a value.
 func TestYearlessFreshlyObservedCompetitionIsIngested(t *testing.T) {
 	// Title deliberately carries no year, and the body has no dates.
-	page := `<html><head><title>华为软件精英挑战赛官网</title></head><body>
-<p>华为软件精英挑战赛，面向全球在校学生开放的算法竞技赛事。</p>
-<p>赛题围绕真实云场景下的资源调度与优化问题展开。</p></body></html>`
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, page) }))
-	defer server.Close()
+	doc := model.Document{
+		Title: "华为软件精英挑战赛官网",
+		URL:   testPageBase,
+		Text:  "华为软件精英挑战赛，面向全球在校学生开放的算法竞技赛事。赛题围绕真实云场景下的资源调度与优化问题展开。",
+	}
 
-	app, database, _ := newPageService(t, server.URL, "huawei-competition", "华为软件精英挑战赛", "high")
+	app, database, _ := newPageService(t, func() model.Document { return doc }, "huawei-competition", "华为软件精英挑战赛", "high")
 	defer database.Close()
 
 	if err := app.Run(context.Background()); err != nil {
