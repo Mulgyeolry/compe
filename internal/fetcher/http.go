@@ -41,10 +41,6 @@ var ErrAntiBot = errors.New("request blocked by anti-bot protection")
 // Callers and tests identify rejected requests with errors.Is(err, ErrUnsafeURL).
 var ErrUnsafeURL = errors.New("unsafe outbound URL")
 
-// errRejectRedirect is a sentinel used by the public CheckRedirect policy; it
-// is never returned to callers directly, only used to abort a redirect chain.
-var errRejectRedirect = errors.New("unsafe redirect target")
-
 // unsafeNetworks lists the address families that must never be dialed by the
 // public crawler. Everything here is either loopback, private, link-local,
 // metadata, multicast or otherwise non-public.
@@ -163,21 +159,40 @@ func publicRoundTripper(lookupIP func(context.Context, string) ([]net.IPAddr, er
 		if err != nil {
 			return nil, err
 		}
-		// Conservative: if any resolved address is unsafe, reject the whole
-		// target to avoid racing a DNS rebinding to a private IP.
-		for _, ip := range ips {
-			addr, ok := netip.AddrFromSlice(ip.IP)
-			if !ok {
-				continue
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("resolve %q: no IP addresses", host)
+		}
+		// Validate every resolved address. The result is rejected if any of
+		// them is unsafe, so a DNS rebinding that mixes public and private
+		// addresses cannot slip through.
+		validated := make([]netip.Addr, 0, len(ips))
+		for _, resolved := range ips {
+			if resolved.Zone != "" {
+				return nil, fmt.Errorf("%w: zoned address for %q", ErrUnsafeURL, host)
 			}
+			addr, ok := netip.AddrFromSlice(resolved.IP)
+			if !ok {
+				return nil, fmt.Errorf("resolve %q: invalid IP result", host)
+			}
+			addr = addr.Unmap()
 			if !isSafeIP(addr) {
 				return nil, fmt.Errorf("%w: private address %s for %q", ErrUnsafeURL, addr, host)
 			}
+			validated = append(validated, addr)
 		}
-		// Dial the validated IP directly so the transport does not re-resolve
-		// the hostname. TLS still verifies the certificate against the original
-		// hostname because the request URL is unchanged.
-		return dialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		// Dial each validated IP directly so the transport never re-resolves
+		// the hostname (which would defeat the IP check). TLS still verifies
+		// the certificate against the original hostname because the request
+		// URL is unchanged. Try each address in turn and fall back on failure.
+		var lastErr error
+		for _, addr := range validated {
+			conn, err := dialContext(ctx, network, net.JoinHostPort(addr.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
 	}
 	return transport
 }
@@ -310,12 +325,14 @@ func (r *routeToServer) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// NewHTTPCollectorForTest builds a collector whose public client routes every
-// request to target (typically an httptest server) instead of using the
-// SSRF-protected transport. It lets service-level tests reach a local test
-// server that would otherwise be rejected as a private address. Production code
-// must use NewHTTPCollector.
-func NewHTTPCollectorForTest(target *url.URL) *HTTPCollector {
+// NewUnsafeHTTPCollectorForTest builds a collector whose public client routes
+// every request to target (typically an httptest server) instead of using the
+// SSRF-protected transport. It is ONLY for service-level tests that must reach
+// a local test server on a private address. The name is intentionally loud so
+// it cannot be mistaken for a production-safe constructor; production code must
+// use NewHTTPCollector and must never select this one via configuration or
+// environment variables.
+func NewUnsafeHTTPCollectorForTest(target *url.URL) *HTTPCollector {
 	return &HTTPCollector{
 		client: &http.Client{
 			Timeout:       20 * time.Second,
@@ -335,12 +352,20 @@ func NewHTTPCollectorForTest(target *url.URL) *HTTPCollector {
 // doRequest executes a public, SSRF-protected request with exponential-backoff
 // retries. It is used for all untrusted targets (page/RSS sources, Fetch,
 // search-result candidates). See doRequestWithClient for the retry loop.
+// doRequest executes a public, SSRF-protected request. The initial target is
+// validated before any retry or dial, so an unsafe URL is rejected before any
+// network I/O.
 func (c *HTTPCollector) doRequest(ctx context.Context, target string, headers map[string]string) (*http.Response, error) {
+	if _, err := validatePublicURL(target); err != nil {
+		return nil, err
+	}
 	return c.doRequestWithClient(ctx, c.client, target, headers)
 }
 
 // doServiceRequest executes a request through the trusted client, used only to
-// talk to the configured SearxNG instance inside the trusted network.
+// talk to the configured SearxNG instance inside the trusted network. It must
+// NOT apply the public URL validation because SearxNG may live on a private
+// in-network address (e.g. http://searxng:8080).
 func (c *HTTPCollector) doServiceRequest(ctx context.Context, target string, headers map[string]string) (*http.Response, error) {
 	return c.doRequestWithClient(ctx, c.serviceClient, target, headers)
 }

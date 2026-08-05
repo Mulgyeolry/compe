@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestPDFUsesPdftotext(t *testing.T) {
@@ -31,8 +30,8 @@ func TestPDFUsesPdftotext(t *testing.T) {
 		_, _ = io.WriteString(w, "%PDF-simulated")
 	}))
 	defer server.Close()
-	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1024}
-	doc, err := collector.Fetch(context.Background(), server.URL+"/notice.pdf")
+	collector := newTestFetchCollector(t, server.URL)
+	doc, err := collector.Fetch(context.Background(), testBaseURL+"/notice.pdf")
 	if err != nil {
 		t.Fatal(err)
 	}

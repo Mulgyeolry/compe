@@ -39,8 +39,8 @@ func TestFetchExtractsArticleAndPublicationDate(t *testing.T) {
 </body></html>`)
 	}))
 	defer server.Close()
-	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1 << 20}
-	document, err := collector.Fetch(context.Background(), server.URL)
+	collector := newTestFetchCollector(t, server.URL)
+	document, err := collector.Fetch(context.Background(), testBaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,8 +62,8 @@ func TestFetchMarksLinkDensePageAsListing(t *testing.T) {
 		_, _ = fmt.Fprint(w, "</main></body></html>")
 	}))
 	defer server.Close()
-	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1 << 20}
-	document, err := collector.Fetch(context.Background(), server.URL)
+	collector := newTestFetchCollector(t, server.URL)
+	document, err := collector.Fetch(context.Background(), testBaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +126,23 @@ func (r *routeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// newTestFetchCollector returns a collector whose public client routes every
+// request to the given (httptest) server. Tests that exercise HTML extraction,
+// anti-bot or PDF handling fetch through a public-style base URL so the initial
+// URL validation passes while the request lands on the test server.
+func newTestFetchCollector(t *testing.T, serverURL string) *HTTPCollector {
+	t.Helper()
+	parsed, err := url.Parse(serverURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewUnsafeHTTPCollectorForTest(parsed)
+}
+
+// testBaseURL is a public-style base used as the fetch target in HTML/PDF tests;
+// newTestFetchCollector routes it to the httptest server.
+const testBaseURL = "https://contest.example.com"
+
 func TestPDFSegmentsPreservePageNumbers(t *testing.T) {
 	segments := buildPDFSegments("第一页赛事介绍\f第二页报名截止时间为2026年9月20日")
 	if len(segments) != 2 || segments[0].Page != 1 || segments[1].Page != 2 || !strings.Contains(segments[1].Text, "报名截止") {
@@ -160,8 +177,8 @@ func TestFetchSurfacesErrAntiBotForChallengePage(t *testing.T) {
 		_, _ = fmt.Fprint(w, `<html><body>请开启 JavaScript 以继续</body></html>`)
 	}))
 	defer server.Close()
-	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1 << 20}
-	_, err := collector.Fetch(context.Background(), server.URL)
+	collector := newTestFetchCollector(t, server.URL)
+	_, err := collector.Fetch(context.Background(), testBaseURL)
 	if !errors.Is(err, ErrAntiBot) {
 		t.Fatalf("Fetch() error = %v, want ErrAntiBot", err)
 	}
@@ -197,8 +214,8 @@ func TestFetchDoesNotMistakeResourceURLsForAntiBot(t *testing.T) {
 </head><body><article>2026 CCF CCSP 竞赛报名通知，报名时间 2026-09-15 至 2026-10-12。</article></body></html>`)
 	}))
 	defer server.Close()
-	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1 << 20}
-	doc, err := collector.Fetch(context.Background(), server.URL)
+	collector := newTestFetchCollector(t, server.URL)
+	doc, err := collector.Fetch(context.Background(), testBaseURL)
 	if err != nil {
 		t.Fatalf("Fetch() unexpectedly rejected legitimate page: %v", err)
 	}
@@ -216,8 +233,8 @@ func TestFetchBlocksChallengePageInVisibleText(t *testing.T) {
 <body><p>请完成安全验证，以继续访问该页面</p></body></html>`)
 	}))
 	defer server.Close()
-	collector := &HTTPCollector{client: &http.Client{Timeout: time.Second}, maxBytes: 1 << 20}
-	_, err := collector.Fetch(context.Background(), server.URL)
+	collector := newTestFetchCollector(t, server.URL)
+	_, err := collector.Fetch(context.Background(), testBaseURL)
 	if !errors.Is(err, ErrAntiBot) {
 		t.Fatalf("Fetch() error = %v, want ErrAntiBot", err)
 	}

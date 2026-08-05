@@ -74,7 +74,7 @@ func TestCSPRegistrationAndDuplicateSuppression(t *testing.T) {
 	if err := app.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if sender.count() != 1 || !strings.Contains(sender.mails[0].body, "报名中") || !strings.Contains(sender.mails[0].body, "23:59") || !strings.Contains(sender.mails[0].body, server.URL) {
+	if sender.count() != 1 || !strings.Contains(sender.mails[0].body, "报名中") || !strings.Contains(sender.mails[0].body, "23:59") || !strings.Contains(sender.mails[0].body, testPageBase) {
 		t.Fatalf("unexpected first notification: %#v", sender.mails)
 	}
 	if err := app.Run(ctx); err != nil {
@@ -142,7 +142,7 @@ func TestSearchFindsAgentCompetitionAndFiltersIrrelevantPage(t *testing.T) {
 	cfg.MediumDomains = []string{parsed.Hostname(), "contest.example.com"}
 	cfg.Sources = []config.Source{
 		{ID: "agent-search", Name: "Agent discovery", Kind: "search", Query: "AI Agent 比赛 报名", Limit: 10},
-		{ID: "cooking", Name: "烹饪比赛", Kind: "page", URL: server.URL + "/cooking", Trust: "high", Limit: 5},
+		{ID: "cooking", Name: "烹饪比赛", Kind: "page", URL: testPageBase + "/cooking", Trust: "high", Limit: 5},
 	}
 	mux.HandleFunc("/cooking", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `<html><head><title>校园烹饪与厨艺大赛报名通知</title></head><body>欢迎参加厨艺比赛，报名中。</body></html>`)
@@ -237,8 +237,8 @@ func TestConflictingOfficialDatesAreNotScheduled(t *testing.T) {
 	mux.HandleFunc("/b", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, page("2026年8月12日")) })
 	cfg := baseConfig(t)
 	cfg.Sources = []config.Source{
-		{ID: "official-a", Name: "官方来源 A", Kind: "page", URL: server.URL + "/a", Trust: "high", Limit: 5},
-		{ID: "official-b", Name: "官方来源 B", Kind: "page", URL: server.URL + "/b", Trust: "high", Limit: 5},
+		{ID: "official-a", Name: "官方来源 A", Kind: "page", URL: testPageBase + "/a", Trust: "high", Limit: 5},
+		{ID: "official-b", Name: "官方来源 B", Kind: "page", URL: testPageBase + "/b", Trust: "high", Limit: 5},
 	}
 	database := openStore(t, cfg.DBPath)
 	defer database.Close()
@@ -265,7 +265,7 @@ func TestMultiUserCategoryMatching(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, page) }))
 	defer server.Close()
 	cfg := baseConfig(t)
-	cfg.Sources = []config.Source{{ID: "csp", Name: "CCF CSP", Kind: "page", URL: server.URL, Trust: "high", Limit: 10}}
+	cfg.Sources = []config.Source{{ID: "csp", Name: "CCF CSP", Kind: "page", URL: testPageBase, Trust: "high", Limit: 10}}
 	database := openStore(t, cfg.DBPath)
 	defer database.Close()
 	now := fixedNow()
@@ -460,7 +460,14 @@ func enableAllCategoryTestUser(t *testing.T, database *store.Store, app *service
 func newPageService(t *testing.T, pageURL, id, name, trust string) (*service.Service, *store.Store, *memorySender) {
 	t.Helper()
 	cfg := baseConfig(t)
-	cfg.Sources = []config.Source{{ID: id, Name: name, Kind: "page", URL: pageURL, Trust: trust, Limit: 10}}
+	// The source URL uses a public-style host carrying the page path; the test
+	// collector routes it to the httptest server at pageURL.
+	parsedURL, err := url.Parse(pageURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceURL := testPageBase + parsedURL.Path
+	cfg.Sources = []config.Source{{ID: id, Name: name, Kind: "page", URL: sourceURL, Trust: trust, Limit: 10}}
 	database := openStore(t, cfg.DBPath)
 	sender := &memorySender{}
 	app := service.New(cfg, database, newTestCollector(t, pageURL), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -469,17 +476,21 @@ func newPageService(t *testing.T, pageURL, id, name, trust string) (*service.Ser
 	return app, database, sender
 }
 
+// testPageBase is a public-style base host used as the source URL in service
+// tests; newTestCollector routes it to the httptest server.
+const testPageBase = "https://contest.example.com"
+
 // newTestCollector builds a fetcher.Collector whose public client routes every
 // request to the given (httptest) server URL. This lets service tests reach a
 // local test server that the production SSRF-protected collector would reject
-// as a private address.
+// as a private address. It is test-only and must never be used in production.
 func newTestCollector(t *testing.T, targetURL string) fetcher.Collector {
 	t.Helper()
 	parsed, err := url.Parse(targetURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return fetcher.NewHTTPCollectorForTest(parsed)
+	return fetcher.NewUnsafeHTTPCollectorForTest(parsed)
 }
 
 func baseConfig(t *testing.T) config.Config {
