@@ -79,7 +79,7 @@ func TestEmailLoginAndPreferenceUpdate(t *testing.T) {
 		AppSecret: "0123456789abcdef0123456789abcdef", AppriseSenderURL: "mailtos://sender:code@smtp.example.test:465",
 		VerificationTTL: 10 * time.Minute, SessionTTL: 30 * 24 * time.Hour,
 	}
-	server, err := New(database, sender, manager, webConfig, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server, err := New(database, sender, manager, webConfig, time.FixedZone("CST", 8*3600), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +303,7 @@ func TestDashboardShowsUnconfirmedSection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server, err := New(database, &capturedSender{}, manager, config.Web{Enabled: true, PublicBaseURL: "http://example.test"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server, err := New(database, &capturedSender{}, manager, config.Web{Enabled: true, PublicBaseURL: "http://example.test"}, time.FixedZone("CST", 8*3600), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,5 +328,68 @@ func TestDashboardShowsUnconfirmedSection(t *testing.T) {
 	}
 	if !(latestIndex < previewIndex && previewIndex < unconfirmedIndex && unconfirmedIndex < unknownIndex) {
 		t.Fatalf("confirmed and unconfirmed competitions are mixed up: latest=%d preview=%d unconfirmed=%d unknown=%d", latestIndex, previewIndex, unconfirmedIndex, unknownIndex)
+	}
+}
+
+// TestWebUsesInjectedTimezone proves the Web layer uses the location passed to
+// New instead of a hardcoded UTC+8 zone. The test-mail timestamp is rendered in
+// America/New_York (EDT during a summer date), so the body must show EDT and
+// never CST.
+func TestWebUsesInjectedTimezone(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "web-timezone.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	manager, err := authn.New("0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 8, 3, 8, 0, 0, 0, ny)
+
+	email := "student@example.com"
+	code := "123456"
+	if err := database.RequestVerification(ctx, email, manager.VerificationHash(email, code), fixedNow, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	user, err := database.ConsumeVerification(ctx, email, manager.VerificationHash(email, code), fixedNow, subscription.CategoryIDs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionToken := "timezone-test-session"
+	if err := database.CreateSession(ctx, user.ID, manager.SessionHash(sessionToken), fixedNow.Add(24*time.Hour), fixedNow); err != nil {
+		t.Fatal(err)
+	}
+
+	sender := &capturedSender{}
+	server, err := New(database, sender, manager, config.Web{Enabled: true, PublicBaseURL: "http://example.test"}, ny, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetNow(func() time.Time { return fixedNow })
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	jar, _ := cookiejar.New(nil)
+	parsedURL, _ := url.Parse(httpServer.URL)
+	jar.SetCookies(parsedURL, []*http.Cookie{{Name: sessionCookie, Value: sessionToken, Path: "/"}})
+	client := &http.Client{Jar: jar}
+
+	dashboardPage := getBody(t, client, httpServer.URL+"/dashboard")
+	dashboardCSRF := hiddenValue(t, dashboardPage, "csrf")
+	response := postForm(t, client, httpServer.URL+"/actions/test-email", url.Values{"csrf": {dashboardCSRF}})
+	_ = readResponse(t, response)
+	if sender.calls != 1 {
+		t.Fatalf("test mail calls=%d, want 1", sender.calls)
+	}
+	if !strings.Contains(sender.body, "EDT") {
+		t.Fatalf("test mail timestamp not rendered in injected timezone (America/New_York): %q", sender.body)
+	}
+	if strings.Contains(sender.body, "CST") {
+		t.Fatalf("test mail timestamp still uses hardcoded UTC+8: %q", sender.body)
 	}
 }

@@ -39,6 +39,7 @@ type Server struct {
 	auth         *authn.Manager
 	web          config.Web
 	log          *slog.Logger
+	location     *time.Location
 	now          func() time.Time
 	template     *template.Template
 	handler      http.Handler
@@ -101,12 +102,15 @@ type historyCard struct {
 	Time            string
 }
 
-func New(database *store.Store, sender notifier.RecipientSender, manager *authn.Manager, web config.Web, logger *slog.Logger) (*Server, error) {
+func New(database *store.Store, sender notifier.RecipientSender, manager *authn.Manager, web config.Web, location *time.Location, logger *slog.Logger) (*Server, error) {
+	if location == nil {
+		return nil, errors.New("webapp: location must not be nil")
+	}
 	templates, err := template.ParseFS(assets, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse web templates: %w", err)
 	}
-	server := &Server{store: database, sender: sender, auth: manager, web: web, log: logger, now: time.Now, template: templates, lastTestMail: make(map[int64]time.Time)}
+	server := &Server{store: database, sender: sender, auth: manager, web: web, log: logger, location: location, now: time.Now, template: templates, lastTestMail: make(map[int64]time.Time)}
 	mux := http.NewServeMux()
 	staticFiles, err := fs.Sub(assets, "static")
 	if err != nil {
@@ -254,7 +258,7 @@ func (s *Server) dashboard(w http.ResponseWriter, request *http.Request) {
 		s.internalError(w, request, err)
 		return
 	}
-	competitions, err := s.store.ListActionableCompetitions(request.Context(), s.now().In(time.FixedZone("CST", 8*3600)), 50)
+	competitions, err := s.store.ListActionableCompetitions(request.Context(), s.now().In(s.location), 50)
 	if err != nil {
 		s.internalError(w, request, err)
 		return
@@ -376,7 +380,7 @@ func (s *Server) testEmail(w http.ResponseWriter, request *http.Request) {
 		http.Redirect(w, request, "/dashboard?result=test-rate-limited", http.StatusSeeOther)
 		return
 	}
-	subject, body, err := notifier.RenderTest(s.now().In(time.FixedZone("CST", 8*3600)))
+	subject, body, err := notifier.RenderTest(s.now().In(s.location))
 	if err == nil {
 		err = s.sender.SendTo(request.Context(), user.Email, subject, body)
 	}

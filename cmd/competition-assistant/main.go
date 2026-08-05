@@ -82,7 +82,7 @@ func run() error {
 		}
 		app.EnableMultiUser(cfg.Web.PublicBaseURL, manager)
 		if command == "serve" {
-			web, err := webapp.New(database, sender, manager, cfg.Web, logger)
+			web, err := webapp.New(database, sender, manager, cfg.Web, cfg.Location, logger)
 			if err != nil {
 				return err
 			}
