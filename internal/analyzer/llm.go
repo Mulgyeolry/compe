@@ -504,15 +504,14 @@ type singleValueFact struct {
 	Set   func(*AIResult, AIFact)
 }
 
-// factCandidate groups the non-empty values a single fact field produced, along
-// with the evidence they came from, so a cross-segment majority can be found.
+// factCandidate groups the non-empty values a single fact field produced. Each
+// group keeps a full representative AIFact selected deterministically, so the
+// merged fact never depends on the order of the input parts.
 type factCandidate struct {
-	key        string
-	value      string
-	edition    string
-	evidence   string
-	confidence string
-	count      int
+	key            string
+	derivedEdition bool
+	representative AIFact
+	count          int
 }
 
 // consensusFact collects every non-empty value for one field across segments,
@@ -529,24 +528,27 @@ func consensusFact(field string, parts []AIResult, get func(AIResult) AIFact, re
 		}
 		value := normalizeIdentity(fact.Value)
 		edition := normalizeIdentity(fact.Edition)
+		derived := false
 		if edition == "" {
 			if year := yearIn(fact.Evidence); year != 0 {
 				edition = fmt.Sprintf("%d", year)
+				derived = true
 			}
 		}
 		key := value + "\x00" + edition
 		candidate, ok := groups[key]
 		if !ok {
-			candidate = &factCandidate{key: key, value: fact.Value, edition: fact.Edition, evidence: fact.Evidence, confidence: fact.Confidence}
+			candidate = &factCandidate{key: key, derivedEdition: derived, representative: fact}
 			groups[key] = candidate
 			order = append(order, key)
 		}
 		candidate.count++
-		if confidenceRank(fact.Confidence) > confidenceRank(candidate.confidence) {
-			candidate.confidence = fact.Confidence
-		}
-		if len(normalize(fact.Evidence)) > len(normalize(candidate.evidence)) {
-			candidate.evidence = fact.Evidence
+		// Keep the most authoritative representative for this value: higher
+		// confidence, then longer evidence, then lexicographically smaller
+		// evidence, finally value+edition. All comparisons are deterministic so
+		// shuffling the input parts never changes the result.
+		if betterFact(candidate.representative, fact) {
+			candidate.representative = fact
 		}
 	}
 	if len(groups) == 0 {
@@ -572,7 +574,7 @@ func consensusFact(field string, parts []AIResult, get func(AIResult) AIFact, re
 		// Multiple distinct values share the top vote count: unresolved conflict.
 		var summary []string
 		for _, key := range order {
-			summary = append(summary, fmt.Sprintf("%s x%d", groups[key].value, groups[key].count))
+			summary = append(summary, fmt.Sprintf("%s x%d", groups[key].representative.Value, groups[key].count))
 		}
 		*rejections = append(*rejections, model.AnalysisRejection{
 			Field:  field,
@@ -581,12 +583,14 @@ func consensusFact(field string, parts []AIResult, get func(AIResult) AIFact, re
 		})
 		return AIFact{}, true
 	}
-	// A strict majority exists. Record that minority values were discarded.
-	if bestCount < len(parts) {
+	// A strict majority exists and more than one distinct value was offered:
+	// record that the minority values were discarded. Empty segments are not a
+	// conflict and must not produce this rejection.
+	if len(groups) > 1 && bestCount < len(parts) {
 		var discarded []string
 		for _, key := range order {
 			if key != bestKey {
-				discarded = append(discarded, fmt.Sprintf("%s x%d", groups[key].value, groups[key].count))
+				discarded = append(discarded, fmt.Sprintf("%s x%d", groups[key].representative.Value, groups[key].count))
 			}
 		}
 		sort.Strings(discarded)
@@ -599,7 +603,40 @@ func consensusFact(field string, parts []AIResult, get func(AIResult) AIFact, re
 	best := groups[bestKey]
 	// Confidence only selects the representative evidence for the winning value;
 	// it never lets a single high-confidence claim outvote a two-segment majority.
-	return AIFact{Value: best.value, Evidence: best.evidence, Edition: best.edition, Confidence: best.confidence}, false
+	// If the group was grouped by a year derived from evidence but the chosen
+	// representative left Edition empty, write the derived year back so a later
+	// edition check does not reject the fact.
+	if best.representative.Edition == "" && best.derivedEdition && best.keyEdition() != "" {
+		best.representative.Edition = best.keyEdition()
+	}
+	return best.representative, false
+}
+
+// keyEdition extracts the edition segment of a group key (everything after the
+// first NUL separator). It is only meaningful for grouping keys built above.
+func (c *factCandidate) keyEdition() string {
+	if index := strings.IndexByte(c.key, 0); index >= 0 {
+		return c.key[index+1:]
+	}
+	return ""
+}
+
+// betterFact reports whether candidate is a more authoritative representative
+// than current for the same value, using a fully deterministic ordering.
+func betterFact(current, candidate AIFact) bool {
+	if rank := confidenceRank(candidate.Confidence); rank != confidenceRank(current.Confidence) {
+		return rank > confidenceRank(current.Confidence)
+	}
+	currentEvidence, candidateEvidence := normalize(current.Evidence), normalize(candidate.Evidence)
+	if len(candidateEvidence) != len(currentEvidence) {
+		return len(candidateEvidence) > len(currentEvidence)
+	}
+	if candidateEvidence != currentEvidence {
+		return candidateEvidence < currentEvidence
+	}
+	candidateKey := normalizeIdentity(candidate.Value) + "\x00" + normalizeIdentity(candidate.Edition)
+	currentKey := normalizeIdentity(current.Value) + "\x00" + normalizeIdentity(current.Edition)
+	return candidateKey < currentKey
 }
 
 // lifecycleFactConflict reports whether any unresolved conflict touches the

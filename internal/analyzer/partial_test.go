@@ -289,6 +289,102 @@ func TestMergeAISameValueChoosesBetterEvidence(t *testing.T) {
 	}
 }
 
+// TestConsensusSameValueOrderIndependent proves that swapping the order of
+// same-value candidates yields an identical full representative AIFact and an
+// identical set of rejections.
+func TestConsensusSameValueOrderIndependent(t *testing.T) {
+	a := AIResult{
+		SchemaVersion: AIAnalyzerVersion,
+		Facts: AIFacts{Fee: AIFact{
+			Value: "50元/人", Edition: "2026", Confidence: "medium",
+			Evidence: "报名费为50元/人",
+		}},
+	}
+	b := AIResult{
+		SchemaVersion: AIAnalyzerVersion,
+		Facts: AIFacts{Fee: AIFact{
+			Value: "50元/人", Edition: "2026", Confidence: "high",
+			Evidence: "报名费为50元/人，缴费后确认参赛资格",
+		}},
+	}
+	// Exercise the representative-selection tiebreak with three same-value
+	// candidates so the full fact is decided by confidence then evidence length.
+	c := AIResult{
+		SchemaVersion: AIAnalyzerVersion,
+		Facts: AIFacts{Fee: AIFact{
+			Value: "50元/人", Edition: "2026", Confidence: "high",
+			Evidence: "报名费为50元/人，缴费后确认参赛资格，费用含税",
+		}},
+	}
+	forward, conflictedForward := mergeAIChunkResults([]AIResult{a, b, c})
+	reversed, conflictedReversed := mergeAIChunkResults([]AIResult{c, b, a})
+	if forward.Facts.Fee != reversed.Facts.Fee {
+		t.Fatalf("full AIFact depends on part order:\nA=%#v\nB=%#v", forward.Facts.Fee, reversed.Facts.Fee)
+	}
+	if !equalRejections(forward.Rejections, reversed.Rejections) {
+		t.Fatalf("rejections depend on part order:\nA=%#v\nB=%#v", forward.Rejections, reversed.Rejections)
+	}
+	if !equalStrings(conflictedForward, conflictedReversed) {
+		t.Fatalf("conflicted fields depend on order: %v vs %v", conflictedForward, conflictedReversed)
+	}
+	// The longest, highest-confidence evidence must win as the representative.
+	if forward.Facts.Fee.Evidence != "报名费为50元/人，缴费后确认参赛资格，费用含税" {
+		t.Fatalf("best representative not selected: %#v", forward.Facts.Fee)
+	}
+}
+
+// TestConsensusDerivesEditionFromEvidence proves that when the winning fact's
+// Edition is empty but the group was keyed by a year derived from evidence, the
+// derived year is written back so a later edition check does not reject it.
+func TestConsensusDerivesEditionFromEvidence(t *testing.T) {
+	parts := []AIResult{
+		{
+			SchemaVersion: AIAnalyzerVersion,
+			Facts: AIFacts{Fee: AIFact{
+				Value: "50元/人", Evidence: "2026年报名费为50元/人", Confidence: "high",
+			}},
+		},
+		{
+			SchemaVersion: AIAnalyzerVersion,
+			Facts: AIFacts{Fee: AIFact{
+				Value: "50元/人", Evidence: "2026年报名费为50元/人", Confidence: "high",
+			}},
+		},
+	}
+	merged, conflicted := mergeAIChunkResults(parts)
+	if len(conflicted) != 0 {
+		t.Fatalf("unexpected conflict: %v", conflicted)
+	}
+	if merged.Facts.Fee.Value != "50元/人" {
+		t.Fatalf("value lost: %#v", merged.Facts.Fee)
+	}
+	if merged.Facts.Fee.Edition != "2026" {
+		t.Fatalf("derived edition not written back: %#v", merged.Facts.Fee)
+	}
+}
+
+// TestConsensusSingleNonEmptyValueNoMinorityRejection proves that one non-empty
+// value alongside empty segments is not a conflict and produces no minority
+// rejection.
+func TestConsensusSingleNonEmptyValueNoMinorityRejection(t *testing.T) {
+	parts := []AIResult{
+		withRegistrationEnd("2026年9月20日"),
+		{SchemaVersion: AIAnalyzerVersion},
+		{SchemaVersion: AIAnalyzerVersion},
+		{SchemaVersion: AIAnalyzerVersion},
+	}
+	merged, conflicted := mergeAIChunkResults(parts)
+	if len(conflicted) != 0 {
+		t.Fatalf("unexpected conflict: %v", conflicted)
+	}
+	if merged.Facts.RegistrationEnd.Value != "2026年9月20日" {
+		t.Fatalf("single value not retained: %#v", merged.Facts.RegistrationEnd)
+	}
+	if hasRejectionReason(merged.Rejections, "minority conflicting values discarded by cross-segment consensus") {
+		t.Fatalf("empty segments were treated as minority conflict: %#v", merged.Rejections)
+	}
+}
+
 func TestAnalyzeRetainsStableFieldsOnPartialExtraction(t *testing.T) {
 	location := time.FixedZone("CST", 8*3600)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
