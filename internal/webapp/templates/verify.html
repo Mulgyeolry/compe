@@ -1,0 +1,4 @@
+{{define "verify.html"}}<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>输入验证码</title><link rel="stylesheet" href="/static/app.css"></head>
+<body><main class="shell narrow"><section class="panel auth-card"><a class="back" href="/">← 更换邮箱</a><h1>检查你的邮箱</h1>{{if .Message}}<div class="alert success">{{.Message}}</div>{{end}}{{if .Error}}<div class="alert error">{{.Error}}</div>{{end}}<p>验证码已发送至 <strong>{{.Email}}</strong>，10 分钟内有效。</p>
+<form method="post" action="/auth/verify"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="email" value="{{.Email}}"><label>6 位验证码<input class="code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required autofocus placeholder="000000"></label><button type="submit">验证并登录</button></form></section></main></body></html>{{end}}

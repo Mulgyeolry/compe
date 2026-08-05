@@ -1,0 +1,282 @@
+schedule: "0 20 * * *"
+timezone: "Asia/Shanghai"
+db_path: "/data/competitions.db"
+searxng_url: "http://searxng:8080"
+apprise_url: "http://apprise:8000/notify/"
+
+fetch:
+  timeout_seconds: 20
+  max_bytes: 5242880
+  max_candidates_per_source: 40
+
+# 数据清洗在每次系统扫描结束后执行。去重事件和官方事实不会被删除。
+retention:
+  enabled: true
+  observation_days: 30
+  closed_competition_content_days: 180
+  expired_authentication_days: 7
+
+# 仅用于新赛事的定性分析。二手来源不会覆盖报名时间、费用、资格或规则。
+enrichment:
+  enabled: true
+  max_sources: 5
+  allowed_domains:
+    - nowcoder.com
+    - tieba.baidu.com
+    - zhihu.com
+    - juejin.cn
+    - segmentfault.com
+    - csdn.net
+    - bilibili.com
+    - douyin.com
+    - xiaohongshu.com
+
+high_trust_domains:
+  - cspro.org
+  - ccf.org.cn
+  - ccpc.io
+  - icpc.global
+  - huawei.com
+  - e.huawei.com
+  - huaweicloud.com
+  - developer.huawei.com
+  - tianchi.aliyun.com
+  - cloud.tencent.com
+  - jsjds.blcu.edu.cn
+  - moe.gov.cn
+  - cy.ncss.cn
+  - openatom.org.cn
+  - cncf.io
+
+medium_trust_domains:
+  - aliyun.com
+  - tencent.com
+  - baidu.com
+  - volcengine.com
+  - jd.com
+  - linuxfoundation.org
+
+keywords:
+  focus:
+    - CCF CSP
+    - CCF CCSP
+    - CCF CAT
+    - CCPC
+    - ICPC
+    - ACM-ICPC
+    - 团体程序设计天梯赛
+    - GPLT
+    - 蓝桥杯
+    - 华为 ICT 大赛
+    - 华为软件精英挑战赛
+    - HarmonyOS
+    - 昇腾
+    - 天池
+    - 百度之星程序设计大赛
+    - 中国大学生计算机设计大赛
+    - 中国高校计算机大赛
+    - 全国大学生计算机系统能力大赛
+    - 中国大学生服务外包创新创业大赛
+    - 全国大学生信息安全竞赛
+    - CISC
+    - 0CTF
+    - 全国大学生数学建模竞赛
+    - CUMCM
+    - 中国国际大学生创新大赛
+    - 挑战杯
+    - 中国研究生数学建模竞赛
+    - 中国研究生人工智能创新大赛
+    - 中国研究生网络安全创新大赛
+    - 中国研究生电子设计竞赛
+    - 中国研究生创芯大赛
+    - EDA 精英挑战赛
+    - 中国研究生智慧城市技术与创意设计大赛
+    - 中国研究生机器人创新设计大赛
+    - 中国研究生操作系统开源创新大赛
+    - 中国研究生金融科技创新大赛
+    - 微软创新杯
+    - 花旗杯金融创新应用大赛
+    - 全国高校计算机能力挑战赛
+    - 司南杯量子计算编程挑战赛
+    - 华北五省大学生计算机应用大赛
+    - 海峡两岸暨港澳地区大学生计算机创新作品赛
+    - 东北四省大学生程序设计邀请赛
+    - 长三角大学生计算机设计邀请赛
+  positive:
+    - AI Agent
+    - 智能体
+    - RAG
+    - 大模型应用
+    - Go 后端
+    - 云原生
+    - 云计算
+    - 软件开发
+    - 程序设计大赛
+    - 开发者挑战赛
+    - 企业命题
+    - 省赛
+    - 市赛
+    - 黑客松
+  negative:
+    - 烹饪
+    - 舞蹈
+    - 书法
+    - 摄影
+    - 公共政策案例
+    - 社会治理案例
+
+sources:
+  - id: ccf-csp
+    name: CCF CSP 官网
+    kind: page
+    url: https://www.cspro.org/
+    trust: high
+    limit: 40
+
+  - id: ccf-ccsp
+    name: CCF CCSP 竞赛动态
+    kind: page
+    url: https://www.ccf.org.cn/ccsp/Bulletin/
+    trust: high
+
+  - id: ccpc
+    name: CCPC 公告
+    kind: page
+    url: https://ccpc.io/placard
+    trust: high
+
+  - id: icpc
+    name: ICPC Regionals
+    kind: page
+    url: https://icpc.global/regionals/results
+    trust: high
+
+  - id: huawei-ict
+    name: 华为 ICT 大赛官方入口
+    kind: page
+    url: https://e.huawei.com/cn/talent/portal/
+    trust: high
+
+  - id: huawei-developer
+    name: 华为开发者赛事
+    kind: page
+    url: https://developer.huawei.com/consumer/cn/activity/digixActivity/Winnerlist
+    trust: high
+
+  - id: tianchi
+    name: 阿里云天池算法大赛
+    kind: page
+    url: https://tianchi.aliyun.com/competition/algorithmList
+    trust: high
+
+  - id: tencent-cloud
+    name: 腾讯云开发者竞赛
+    kind: page
+    url: https://cloud.tencent.com/developer/competition
+    trust: high
+
+  - id: computer-design
+    name: 中国大学生计算机设计大赛
+    kind: page
+    url: https://jsjds.blcu.edu.cn/
+    trust: high
+
+  - id: moe-innovation
+    name: 教育部高等教育赛事通知
+    kind: page
+    url: https://www.moe.gov.cn/srcsite/A08/s5672/
+    trust: high
+
+  - id: discover-ai
+    name: AI Agent 与大模型比赛发现
+    kind: search
+    query: '({year} OR 新一届) (AI Agent OR 智能体 OR RAG OR 大模型应用) (比赛 OR 大赛 OR 黑客松) (报名 OR 启动 OR 预告 OR 赛题)'
+    limit: 20
+
+  - id: discover-cloud
+    name: 云计算与后端比赛发现
+    kind: search
+    query: '({year} OR 新一届) (云计算 OR 云原生 OR Kubernetes OR Go后端 OR 软件开发) (比赛 OR 大赛 OR 黑客松) (报名 OR 启动 OR 预告)'
+    limit: 20
+
+  - id: discover-university
+    name: 高校计算机比赛发现
+    kind: search
+    query: 'site:edu.cn {year} (计算机 OR 人工智能 OR 软件 OR 云原生) (竞赛 OR 大赛 OR 黑客松) (报名 OR 即将启动 OR 敬请期待)'
+    limit: 20
+
+  - id: discover-enterprise
+    name: 企业开发者比赛发现
+    kind: search
+    query: '({year} OR 新一届) (开发者大赛 OR 程序设计大赛 OR 技术挑战赛 OR 黑客松 OR 企业命题) (报名 OR 启动 OR 预告) (华为 OR 阿里 OR 腾讯 OR 百度 OR 京东 OR 字节 OR 火山引擎 OR 小米 OR OPPO OR vivo OR 科技公司)'
+    limit: 15
+    allowed_domains:
+      - huawei.com
+      - huaweicloud.com
+      - aliyun.com
+      - tencent.com
+      - baidu.com
+      - jd.com
+      - volcengine.com
+      - xiaomi.com
+      - oppo.com
+      - vivo.com
+
+  - id: discover-emerging-enterprise
+    name: 中小企业技术比赛候选发现
+    kind: search
+    query: '{year} (科技有限公司 OR 软件公司 OR 开发者社区) (程序设计大赛 OR 开发者挑战赛 OR AI应用大赛 OR 黑客松) (报名 OR 启动 OR 预告)'
+    limit: 10
+
+  - id: discover-national-programming
+    name: 全国程序设计与软件比赛发现
+    kind: search
+    query: '{year} (全国 OR 国家级 OR 中国区) (程序设计大赛 OR 软件开发大赛 OR 编程挑战赛 OR 计算机大赛) (报名 OR 启动 OR 预告 OR 赛题发布)'
+    limit: 15
+
+  - id: discover-regional
+    name: 地方计算机比赛发现
+    kind: search
+    query: '{year} (省赛 OR 市赛 OR 区域赛 OR 重庆 OR 四川 OR 北京 OR 上海 OR 广东 OR 江苏 OR 浙江 OR 湖北 OR 陕西) (程序设计 OR 软件开发 OR 人工智能 OR 云计算 OR 网络安全) (大赛 OR 竞赛 OR 挑战赛) (报名 OR 启动 OR 预告)'
+    limit: 20
+    allowed_domains:
+      - gov.cn
+      - edu.cn
+      - org.cn
+
+  - id: discover-authoritative-student
+    name: 权威大学生计算机赛事发现
+    kind: search
+    query: '{year} (蓝桥杯 OR 团体程序设计天梯赛 OR 中国高校计算机大赛 OR 全国大学生计算机系统能力大赛 OR 中国大学生服务外包创新创业大赛 OR 全国大学生信息安全竞赛 OR 全国大学生数学建模竞赛) (报名 OR 启动 OR 预告 OR 通知)'
+    limit: 20
+    allowed_domains:
+      - gov.cn
+      - edu.cn
+      - org.cn
+      - ccf.org.cn
+
+  - id: discover-graduate-authoritative
+    name: 中国研究生创新实践系列赛事发现
+    kind: search
+    query: '{year} 中国研究生 (数学建模 OR 人工智能 OR 网络安全 OR 电子设计 OR 创芯 OR 智慧城市 OR 机器人 OR 操作系统 OR 金融科技) (大赛 OR 竞赛) (报名 OR 启动 OR 预告 OR 通知)'
+    limit: 20
+    allowed_domains:
+      - gov.cn
+      - edu.cn
+      - org.cn
+
+  - id: discover-authoritative-enterprise
+    name: 权威企业技术赛事发现
+    kind: search
+    query: '{year} (百度之星 OR 华为软件精英挑战赛 OR 天池大赛 OR 微软创新杯 OR 花旗杯 OR 司南杯) (报名 OR 启动 OR 预告 OR 通知)'
+    limit: 20
+
+  - id: discover-provincial-programming
+    name: 各省正规程序设计与安全赛事发现
+    kind: search
+    query: '{year} (省大学生程序设计竞赛 OR 市大学生程序设计竞赛 OR 大学生信息安全竞赛 OR 大学生网络安全大赛 OR 大学生计算机设计大赛) (报名 OR 启动 OR 预告 OR 通知)'
+    limit: 25
+    allowed_domains:
+      - gov.cn
+      - edu.cn
+      - org.cn

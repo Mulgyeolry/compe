@@ -1,0 +1,59 @@
+{{define "dashboard.html"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>赛事订阅 · 比赛资讯助手</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/dashboard-actions.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="shell header-inner">
+    <a class="brand" href="/dashboard"><span class="brand-mark">赛</span><span>比赛资讯助手</span></a>
+    <nav class="main-nav" aria-label="主导航"><a class="active" href="/dashboard">赛事动态</a><a href="/preferences">订阅设置</a></nav>
+    <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="text-button" type="submit">退出</button></form>
+  </div>
+</header>
+<main class="shell dashboard">
+  <div class="page-heading"><div><h1>值得关注的赛事</h1></div><div class="heading-actions"><form method="post" action="/actions/test-email"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="button secondary compact" type="submit">发送测试邮件</button></form><form method="post" action="/actions/push"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="button secondary compact" type="submit" title="只发送已发现但尚未投递的通知，不会触发扫描">立即推送</button></form><a class="button compact" href="/preferences">调整筛选</a></div></div>
+  {{if .Message}}<div class="alert success">{{.Message}}</div>{{end}}{{if .Error}}<div class="alert error">{{.Error}}</div>{{end}}
+  <section class="summary-bar" aria-label="订阅概况">
+    <div><strong>{{len .Competitions}}</strong><span>当前可行动赛事</span></div>
+    <div><strong>{{.PendingCount}}</strong><span>待发送通知</span></div>
+    <div><strong>{{if eq .Preferences.MinTrust "high"}}仅官方{{else}}官方及可信来源{{end}}</strong><span>来源门槛</span></div>
+    <div><strong>{{if eq .Preferences.Frequency "weekly"}}每周按时{{else if eq .Preferences.Frequency "daily"}}每天按时{{else}}尽快{{end}}</strong><span>通知发送方式</span></div>
+  </section>
+  <div class="content-layout">
+    <section class="competition-section">
+      <div class="section-heading"><h2>最新赛事</h2><span>共 {{len .Competitions}} 项</span></div>
+      {{if .Competitions}}<div class="competition-list">{{range .Competitions}}
+        <article class="competition-item">
+          <div class="competition-topline"><span class="status {{.StatusClass}}">{{.Status}}</span><span class="source-label">{{.Trust}}</span></div>
+          <h3><a href="{{.OfficialURL}}" target="_blank" rel="noopener noreferrer">{{.Name}}</a></h3>
+          <dl class="competition-meta"><div><dt>主办方</dt><dd>{{.Organizer}}</dd></div><div><dt>报名截止</dt><dd>{{.Deadline}}</dd></div><div><dt>比赛费用</dt><dd>{{.Fee}}</dd></div></dl>
+          <div class="tag-row">{{range .Tags}}<span>{{.}}</span>{{end}}</div>
+          {{if .Analysis.Summary}}<details class="analysis-panel"><summary>查看赛事分析 <small>{{.AnalysisTrust}}</small></summary><p>{{.Analysis.Summary}}</p>{{if .Analysis.SuitableFor}}<p><strong>适合人群：</strong>{{.Analysis.SuitableFor}}</p>{{end}}{{if .Analysis.Difficulty}}<p><strong>难度判断：</strong>{{.Analysis.Difficulty}}</p>{{end}}{{if .Analysis.ResumeValue}}<p><strong>简历价值判断：</strong>{{.Analysis.ResumeValue}}</p>{{end}}{{if .Analysis.Caveats}}<p><strong>注意事项：</strong>{{.Analysis.Caveats}}</p>{{end}}{{if .Analysis.References}}<p class="analysis-references"><strong>可回查依据：</strong>{{range $i,$v := .Analysis.References}}{{if $i}} · {{end}}<a href="{{$v.URL}}" target="_blank" rel="noopener noreferrer">{{$v.Title}}</a>{{end}}</p>{{end}}</details>{{end}}
+          <div class="competition-actions"><a href="{{.OfficialURL}}" target="_blank" rel="noopener noreferrer">查看原始官方信息 <span aria-hidden="true">↗</span></a>{{if .AlternateURL}}<a class="alternate-link" href="{{.AlternateURL}}" target="_blank" rel="noopener noreferrer">华为人才在线（备用）</a>{{end}}{{if .LinkNote}}<small>{{.LinkNote}}</small>{{end}}</div>
+          <div class="decision-actions" aria-label="参赛选择"><span>我的选择</span><form method="post" action="/competitions/choice"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="competition_id" value="{{.ID}}"><input type="hidden" name="decision" value="participating"><button class="button compact {{if eq .Decision "participating"}}selected{{end}}" type="submit" {{if eq .Decision "participating"}}disabled{{end}}>参加</button></form><form method="post" action="/competitions/choice"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="competition_id" value="{{.ID}}"><input type="hidden" name="decision" value="declined"><button class="button secondary compact {{if eq .Decision "declined"}}selected{{end}}" type="submit" {{if eq .Decision "declined"}}disabled{{end}}>不参加</button></form>{{if eq .Decision "undecided"}}<small>选择参加后才会收到正式开赛提醒</small>{{else}}<small>可随时修改</small>{{end}}</div>
+        </article>{{end}}
+      </div>{{else}}<div class="empty-state"><strong>暂时没有符合条件的可关注赛事</strong><p>系统仍会按计划扫描。发现预告或开放报名后会按你的设置发送；已选择参加的赛事还会继续跟进正式开赛。</p><a href="/preferences">检查筛选条件</a></div>{{end}}
+    </section>
+    <aside class="sidebar">
+      <section class="side-panel"><div class="section-heading"><h2>订阅状态</h2><a href="/preferences">编辑</a></div><dl class="subscription-facts"><div><dt>接收邮箱</dt><dd>{{.User.Email}}</dd></div><div><dt>投递计划</dt><dd>{{if eq .Preferences.Frequency "immediate"}}新通知发现后尽快发送{{else if eq .Preferences.Frequency "daily"}}每天 {{.Preferences.DeliveryTime}}（北京时间）{{else}}每周{{if eq .Preferences.WeeklyDay 1}}一{{else if eq .Preferences.WeeklyDay 2}}二{{else if eq .Preferences.WeeklyDay 3}}三{{else if eq .Preferences.WeeklyDay 4}}四{{else if eq .Preferences.WeeklyDay 5}}五{{else if eq .Preferences.WeeklyDay 6}}六{{else}}日{{end}} {{.Preferences.DeliveryTime}}（北京时间）{{end}}</dd></div><div><dt>地区偏好</dt><dd>{{if .Preferences.Regions}}{{range $i,$v := .Preferences.Regions}}{{if $i}}、{{end}}{{$v}}{{end}}{{else}}全国不限{{end}}</dd></div></dl><p class="side-note">学院内部转发、获奖名单、落幕回顾等资讯不会进入提醒。</p></section>
+      <section class="side-panel"><div class="section-heading"><h2>最近通知</h2></div>{{if .History}}<div class="history-list">{{range .History}}<article><div><strong>{{.CompetitionName}}</strong><span>{{.Event}} · {{.Status}}</span></div><time>{{.Time}}</time></article>{{end}}</div>{{else}}<p class="empty-small">还没有发送记录。</p>{{end}}</section>
+    </aside>
+  </div>
+  <section class="competition-section unconfirmed-section">
+    <div class="section-heading"><h2>待确认赛事</h2><span>共 {{len .Unconfirmed}} 项</span></div>
+    {{if .Unconfirmed}}<div class="competition-list">{{range .Unconfirmed}}
+      <article class="competition-item">
+        <div class="competition-topline"><span class="status {{.StatusClass}}">{{.Status}}</span><span class="source-label">{{.Trust}}</span></div>
+        <h3><a href="{{.OfficialURL}}" target="_blank" rel="noopener noreferrer">{{.Name}}</a></h3>
+        <dl class="competition-meta"><div><dt>主办方</dt><dd>{{.Organizer}}</dd></div><div><dt>状态说明</dt><dd>AI 分析待补全，确认后将自动移入最新赛事并提醒，不会直接推送。</dd></div></dl>
+        <div class="competition-actions"><a href="{{.OfficialURL}}" target="_blank" rel="noopener noreferrer">查看原始官方信息 <span aria-hidden="true">↗</span></a>{{if .AlternateURL}}<a class="alternate-link" href="{{.AlternateURL}}" target="_blank" rel="noopener noreferrer">华为人才在线（备用）</a>{{end}}{{if .LinkNote}}<small>{{.LinkNote}}</small>{{end}}</div>
+      </article>{{end}}
+    </div>{{else}}<div class="empty-state"><strong>暂无可展示的待确认赛事</strong><p>系统仍在按计划扫描。新公告在确认状态之前会先出现在这里，确认后才会向你发送提醒。</p></div>{{end}}
+  </section>
+</main>
+</body></html>{{end}}

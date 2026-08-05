@@ -1,0 +1,8 @@
+{{define "login.html"}}<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>比赛资讯助手</title><link rel="stylesheet" href="/static/app.css"><link rel="stylesheet" href="/static/auth.css"></head>
+<body class="auth-page">
+<header class="auth-header"><div class="auth-nav"><a class="brand" href="/"><span class="brand-mark">赛</span><span>比赛资讯助手</span></a><span class="auth-update"><i></i>每日更新</span></div></header>
+<main class="auth-shell">
+  <section class="auth-intro"><span class="auth-kicker">计算机学生赛事订阅</span><h1>不错过值得参加的<br><em>计算机比赛</em></h1><p>汇集算法、AI、软件开发和云计算赛事，在预告与报名开放时提醒你。</p></section>
+  <section class="auth-login-card"><h2>开始订阅比赛资讯</h2><p>输入邮箱，我们会发送一个 6 位验证码。</p>{{if .Error}}<div class="alert error">{{.Error}}</div>{{end}}<form method="post" action="/auth/request"><input type="hidden" name="csrf" value="{{.CSRF}}"><label for="login-email">邮箱地址</label><input id="login-email" name="email" type="email" autocomplete="email" maxlength="254" required placeholder="name@example.com"><button type="submit">获取验证码</button></form><p class="auth-form-note">验证码 10 分钟内有效</p></section>
+</main></body></html>{{end}}

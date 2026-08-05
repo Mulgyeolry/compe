@@ -1,0 +1,58 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GOLANG_IMAGE: ${GOLANG_IMAGE:-m.daocloud.io/docker.io/library/golang:1.25-bookworm}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-m.daocloud.io/docker.io/library/debian:bookworm-slim}
+    restart: unless-stopped
+    depends_on:
+      - searxng
+      - apprise
+    environment:
+      CONFIG_PATH: /app/config/sources.yaml
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Shanghai}
+      APP_SCHEDULE: ${APP_SCHEDULE:-0 20 * * *}
+      DB_PATH: ${DB_PATH:-/data/competitions.db}
+      SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
+      APPRISE_API_URL: ${APPRISE_API_URL:-http://apprise:8000/notify/}
+      WEB_LISTEN_ADDR: ${WEB_LISTEN_ADDR:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      APP_SECRET: ${APP_SECRET:-}
+      APPRISE_SENDER_URL: ${APPRISE_SENDER_URL:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      CLEANUP_ENABLED: ${CLEANUP_ENABLED:-}
+      OBSERVATION_RETENTION_DAYS: ${OBSERVATION_RETENTION_DAYS:-}
+      CLOSED_COMPETITION_CONTENT_RETENTION_DAYS: ${CLOSED_COMPETITION_CONTENT_RETENTION_DAYS:-}
+      EXPIRED_AUTH_RETENTION_DAYS: ${EXPIRED_AUTH_RETENTION_DAYS:-}
+    volumes:
+      - ${CONFIG_FILE:-./sources.example.yaml}:/app/config/sources.yaml:ro
+      - competition_data:/data
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-change-this-searxng-secret}
+      SEARXNG_LIMITER: "false"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+
+  apprise:
+    image: caronc/apprise:latest
+    restart: unless-stopped
+    environment:
+      APPRISE_STATEFUL_MODE: disabled
+      APPRISE_API_ONLY: "yes"
+      APPRISE_STATELESS_URLS: ${APPRISE_STATELESS_URLS:-}
+      APPRISE_WORKER_COUNT: "1"
+      TZ: ${APP_TIMEZONE:-Asia/Shanghai}
+
+volumes:
+  competition_data:

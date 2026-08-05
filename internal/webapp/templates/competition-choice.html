@@ -1,0 +1,3 @@
+{{define "competition-choice.html"}}<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>确认参赛选择 · 比赛资讯助手</title><link rel="stylesheet" href="/static/app.css"><link rel="stylesheet" href="/static/auth.css"></head>
+<body><main class="shell narrow"><section class="panel auth-card"><h1>确认参赛选择</h1><p class="muted">比赛：{{.ChoiceCompetition}}</p><p>你将把选择修改为：<strong>{{.ChoiceDecision}}</strong></p><form method="post" action="/competition-choice"><input type="hidden" name="token" value="{{.ChoiceToken}}"><button type="submit">确认保存</button></form><p class="fineprint">邮件链接只会打开本确认页，不会在打开时直接修改状态。之后仍可在网站中更改选择。</p></section></main></body></html>{{end}}

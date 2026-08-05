@@ -1,0 +1,17 @@
+.field-label[hidden] {
+  display: none;
+}
+
+.choice-note {
+  display: grid;
+  gap: 2px;
+  padding: 11px 12px;
+  border: 1px solid #dde2e6;
+  border-radius: 4px;
+  background: #f7f9f8;
+}
+
+.choice-note span {
+  color: var(--muted);
+  font-size: 11px;
+}
