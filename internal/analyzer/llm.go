@@ -509,7 +509,6 @@ type singleValueFact struct {
 // merged fact never depends on the order of the input parts.
 type factCandidate struct {
 	key            string
-	derivedEdition bool
 	representative AIFact
 	count          int
 }
@@ -528,17 +527,15 @@ func consensusFact(field string, parts []AIResult, get func(AIResult) AIFact, re
 		}
 		value := normalizeIdentity(fact.Value)
 		edition := normalizeIdentity(fact.Edition)
-		derived := false
 		if edition == "" {
 			if year := yearIn(fact.Evidence); year != 0 {
 				edition = fmt.Sprintf("%d", year)
-				derived = true
 			}
 		}
 		key := value + "\x00" + edition
 		candidate, ok := groups[key]
 		if !ok {
-			candidate = &factCandidate{key: key, derivedEdition: derived, representative: fact}
+			candidate = &factCandidate{key: key, representative: fact}
 			groups[key] = candidate
 			order = append(order, key)
 		}
@@ -603,10 +600,12 @@ func consensusFact(field string, parts []AIResult, get func(AIResult) AIFact, re
 	best := groups[bestKey]
 	// Confidence only selects the representative evidence for the winning value;
 	// it never lets a single high-confidence claim outvote a two-segment majority.
-	// If the group was grouped by a year derived from evidence but the chosen
-	// representative left Edition empty, write the derived year back so a later
-	// edition check does not reject the fact.
-	if best.representative.Edition == "" && best.derivedEdition && best.keyEdition() != "" {
+	// If the chosen representative left Edition empty while the group was keyed
+	// by a non-empty edition (explicit or derived from evidence), write the key
+	// edition back so a later edition check does not reject the fact. Relying on
+	// the key rather than a per-candidate flag makes the write-back independent
+	// of which candidate was selected as representative.
+	if best.representative.Edition == "" && best.keyEdition() != "" {
 		best.representative.Edition = best.keyEdition()
 	}
 	return best.representative, false

@@ -363,6 +363,45 @@ func TestConsensusDerivesEditionFromEvidence(t *testing.T) {
 	}
 }
 
+// TestConsensusMixedEditionBoundary proves that within one group the first
+// candidate may carry an explicit edition while the eventual representative has
+// an empty Edition (with a year derivable from its evidence). The derived year
+// must still be written back, independent of candidate order.
+func TestConsensusMixedEditionBoundary(t *testing.T) {
+	explicit := AIResult{
+		SchemaVersion: AIAnalyzerVersion,
+		Facts: AIFacts{Fee: AIFact{
+			Value: "50元/人", Edition: "2026", Confidence: "low",
+			Evidence: "报名费为50元/人",
+		}},
+	}
+	derived := AIResult{
+		SchemaVersion: AIAnalyzerVersion,
+		Facts: AIFacts{Fee: AIFact{
+			Value: "50元/人", Evidence: "2026年报名费为50元/人", Confidence: "high",
+		}},
+	}
+	forward, conflictedForward := mergeAIChunkResults([]AIResult{explicit, derived})
+	reversed, conflictedReversed := mergeAIChunkResults([]AIResult{derived, explicit})
+	if forward.Facts.Fee != reversed.Facts.Fee {
+		t.Fatalf("full AIFact depends on part order:\nA=%#v\nB=%#v", forward.Facts.Fee, reversed.Facts.Fee)
+	}
+	if !equalRejections(forward.Rejections, reversed.Rejections) {
+		t.Fatalf("rejections depend on part order:\nA=%#v\nB=%#v", forward.Rejections, reversed.Rejections)
+	}
+	if !equalStrings(conflictedForward, conflictedReversed) {
+		t.Fatalf("conflicted fields depend on order: %v vs %v", conflictedForward, conflictedReversed)
+	}
+	// The high-confidence candidate with empty Edition must win the
+	// representative slot, and the key edition must be written back to it.
+	if forward.Facts.Fee.Confidence != "high" {
+		t.Fatalf("high-confidence candidate not selected as representative: %#v", forward.Facts.Fee)
+	}
+	if forward.Facts.Fee.Edition != "2026" {
+		t.Fatalf("key edition not written back to representative: %#v", forward.Facts.Fee)
+	}
+}
+
 // TestConsensusSingleNonEmptyValueNoMinorityRejection proves that one non-empty
 // value alongside empty segments is not a conflict and produces no minority
 // rejection.
