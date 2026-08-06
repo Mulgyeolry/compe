@@ -32,20 +32,21 @@ const (
 var assets embed.FS
 
 type Server struct {
-	store        *store.Store
-	sender       notifier.RecipientSender
-	auth         *authn.Manager
-	web          config.Web
-	log          *slog.Logger
-	location     *time.Location
-	now          func() time.Time
-	template     *template.Template
-	handler      http.Handler
-	pushTrigger  func(int64) bool
-	backfill     func(context.Context, int64) (int, error)
-	setChoice    func(context.Context, int64, int64, model.ParticipationDecision) error
-	testMailMu   sync.Mutex
-	lastTestMail map[int64]time.Time
+	store         *store.Store
+	sessionLookup sessionLookup
+	sender        notifier.RecipientSender
+	auth          *authn.Manager
+	web           config.Web
+	log           *slog.Logger
+	location      *time.Location
+	now           func() time.Time
+	template      *template.Template
+	handler       http.Handler
+	pushTrigger   func(int64) bool
+	backfill      func(context.Context, int64) (int, error)
+	setChoice     func(context.Context, int64, int64, model.ParticipationDecision) error
+	testMailMu    sync.Mutex
+	lastTestMail  map[int64]time.Time
 }
 
 type pageData struct {
@@ -108,7 +109,7 @@ func New(database *store.Store, sender notifier.RecipientSender, manager *authn.
 	if err != nil {
 		return nil, fmt.Errorf("parse web templates: %w", err)
 	}
-	server := &Server{store: database, sender: sender, auth: manager, web: web, log: logger, location: location, now: time.Now, template: templates, lastTestMail: make(map[int64]time.Time)}
+	server := &Server{store: database, sessionLookup: database, sender: sender, auth: manager, web: web, log: logger, location: location, now: time.Now, template: templates, lastTestMail: make(map[int64]time.Time)}
 	mux := http.NewServeMux()
 	staticFiles, err := fs.Sub(assets, "static")
 	if err != nil {
