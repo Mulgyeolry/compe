@@ -105,13 +105,12 @@ func (s *Service) run(ctx context.Context) error {
 	if err := s.commitFreshEvents(ctx, now, users, eventMap); err != nil {
 		return err
 	}
-	// After the system is bootstrapped, reconcile any events a previous scan may
-	// have lost by crashing after upserting a competition but before committing
-	// its events. This is idempotent: unrecorded events are the only ones added.
-	if bootstrapped {
-		if err := s.reconcileEvents(ctx, now, users); err != nil {
-			return err
-		}
+	// Reconcile any events a previous scan may have lost by crashing after
+	// upserting a competition but before committing its events. This must run on
+	// every scan (including the bootstrap scan) so a first-scan interruption is
+	// also recovered. It is idempotent: unrecorded events are the only ones added.
+	if err := s.reconcileEvents(ctx, now, users); err != nil {
+		return err
 	}
 	if !bootstrapped {
 		if err := s.store.MarkBootstrapped(ctx); err != nil {

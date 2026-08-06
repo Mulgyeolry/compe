@@ -14,10 +14,11 @@ import (
 )
 
 // purgeCommittedEvents simulates a scan that was interrupted after upserting a
-// competition but before its events and notifications were durably committed.
-// It deletes only the event and notification rows, leaving the competition and
-// its change-detection observation intact so the normal scan path skips it.
-func purgeCommittedEvents(t *testing.T, path string) {
+// competition but before its events, notifications and bootstrap marker were
+// durably committed. It deletes only the event, notification and (optionally)
+// bootstrap rows, leaving the competition and its change-detection observation
+// intact so the normal scan path skips it.
+func purgeCommittedEvents(t *testing.T, path string, purgeBootstrap bool) {
 	t.Helper()
 	raw, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -27,6 +28,11 @@ func purgeCommittedEvents(t *testing.T, path string) {
 	for _, table := range []string{"competition_events", "user_notifications"} {
 		if _, err := raw.Exec("DELETE FROM " + table); err != nil {
 			t.Fatalf("purge %s: %v", table, err)
+		}
+	}
+	if purgeBootstrap {
+		if _, err := raw.Exec("DELETE FROM meta WHERE key='bootstrapped'"); err != nil {
+			t.Fatalf("purge bootstrap: %v", err)
 		}
 	}
 }
@@ -45,10 +51,25 @@ func countRows(t *testing.T, path, query string) int {
 	return count
 }
 
-// TestReconcileRecoversRegistrationOpened proves a scan-end reconciliation
-// restores a registration_opened event and a single user notification that a
-// previous scan lost when it crashed after ingesting the competition.
-func TestReconcileRecoversRegistrationOpened(t *testing.T) {
+func isBootstrapped(t *testing.T, path string) bool {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var count int
+	if err := raw.QueryRow("SELECT COUNT(*) FROM meta WHERE key='bootstrapped'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count > 0
+}
+
+// TestReconcileRecoversRegistrationOpenedOnBootstrap proves a scan-end
+// reconciliation restores a registration_opened event and a single user
+// notification, and re-writes the bootstrap marker, when the very first scan was
+// interrupted after ingesting the competition but before committing anything.
+func TestReconcileRecoversRegistrationOpenedOnBootstrap(t *testing.T) {
 	doc := model.Document{
 		Title: "2026 全国程序设计大赛报名通知",
 		URL:   testPageBase,
@@ -64,24 +85,32 @@ func TestReconcileRecoversRegistrationOpened(t *testing.T) {
 	app.SetNow(fixedNow)
 	ctx := context.Background()
 
-	// First scan ingests the competition and commits its registration_opened
-	// event and notification.
+	// First scan ingests the competition, commits its registration_opened event
+	// and notification, and marks the system bootstrapped.
 	if err := app.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM competition_events WHERE event_type='registration_opened'"); got != 1 {
 		t.Fatalf("initial registration_opened events=%d, want 1", got)
 	}
+	if !isBootstrapped(t, cfg.DBPath) {
+		t.Fatal("system should be bootstrapped after first scan")
+	}
 
-	// Simulate the interrupted scan: the competition and its observation remain,
-	// but the events and notifications were never durably written.
-	purgeCommittedEvents(t, cfg.DBPath)
+	// Simulate the interrupted bootstrap scan: the competition and its
+	// observation remain, but the events, notifications and bootstrap marker
+	// were never durably written.
+	purgeCommittedEvents(t, cfg.DBPath, true)
+	if isBootstrapped(t, cfg.DBPath) {
+		t.Fatal("bootstrapped should be false after purge")
+	}
 	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM competition_events"); got != 0 {
 		t.Fatalf("after purge events=%d, want 0", got)
 	}
 
 	// Second scan: content hash and analyzer version are unchanged, so the normal
-	// path skips the document; reconciliation restores the missing event.
+	// path skips the document; reconciliation (now unconditional) restores the
+	// missing event, notification and bootstrap marker in the same scan.
 	if err := app.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -90,6 +119,9 @@ func TestReconcileRecoversRegistrationOpened(t *testing.T) {
 	}
 	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM user_notifications"); got != 1 {
 		t.Fatalf("reconciled user_notifications=%d, want 1", got)
+	}
+	if !isBootstrapped(t, cfg.DBPath) {
+		t.Fatal("bootstrapped should be re-written after recovery scan")
 	}
 
 	// Third scan must not duplicate the event or notification.
@@ -105,8 +137,8 @@ func TestReconcileRecoversRegistrationOpened(t *testing.T) {
 }
 
 // TestReconcileRecoversCompetitionDiscovered proves reconciliation restores the
-// competition_discovered event for a current unknown/unknown announcement whose
-// event was lost to an interrupted scan.
+// competition_discovered event for a current unknown/unknown announcement after
+// the system is already bootstrapped (normal-operation recovery).
 func TestReconcileRecoversCompetitionDiscovered(t *testing.T) {
 	// A year-less, dateless announcement is analysed as unknown/unknown but is a
 	// current discoverable announcement, so it qualifies for competition_discovered.
@@ -132,7 +164,9 @@ func TestReconcileRecoversCompetitionDiscovered(t *testing.T) {
 		t.Fatalf("initial competition_discovered events=%d, want 1", got)
 	}
 
-	purgeCommittedEvents(t, cfg.DBPath)
+	// Keep the system bootstrapped; only the events and notifications are lost,
+	// which mirrors a crash during a normal (post-bootstrap) scan.
+	purgeCommittedEvents(t, cfg.DBPath, false)
 
 	if err := app.Run(ctx); err != nil {
 		t.Fatal(err)
