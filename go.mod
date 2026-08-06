@@ -1,6 +1,6 @@
 module competition-assistant
 
-go 1.25.0
+go 1.25.12
 
 require (
 	github.com/PuerkitoBio/goquery v1.10.3
