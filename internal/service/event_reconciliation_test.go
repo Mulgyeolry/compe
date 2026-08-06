@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"competition-assistant/internal/analyzer"
 	"competition-assistant/internal/config"
@@ -49,6 +50,114 @@ func countRows(t *testing.T, path, query string) int {
 		t.Fatal(err)
 	}
 	return count
+}
+
+// emptyCollector yields no candidates, so a scan with it performs no normal-path
+// ingestion and only the scan-end event reconciliation touches the database.
+func emptyCollector() *scriptedCollector {
+	return &scriptedCollector{
+		discover: func(context.Context, config.Source) ([]model.Candidate, error) { return nil, nil },
+		fetch:    func(context.Context, string) (model.Document, error) { return model.Document{}, nil },
+	}
+}
+
+// TestReconcileSkipsIneligibleCompetitions proves reconciliation never builds
+// events or notifications for a registration-open competition that is low-trust
+// or catalog-ineligible, while still reconciling an eligible control.
+func TestReconcileSkipsIneligibleCompetitions(t *testing.T) {
+	start := fixedNow()
+	future := start.Add(7 * 24 * time.Hour)
+	cases := []struct {
+		name        string
+		competition model.Competition
+		wantEvents  int
+	}{
+		{
+			name: "eligible control",
+			competition: model.Competition{
+				EntityKey:         "eligible-control",
+				Name:              "2026 程序设计大赛报名通知",
+				Status:            model.StatusRegistrationOpen,
+				RegistrationPhase: model.RegistrationOpen,
+				CompetitionPhase:  model.CompetitionUnknown,
+				RegistrationStart: &start,
+				RegistrationEnd:   &future,
+				OfficialURL:       testPageBase,
+				Trust:             model.TrustHigh,
+				FirstSeen:         fixedNow(),
+				LastSeen:          fixedNow(),
+				AnalyzerVersion:   "test",
+				ContentHash:       "hash-control",
+			},
+			wantEvents: 1,
+		},
+		{
+			name: "low trust",
+			competition: model.Competition{
+				EntityKey:         "low-trust",
+				Name:              "2026 程序设计大赛报名通知",
+				Status:            model.StatusRegistrationOpen,
+				RegistrationPhase: model.RegistrationOpen,
+				CompetitionPhase:  model.CompetitionUnknown,
+				RegistrationStart: &start,
+				RegistrationEnd:   &future,
+				OfficialURL:       testPageBase,
+				Trust:             model.TrustLow,
+				FirstSeen:         fixedNow(),
+				LastSeen:          fixedNow(),
+				AnalyzerVersion:   "test",
+				ContentHash:       "hash-low",
+			},
+			wantEvents: 0,
+		},
+		{
+			name: "catalog ineligible",
+			competition: model.Competition{
+				EntityKey:         "catalog-ineligible",
+				Name:              "2026 程序设计大赛获奖名单",
+				Status:            model.StatusRegistrationOpen,
+				RegistrationPhase: model.RegistrationOpen,
+				CompetitionPhase:  model.CompetitionUnknown,
+				RegistrationStart: &start,
+				RegistrationEnd:   &future,
+				OfficialURL:       testPageBase,
+				Trust:             model.TrustHigh,
+				FirstSeen:         fixedNow(),
+				LastSeen:          fixedNow(),
+				AnalyzerVersion:   "test",
+				ContentHash:       "hash-cat",
+			},
+			wantEvents: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig(t)
+			cfg.Sources = []config.Source{{ID: "dummy", Name: "dummy", Kind: "page", URL: testPageBase, Trust: "high", Limit: 1}}
+			database := openStore(t, cfg.DBPath)
+			defer database.Close()
+			ctx := context.Background()
+			if err := database.MarkBootstrapped(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, isNew, err := database.UpsertCompetition(ctx, tc.competition, "source", fixedNow()); err != nil || !isNew {
+				t.Fatalf("insert competition: isNew=%v err=%v", isNew, err)
+			}
+			sender := &memorySender{}
+			app := service.New(cfg, database, emptyCollector(), analyzer.New(cfg), sender, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			enableAllCategoryTestUser(t, database, app, "fixture@example.com", fixedNow())
+			app.SetNow(fixedNow)
+			if err := app.Run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM competition_events"); got != tc.wantEvents {
+				t.Fatalf("competition_events=%d, want %d", got, tc.wantEvents)
+			}
+			if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM user_notifications"); got != tc.wantEvents {
+				t.Fatalf("user_notifications=%d, want %d", got, tc.wantEvents)
+			}
+		})
+	}
 }
 
 func isBootstrapped(t *testing.T, path string) bool {

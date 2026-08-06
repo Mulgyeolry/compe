@@ -313,12 +313,18 @@ func (s *Service) reconcileEvents(ctx context.Context, now time.Time, users []mo
 }
 
 // reconcileEligible reports whether a persisted competition may have events
-// missing and therefore qualifies for scan-end reconciliation. It mirrors the
-// top-level gate changeEvents uses: only actionable competitions, or current
-// discoverable announcements (which may still need competition_discovered), are
-// considered. The actionable and discoverableAnnouncement checks already
-// exclude ended, low-trust, stale and catalog-ineligible competitions.
+// missing and therefore qualifies for scan-end reconciliation. A competition is
+// only reconciled if it is still catalog-eligible, not low-trust and not ended;
+// otherwise a historical or unqualified competition would be given global
+// events. Within that gate, either an actionable competition or a current
+// discoverable announcement (which may still need competition_discovered) is
+// reconciled.
 func reconcileEligible(competition model.Competition, now time.Time, freshness time.Duration) bool {
+	if !subscription.CatalogEligible(competition) ||
+		competition.Trust == model.TrustLow ||
+		competitionEnded(competition, now) {
+		return false
+	}
 	return actionable(competition, now, freshness) || discoverableAnnouncement(competition, now, freshness)
 }
 
