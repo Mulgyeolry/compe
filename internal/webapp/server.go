@@ -133,7 +133,7 @@ func New(database *store.Store, sender notifier.RecipientSender, manager *authn.
 	mux.HandleFunc("POST /logout", server.logout)
 	mux.HandleFunc("GET /unsubscribe", server.unsubscribePage)
 	mux.HandleFunc("POST /unsubscribe", server.unsubscribe)
-	server.handler = server.securityHeaders(mux)
+	server.handler = server.securityHeaders(server.requestObservability(mux))
 	return server, nil
 }
 
@@ -168,7 +168,7 @@ func (s *Server) ready(w http.ResponseWriter, request *http.Request) {
 	ctx, cancel := context.WithTimeout(request.Context(), 2*time.Second)
 	defer cancel()
 	if err := s.store.Ping(ctx); err != nil {
-		s.log.Error("readiness probe failed", "error", err)
+		s.log.Error("readiness probe failed", "request_id", requestIDFromContext(request.Context()), "error", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("not ready\n"))
 		return
@@ -1032,7 +1032,7 @@ func (s *Server) render(w http.ResponseWriter, status int, name string, data pag
 }
 
 func (s *Server) internalError(w http.ResponseWriter, request *http.Request, err error) {
-	s.log.Error("web request failed", "method", request.Method, "path", request.URL.Path, "error", err)
+	s.log.Error("web request failed", "method", request.Method, "path", request.URL.Path, "request_id", requestIDFromContext(request.Context()), "error", err)
 	http.Error(w, "服务器暂时无法处理该请求，请稍后重试。", http.StatusInternalServerError)
 }
 
