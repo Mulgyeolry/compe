@@ -1,5 +1,5 @@
-# Let Git detect text files, while keeping repository text normalized.
-* text=auto
+# Let Git detect text files, while keeping repository text normalized to LF.
+* text=auto eol=lf
 
 # Go and cross-platform project files must use LF.
 *.go text eol=lf
