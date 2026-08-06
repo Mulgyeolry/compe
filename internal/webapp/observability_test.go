@@ -1,0 +1,218 @@
+package webapp
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"competition-assistant/internal/authn"
+	"competition-assistant/internal/config"
+	"competition-assistant/internal/store"
+)
+
+// TestRequestIDGeneratedWithoutHeader verifies a request without X-Request-ID
+// receives a non-empty 32-char lowercase hex ID in both the response header and
+// the request context.
+func TestRequestIDGeneratedWithoutHeader(t *testing.T) {
+	var captured string
+	handler := (&Server{log: slog.New(slog.NewTextHandler(io.Discard, nil))}).requestObservability(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = requestIDFromContext(r.Context())
+		_, _ = w.Write([]byte("ok"))
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/some-path", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	headerID := response.Header().Get("X-Request-ID")
+	if headerID == "" {
+		t.Fatal("X-Request-ID header is empty")
+	}
+	if len(headerID) != 32 {
+		t.Fatalf("generated request id length=%d, want 32", len(headerID))
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(headerID) {
+		t.Fatalf("generated request id is not lowercase hex: %q", headerID)
+	}
+	if captured != headerID {
+		t.Fatalf("context id %q != header id %q", captured, headerID)
+	}
+}
+
+// TestRequestIDAcceptsValidClientID verifies a well-formed client ID is kept
+// verbatim and appears in both the context and the response header.
+func TestRequestIDAcceptsValidClientID(t *testing.T) {
+	const clientID = "abc-123_DEF.xYz"
+	var captured string
+	handler := (&Server{log: slog.New(slog.NewTextHandler(io.Discard, nil))}).requestObservability(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = requestIDFromContext(r.Context())
+		_, _ = w.Write([]byte("ok"))
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/some-path", nil)
+	request.Header.Set("X-Request-ID", clientID)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if got := response.Header().Get("X-Request-ID"); got != clientID {
+		t.Fatalf("header id %q, want %q", got, clientID)
+	}
+	if captured != clientID {
+		t.Fatalf("context id %q, want %q", captured, clientID)
+	}
+}
+
+// TestRequestIDRejectsInvalidOrOversized verifies invalid or too-long client
+// IDs are ignored and replaced with a freshly generated safe ID.
+func TestRequestIDRejectsInvalidOrOversized(t *testing.T) {
+	invalidIDs := []string{
+		"",
+		"has space",
+		"contains;injection",
+		"line\nbreak",
+		"uni" + "code界",
+		strings.Repeat("a", 65),
+	}
+	for _, provided := range invalidIDs {
+		handler := (&Server{log: slog.New(slog.NewTextHandler(io.Discard, nil))}).requestObservability(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("ok"))
+		}))
+		request := httptest.NewRequest(http.MethodGet, "/some-path", nil)
+		request.Header.Set("X-Request-ID", provided)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		got := response.Header().Get("X-Request-ID")
+		if got == provided {
+			t.Fatalf("invalid client id %q was accepted verbatim", provided)
+		}
+		if len(got) != 32 || !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(got) {
+			t.Fatalf("replacement id %q is not a 32-char lowercase hex", got)
+		}
+	}
+}
+
+// TestAccessLogFields verifies the access log records method, path, status,
+// bytes, duration and request_id while never leaking query strings, cookies or
+// authorization headers.
+func TestAccessLogFields(t *testing.T) {
+	var buffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buffer, nil))
+	server := &Server{log: logger}
+	handler := server.requestObservability(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("hello"))
+	}))
+	request := httptest.NewRequest(http.MethodPost, "/some/path?secret=query-token", nil)
+	request.Header.Set("Cookie", "session=super-secret-cookie")
+	request.Header.Set("Authorization", "Bearer super-secret-token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	entry := decodeAccessLog(t, buffer.Bytes())
+	rawLog := buffer.String()
+	if entry["method"] != http.MethodPost {
+		t.Fatalf("method=%v, want POST", entry["method"])
+	}
+	if entry["path"] != "/some/path" {
+		t.Fatalf("path=%v, want /some/path", entry["path"])
+	}
+	if statusOf(entry["status"]) != http.StatusCreated {
+		t.Fatalf("status=%v, want 201", entry["status"])
+	}
+	if statusOf(entry["bytes"]) != 5 {
+		t.Fatalf("bytes=%v, want 5", entry["bytes"])
+	}
+	if _, ok := entry["duration_ms"]; !ok {
+		t.Fatalf("duration_ms missing: %v", entry)
+	}
+	if _, ok := entry["request_id"]; !ok {
+		t.Fatalf("request_id missing: %v", entry)
+	}
+	for _, forbidden := range []string{"secret", "query-token", "super-secret-cookie", "super-secret-token", "Bearer", "session="} {
+		if strings.Contains(rawLog, forbidden) {
+			t.Fatalf("access log leaked %q: %s", forbidden, rawLog)
+		}
+	}
+}
+
+// TestAccessLogNonDefaultStatus verifies a custom handler returning a non-200
+// status is captured correctly for both status and bytes.
+func TestAccessLogNonDefaultStatus(t *testing.T) {
+	var buffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buffer, nil))
+	server := &Server{log: logger}
+	handler := server.requestObservability(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/boom", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	entry := decodeAccessLog(t, buffer.Bytes())
+	if statusOf(entry["status"]) != http.StatusInternalServerError {
+		t.Fatalf("status=%v, want 500", entry["status"])
+	}
+	if statusOf(entry["bytes"]) <= 0 {
+		t.Fatalf("bytes=%v, want > 0", entry["bytes"])
+	}
+}
+
+// TestHealthAndReadinessCarryRequestID verifies the probe endpoints still return
+// their correct business results and both carry an X-Request-ID response header.
+func TestHealthAndReadinessCarryRequestID(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "obs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	manager, err := authn.New("0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(database, &capturedSender{}, manager, config.Web{Enabled: true, PublicBaseURL: "http://example.test"}, time.UTC, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	client := httpServer.Client()
+
+	wantBody := map[string]string{"/healthz": "ok\n", "/readyz": "ready\n"}
+	for endpoint, body := range wantBody {
+		response, err := client.Get(httpServer.URL + endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rawBody, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if string(rawBody) != body {
+			t.Fatalf("%s body=%q, want %q", endpoint, string(rawBody), body)
+		}
+		if id := response.Header.Get("X-Request-ID"); len(id) != 32 {
+			t.Fatalf("%s missing 32-char X-Request-ID: %q", endpoint, id)
+		}
+	}
+}
+
+func decodeAccessLog(t *testing.T, raw []byte) map[string]any {
+	t.Helper()
+	var entry map[string]any
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		t.Fatalf("decode access log: %v", err)
+	}
+	return entry
+}
+
+func statusOf(value any) int {
+	if number, ok := value.(float64); ok {
+		return int(number)
+	}
+	return -1
+}
