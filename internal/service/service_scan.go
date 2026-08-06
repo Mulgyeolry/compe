@@ -90,6 +90,42 @@ func (s *Service) run(ctx context.Context) error {
 		return err
 	}
 	eventMap := map[int64][]model.Event{}
+	successfulSources, err := s.scanConfiguredSources(ctx, now, bootstrapped, eventMap)
+	if err != nil {
+		return err
+	}
+	if successfulSources == 0 {
+		return errors.New("all configured sources failed")
+	}
+
+	users, err := s.store.ListNotificationUsers(ctx)
+	if err != nil {
+		return err
+	}
+	if err := s.commitFreshEvents(ctx, now, users, eventMap); err != nil {
+		return err
+	}
+	if !bootstrapped {
+		if err := s.store.MarkBootstrapped(ctx); err != nil {
+			return err
+		}
+	}
+	if err := s.deliverUserPending(ctx, now); err != nil {
+		return err
+	}
+	if alertErr := s.notifyUnhealthySources(ctx, now); alertErr != nil {
+		// An alerting failure must not invalidate a successful scan.
+		s.log.Error("source health alert failed", "error", alertErr)
+	}
+	s.log.Info("competition scan completed", "sources", successfulSources)
+	return nil
+}
+
+// scanConfiguredSources discovers candidates from every configured source and
+// feeds them through analysis and ingestion. A source that fails discovery is
+// marked unhealthy and the scan continues; the number of sources that produced
+// candidates is returned for the "all configured sources failed" gate.
+func (s *Service) scanConfiguredSources(ctx context.Context, now time.Time, bootstrapped bool, eventMap map[int64][]model.Event) (int, error) {
 	successfulSources := 0
 	for _, source := range s.cfg.Sources {
 		candidates, err := s.collector.Discover(ctx, source)
@@ -100,118 +136,137 @@ func (s *Service) run(ctx context.Context) error {
 		}
 		successfulSources++
 		s.recordSourceHealth(ctx, source, true)
-		for _, candidate := range candidates {
-			if s.analyzer.CandidateScore(candidate.Title, candidate.Snippet) < 15 {
-				continue
-			}
-			doc, err := s.collector.Fetch(ctx, candidate.URL)
-			if err != nil {
-				s.log.Warn("candidate fetch failed", "source", source.ID, "url", candidate.URL, "error", err)
-				continue
-			}
-			trust := analyzer.TrustForURL(doc.URL, source, s.cfg)
-			hash := contentHash(fmt.Sprintf("%s\n[published_at]%s\n[listing]%t", doc.Text, doc.PublishedAtRaw, doc.IsListing))
-			changed, err := s.store.RecordObservationVersioned(ctx, source.ID, doc, hash, trust, s.analyzer.Version(), now)
-			if err != nil {
-				return err
-			}
-			if !changed || trust == model.TrustLow {
-				continue
-			}
-			competition, relevant, err := s.analyzer.Analyze(ctx, candidate, doc, trust, now)
-			pendingCandidate := relevant && analyzer.IsPendingCandidateError(err)
-			audit := competition.ExtractionAudit
-			if err != nil && audit.AnalyzerVersion == "" {
-				audit = model.AnalysisAudit{AnalyzerVersion: s.analyzer.Version(), InputHash: hash, Error: err.Error(), AnalyzedAt: now}
-			}
-			if audit.AnalyzerVersion != "" {
-				if auditErr := s.store.RecordAnalysisAudit(ctx, source.ID, doc.URL, hash, audit); auditErr != nil {
-					return fmt.Errorf("record analysis audit: %w", auditErr)
-				}
-			}
-			if err != nil {
-				if retryErr := s.store.RetryDocumentOnNextScan(ctx, source.ID, doc.URL); retryErr != nil {
-					s.log.Warn("candidate retry baseline reset failed", "source", source.ID, "url", doc.URL, "error", retryErr)
-				}
-				s.log.Warn("candidate analysis deferred", "url", doc.URL, "error", err)
-				if !pendingCandidate {
-					continue
-				}
-			}
-			if !relevant {
-				continue
-			}
-			// Fill FirstSeen from the page's earliest observation before the
-			// timeliness gate. A brand-new competition analysed today may have been
-			// first observed in a previous scan (when AI failed); without this, its
-			// FirstSeen would be zero at the gate and the year-less/dateless case
-			// would be wrongly rejected by the freshness fallback.
-			if competition.FirstSeen.IsZero() {
-				firstSeen, firstSeenErr := s.store.FirstObservedAt(ctx, doc.URL)
-				if firstSeenErr != nil {
-					return fmt.Errorf("read first observed time for %s: %w", doc.URL, firstSeenErr)
-				}
-				competition.FirstSeen = firstSeen
-			}
-			// Dual-dimension gate at ingest: a competition must satisfy both
-			// trust and timeliness to be persisted. A first-time competition
-			// from an explicitly past-year edition, or one whose page was
-			// published long ago, is archived and must not enter the catalog
-			// even though its source is trustworthy.
-			if !isCurrentEdition(competition, now, s.freshnessWindow()) {
-				s.log.Debug("skipping archived previous-year competition",
-					"source", source.ID, "url", doc.URL, "name", competition.Name)
-				continue
-			}
-			competition.AnalyzerVersion = s.analyzer.Version()
-			competition.ContentHash = hash
-			old, isNew, err := s.store.UpsertCompetition(ctx, competition, source.ID, now)
-			if err != nil {
-				return err
-			}
-			var saved model.Competition
-			if isNew {
-				saved, err = s.store.GetCompetition(ctx, competition.EntityKey)
-			} else {
-				// A changed announcement title can be merged into an existing
-				// competition whose canonical entity key is different.
-				saved, err = s.store.GetCompetitionByID(ctx, old.ID)
-			}
-			if err != nil {
-				return err
-			}
-			competition = saved
-			if isNew && actionable(competition, now, s.freshnessWindow()) {
-				secondary := s.collectResearchSources(ctx, competition)
-				analysis, keywords, analysisErr := s.analyzer.AnalyzeResearch(ctx, competition, doc, secondary, now)
-				if analysisErr != nil {
-					s.log.Warn("competition qualitative analysis fell back to official content", "competition_id", competition.ID, "error", analysisErr)
-				}
-				if err := s.store.UpdateCompetitionEnrichment(ctx, competition.ID, keywords, analysis); err != nil {
-					return err
-				}
-				competition, err = s.store.GetCompetitionByID(ctx, competition.ID)
-				if err != nil {
-					return err
-				}
-			}
-			events := changeEvents(old, competition, isNew, now, s.freshnessWindow())
-			if !bootstrapped && isNew && !actionable(competition, now, s.freshnessWindow()) && !discoverableAnnouncement(competition, now, s.freshnessWindow()) {
-				events = nil
-			}
-			if len(events) > 0 {
-				eventMap[competition.ID] = append(eventMap[competition.ID], events...)
-			}
+		if err := s.scanSource(ctx, source, candidates, now, bootstrapped, eventMap); err != nil {
+			return 0, err
 		}
 	}
-	if successfulSources == 0 {
-		return errors.New("all configured sources failed")
-	}
+	return successfulSources, nil
+}
 
-	users, err := s.store.ListNotificationUsers(ctx)
+// scanSource iterates the candidates a single source produced, fetching each
+// relevant one and ingesting it. Fetches that fail are skipped; a fatal store
+// or analysis error aborts the whole scan.
+func (s *Service) scanSource(ctx context.Context, source config.Source, candidates []model.Candidate, now time.Time, bootstrapped bool, eventMap map[int64][]model.Event) error {
+	for _, candidate := range candidates {
+		if s.analyzer.CandidateScore(candidate.Title, candidate.Snippet) < 15 {
+			continue
+		}
+		doc, err := s.collector.Fetch(ctx, candidate.URL)
+		if err != nil {
+			s.log.Warn("candidate fetch failed", "source", source.ID, "url", candidate.URL, "error", err)
+			continue
+		}
+		if err := s.processCandidate(ctx, source, candidate, doc, now, bootstrapped, eventMap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// processCandidate analyses a fetched document and ingests the resulting
+// competition, collecting any lifecycle events. CandidateScore gating, trust,
+// content hashing, the current-edition gate, research enrichment and the
+// cross-entity-key upsert merge are all preserved verbatim.
+func (s *Service) processCandidate(ctx context.Context, source config.Source, candidate model.Candidate, doc model.Document, now time.Time, bootstrapped bool, eventMap map[int64][]model.Event) error {
+	trust := analyzer.TrustForURL(doc.URL, source, s.cfg)
+	hash := contentHash(fmt.Sprintf("%s\n[published_at]%s\n[listing]%t", doc.Text, doc.PublishedAtRaw, doc.IsListing))
+	changed, err := s.store.RecordObservationVersioned(ctx, source.ID, doc, hash, trust, s.analyzer.Version(), now)
 	if err != nil {
 		return err
 	}
+	if !changed || trust == model.TrustLow {
+		return nil
+	}
+	competition, relevant, err := s.analyzer.Analyze(ctx, candidate, doc, trust, now)
+	pendingCandidate := relevant && analyzer.IsPendingCandidateError(err)
+	audit := competition.ExtractionAudit
+	if err != nil && audit.AnalyzerVersion == "" {
+		audit = model.AnalysisAudit{AnalyzerVersion: s.analyzer.Version(), InputHash: hash, Error: err.Error(), AnalyzedAt: now}
+	}
+	if audit.AnalyzerVersion != "" {
+		if auditErr := s.store.RecordAnalysisAudit(ctx, source.ID, doc.URL, hash, audit); auditErr != nil {
+			return fmt.Errorf("record analysis audit: %w", auditErr)
+		}
+	}
+	if err != nil {
+		if retryErr := s.store.RetryDocumentOnNextScan(ctx, source.ID, doc.URL); retryErr != nil {
+			s.log.Warn("candidate retry baseline reset failed", "source", source.ID, "url", doc.URL, "error", retryErr)
+		}
+		s.log.Warn("candidate analysis deferred", "url", doc.URL, "error", err)
+		if !pendingCandidate {
+			return nil
+		}
+	}
+	if !relevant {
+		return nil
+	}
+	// Fill FirstSeen from the page's earliest observation before the
+	// timeliness gate. A brand-new competition analysed today may have been
+	// first observed in a previous scan (when AI failed); without this, its
+	// FirstSeen would be zero at the gate and the year-less/dateless case
+	// would be wrongly rejected by the freshness fallback.
+	if competition.FirstSeen.IsZero() {
+		firstSeen, firstSeenErr := s.store.FirstObservedAt(ctx, doc.URL)
+		if firstSeenErr != nil {
+			return fmt.Errorf("read first observed time for %s: %w", doc.URL, firstSeenErr)
+		}
+		competition.FirstSeen = firstSeen
+	}
+	// Dual-dimension gate at ingest: a competition must satisfy both
+	// trust and timeliness to be persisted. A first-time competition
+	// from an explicitly past-year edition, or one whose page was
+	// published long ago, is archived and must not enter the catalog
+	// even though its source is trustworthy.
+	if !isCurrentEdition(competition, now, s.freshnessWindow()) {
+		s.log.Debug("skipping archived previous-year competition",
+			"source", source.ID, "url", doc.URL, "name", competition.Name)
+		return nil
+	}
+	competition.AnalyzerVersion = s.analyzer.Version()
+	competition.ContentHash = hash
+	old, isNew, err := s.store.UpsertCompetition(ctx, competition, source.ID, now)
+	if err != nil {
+		return err
+	}
+	var saved model.Competition
+	if isNew {
+		saved, err = s.store.GetCompetition(ctx, competition.EntityKey)
+	} else {
+		// A changed announcement title can be merged into an existing
+		// competition whose canonical entity key is different.
+		saved, err = s.store.GetCompetitionByID(ctx, old.ID)
+	}
+	if err != nil {
+		return err
+	}
+	competition = saved
+	if isNew && actionable(competition, now, s.freshnessWindow()) {
+		secondary := s.collectResearchSources(ctx, competition)
+		analysis, keywords, analysisErr := s.analyzer.AnalyzeResearch(ctx, competition, doc, secondary, now)
+		if analysisErr != nil {
+			s.log.Warn("competition qualitative analysis fell back to official content", "competition_id", competition.ID, "error", analysisErr)
+		}
+		if err := s.store.UpdateCompetitionEnrichment(ctx, competition.ID, keywords, analysis); err != nil {
+			return err
+		}
+		competition, err = s.store.GetCompetitionByID(ctx, competition.ID)
+		if err != nil {
+			return err
+		}
+	}
+	events := changeEvents(old, competition, isNew, now, s.freshnessWindow())
+	if !bootstrapped && isNew && !actionable(competition, now, s.freshnessWindow()) && !discoverableAnnouncement(competition, now, s.freshnessWindow()) {
+		events = nil
+	}
+	if len(events) > 0 {
+		eventMap[competition.ID] = append(eventMap[competition.ID], events...)
+	}
+	return nil
+}
+
+// commitFreshEvents turns each competition's collected events into fresh,
+// unrecorded user dispatches and commits them transactionally.
+func (s *Service) commitFreshEvents(ctx context.Context, now time.Time, users []model.NotificationUser, eventMap map[int64][]model.Event) error {
 	for competitionID, events := range eventMap {
 		competition, err := s.store.GetCompetitionByID(ctx, competitionID)
 		if err != nil {
@@ -251,19 +306,6 @@ func (s *Service) run(ctx context.Context) error {
 			return err
 		}
 	}
-	if !bootstrapped {
-		if err := s.store.MarkBootstrapped(ctx); err != nil {
-			return err
-		}
-	}
-	if err := s.deliverUserPending(ctx, now); err != nil {
-		return err
-	}
-	if alertErr := s.notifyUnhealthySources(ctx, now); alertErr != nil {
-		// An alerting failure must not invalidate a successful scan.
-		s.log.Error("source health alert failed", "error", alertErr)
-	}
-	s.log.Info("competition scan completed", "sources", successfulSources)
 	return nil
 }
 
