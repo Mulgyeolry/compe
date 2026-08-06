@@ -133,7 +133,11 @@ func New(database *store.Store, sender notifier.RecipientSender, manager *authn.
 	mux.HandleFunc("POST /logout", server.logout)
 	mux.HandleFunc("GET /unsubscribe", server.unsubscribePage)
 	mux.HandleFunc("POST /unsubscribe", server.unsubscribe)
-	server.handler = server.securityHeaders(server.requestObservability(mux))
+	server.handler = server.securityHeaders(
+		server.requestObservability(
+			server.recoverPanics(mux),
+		),
+	)
 	return server, nil
 }
 
