@@ -105,6 +105,14 @@ func (s *Service) run(ctx context.Context) error {
 	if err := s.commitFreshEvents(ctx, now, users, eventMap); err != nil {
 		return err
 	}
+	// After the system is bootstrapped, reconcile any events a previous scan may
+	// have lost by crashing after upserting a competition but before committing
+	// its events. This is idempotent: unrecorded events are the only ones added.
+	if bootstrapped {
+		if err := s.reconcileEvents(ctx, now, users); err != nil {
+			return err
+		}
+	}
 	if !bootstrapped {
 		if err := s.store.MarkBootstrapped(ctx); err != nil {
 			return err
@@ -273,38 +281,85 @@ func (s *Service) commitFreshEvents(ctx context.Context, now time.Time, users []
 			return err
 		}
 		events = eventsForCurrentState(competition, deduplicateEvents(events))
-		fresh, err := s.store.UnrecordedCompetitionEvents(ctx, competitionID, events)
+		if err := s.commitEventsForUsers(ctx, now, users, competition, events); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileEvents recovers competition events that were lost when a previous
+// scan was interrupted after upserting a competition but before committing its
+// events. For every persisted competition it re-derives the events implied by
+// the current canonical state, adds only those not already recorded (unique
+// constraints make this idempotent), and writes matching user notifications in
+// the same transaction. It never fabricates events for competitions that are
+// ended, low-trust, stale or catalog-ineligible.
+func (s *Service) reconcileEvents(ctx context.Context, now time.Time, users []model.NotificationUser) error {
+	competitions, err := s.store.ListCompetitions(ctx)
+	if err != nil {
+		return err
+	}
+	freshness := s.freshnessWindow()
+	for _, competition := range competitions {
+		if !reconcileEligible(competition, now, freshness) {
+			continue
+		}
+		events := eventsForCurrentState(competition, deduplicateEvents(backfillEvents(competition, now, s.cfg.Location, freshness)))
+		if err := s.commitEventsForUsers(ctx, now, users, competition, events); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileEligible reports whether a persisted competition may have events
+// missing and therefore qualifies for scan-end reconciliation. It mirrors the
+// top-level gate changeEvents uses: only actionable competitions, or current
+// discoverable announcements (which may still need competition_discovered), are
+// considered. The actionable and discoverableAnnouncement checks already
+// exclude ended, low-trust, stale and catalog-ineligible competitions.
+func reconcileEligible(competition model.Competition, now time.Time, freshness time.Duration) bool {
+	return actionable(competition, now, freshness) || discoverableAnnouncement(competition, now, freshness)
+}
+
+// commitEventsForUsers records any unrecorded competition events and, for each
+// currently matching user, writes the corresponding notification outbox rows in
+// the same transaction. Events are derived from the competition's current state
+// and filtered by the store's unique constraints, so repeated calls are
+// idempotent.
+func (s *Service) commitEventsForUsers(ctx context.Context, now time.Time, users []model.NotificationUser, competition model.Competition, events []model.Event) error {
+	fresh, err := s.store.UnrecordedCompetitionEvents(ctx, competition.ID, events)
+	if err != nil {
+		return err
+	}
+	if len(fresh) == 0 {
+		return nil
+	}
+	var userDispatches []store.UserEventDispatch
+	competitionProfile := subscription.Profile(competition)
+	for _, user := range users {
+		decision, err := s.store.GetUserCompetitionDecision(ctx, user.User.ID, competition.ID)
 		if err != nil {
 			return err
 		}
-		if len(fresh) == 0 {
+		matched := subscription.MatchingEventsForUser(user.Preferences, competition, competitionProfile, fresh, decision, now)
+		if len(matched) == 0 {
 			continue
 		}
-		var userDispatches []store.UserEventDispatch
-		competitionProfile := subscription.Profile(competition)
-		for _, user := range users {
-			decision, err := s.store.GetUserCompetitionDecision(ctx, user.User.ID, competitionID)
-			if err != nil {
-				return err
-			}
-			matched := subscription.MatchingEventsForUser(user.Preferences, competition, competitionProfile, fresh, decision, now)
-			if len(matched) == 0 {
-				continue
-			}
-			dueAt, err := subscription.NextDelivery(now, user.Preferences)
-			if err != nil {
-				s.log.Warn("invalid user delivery preference", "user_id", user.User.ID, "error", err)
-				continue
-			}
-			nonce := matched[0].Type + ":" + matched[0].Key
-			group := subscription.DeliveryGroupKey(user.User.ID, competitionID, user.Preferences.Frequency, dueAt, nonce)
-			for _, event := range matched {
-				userDispatches = append(userDispatches, store.UserEventDispatch{UserID: user.User.ID, Event: event, GroupKey: group, DueAt: dueAt})
-			}
+		dueAt, err := subscription.NextDelivery(now, user.Preferences)
+		if err != nil {
+			s.log.Warn("invalid user delivery preference", "user_id", user.User.ID, "error", err)
+			continue
 		}
-		if err := s.store.CommitCompetitionEvents(ctx, competitionID, fresh, userDispatches, now); err != nil {
-			return err
+		nonce := matched[0].Type + ":" + matched[0].Key
+		group := subscription.DeliveryGroupKey(user.User.ID, competition.ID, user.Preferences.Frequency, dueAt, nonce)
+		for _, event := range matched {
+			userDispatches = append(userDispatches, store.UserEventDispatch{UserID: user.User.ID, Event: event, GroupKey: group, DueAt: dueAt})
 		}
+	}
+	if err := s.store.CommitCompetitionEvents(ctx, competition.ID, fresh, userDispatches, now); err != nil {
+		return err
 	}
 	return nil
 }
