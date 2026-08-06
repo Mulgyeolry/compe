@@ -118,6 +118,7 @@ func New(database *store.Store, sender notifier.RecipientSender, manager *authn.
 	}
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFiles))))
 	mux.HandleFunc("GET /healthz", server.health)
+	mux.HandleFunc("GET /readyz", server.ready)
 	mux.HandleFunc("GET /", server.home)
 	mux.HandleFunc("POST /auth/request", server.requestCode)
 	mux.HandleFunc("POST /auth/verify", server.verifyCode)
@@ -154,6 +155,26 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+// ready reports whether the application is ready to handle normal requests by
+// probing the single critical local dependency, SQLite. External dependencies
+// (LLM, Apprise, search, fetched sites) are deliberately excluded so a brief
+// failure of any of them does not mark the whole application unready. The
+// probe is bounded by a two-second timeout and the HTTP response never exposes
+// internal database errors.
+func (s *Server) ready(w http.ResponseWriter, request *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	ctx, cancel := context.WithTimeout(request.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.store.Ping(ctx); err != nil {
+		s.log.Error("readiness probe failed", "error", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("not ready\n"))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready\n"))
 }
 
 func (s *Server) home(w http.ResponseWriter, request *http.Request) {
