@@ -31,9 +31,16 @@ const (
 //go:embed templates/*.html static/*
 var assets embed.FS
 
+// readinessChecker is the consumer-owned, single-method dependency the
+// readiness endpoint needs to probe the critical local dependency.
+type readinessChecker interface {
+	Ping(context.Context) error
+}
+
 type Server struct {
 	store         *store.Store
 	sessionLookup sessionLookup
+	readiness     readinessChecker
 	sender        notifier.RecipientSender
 	auth          *authn.Manager
 	web           config.Web
@@ -109,7 +116,7 @@ func New(database *store.Store, sender notifier.RecipientSender, manager *authn.
 	if err != nil {
 		return nil, fmt.Errorf("parse web templates: %w", err)
 	}
-	server := &Server{store: database, sessionLookup: database, sender: sender, auth: manager, web: web, log: logger, location: location, now: time.Now, template: templates, lastTestMail: make(map[int64]time.Time)}
+	server := &Server{store: database, sessionLookup: database, readiness: database, sender: sender, auth: manager, web: web, log: logger, location: location, now: time.Now, template: templates, lastTestMail: make(map[int64]time.Time)}
 	mux := http.NewServeMux()
 	staticFiles, err := fs.Sub(assets, "static")
 	if err != nil {
@@ -170,7 +177,7 @@ func (s *Server) ready(w http.ResponseWriter, request *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	ctx, cancel := context.WithTimeout(request.Context(), 2*time.Second)
 	defer cancel()
-	if err := s.store.Ping(ctx); err != nil {
+	if err := s.readiness.Ping(ctx); err != nil {
 		s.log.Error("readiness probe failed", "request_id", requestIDFromContext(request.Context()), "error", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("not ready\n"))
