@@ -393,3 +393,61 @@ func TestWebUsesInjectedTimezone(t *testing.T) {
 		t.Fatalf("test mail timestamp still uses hardcoded UTC+8: %q", sender.body)
 	}
 }
+
+// TestHealthAndReadiness verifies /healthz stays up regardless of database
+// state while /readyz reflects database availability, without leaking internal
+// error details in the failure response.
+func TestHealthAndReadiness(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "readiness.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := authn.New("0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(database, &capturedSender{}, manager, config.Web{Enabled: true, PublicBaseURL: "http://example.test"}, time.UTC, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	client := httpServer.Client()
+
+	// Healthy database: both endpoints report ready.
+	assertPlainResponse(t, client, httpServer.URL+"/healthz", http.StatusOK, "ok\n")
+	assertPlainResponse(t, client, httpServer.URL+"/readyz", http.StatusOK, "ready\n")
+
+	// Shut the database down: liveness stays up, readiness becomes 503.
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertPlainResponse(t, client, httpServer.URL+"/healthz", http.StatusOK, "ok\n")
+	body := assertPlainResponse(t, client, httpServer.URL+"/readyz", http.StatusServiceUnavailable, "not ready\n")
+	if strings.Contains(body, "sqlite") || strings.Contains(body, "ping failed") {
+		t.Fatalf("readiness failure leaked internal database details: %q", body)
+	}
+}
+
+func assertPlainResponse(t *testing.T, client *http.Client, address string, wantStatus int, wantBody string) string {
+	t.Helper()
+	response, err := client.Get(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != wantStatus {
+		t.Fatalf("%s status=%d, want %d", address, response.StatusCode, wantStatus)
+	}
+	if contentType := response.Header.Get("Content-Type"); contentType != "text/plain; charset=utf-8" {
+		t.Fatalf("%s content-type=%q, want %q", address, contentType, "text/plain; charset=utf-8")
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != wantBody {
+		t.Fatalf("%s body=%q, want %q", address, string(body), wantBody)
+	}
+	return string(body)
+}

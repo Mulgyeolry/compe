@@ -44,6 +44,16 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// Ping verifies the underlying SQLite connection is alive and usable. It is
+// used by the readiness endpoint and never exposes database internals; errors
+// are wrapped with enough context to be traced in server logs.
+func (s *Store) Ping(ctx context.Context) error {
+	if err := s.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("database ping failed: %w", err)
+	}
+	return nil
+}
+
 // RecordObservationVersioned treats a newer analyzer version as a meaningful
 // change even when the fetched bytes are identical. This lets corrected
 // extraction logic revisit previously classified pages without deleting the
