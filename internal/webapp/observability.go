@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"io"
 	"net/http"
 	"time"
 )
@@ -21,15 +23,6 @@ func withRequestID(ctx context.Context, id string) context.Context {
 func requestIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(requestIDKey{}).(string)
 	return id
-}
-
-// normalizeRequestID accepts a client-supplied X-Request-ID only when it is
-// well-formed; otherwise it generates a fresh random ID.
-func normalizeRequestID(provided string) string {
-	if validRequestID(provided) {
-		return provided
-	}
-	return newRequestID()
 }
 
 // validRequestID reports whether id is 1..64 ASCII letters, digits, '-', '_' or
@@ -50,34 +43,63 @@ func validRequestID(id string) bool {
 	return true
 }
 
-// newRequestID returns a 32-character lowercase hex string from 16 random
-// bytes. It uses crypto/rand exclusively; no timestamp or counter is involved.
-func newRequestID() string {
+// generateRequestID reads 16 random bytes from reader and returns them as a
+// 32-character lowercase hex string. It uses io.ReadFull so a short or failed
+// read is surfaced as an error rather than yielding a truncated or zero ID.
+func generateRequestID(reader io.Reader) (string, error) {
 	var buffer [16]byte
-	if _, err := rand.Read(buffer[:]); err != nil {
-		// crypto/rand.Read on a fixed-size buffer never fails on supported
-		// platforms; keep the zero buffer rather than falling back to a
-		// non-cryptographic source.
-		return hex.EncodeToString(buffer[:])
+	if _, err := io.ReadFull(reader, buffer[:]); err != nil {
+		return "", err
 	}
-	return hex.EncodeToString(buffer[:])
+	return hex.EncodeToString(buffer[:]), nil
 }
 
-// responseRecorder wraps an http.ResponseWriter to capture the response status
-// and body byte count for access logging. Unwrap exposes the underlying writer
+// newRequestID returns a fresh 32-character lowercase hex ID from crypto/rand.
+// Callers must handle the error instead of falling back to a fixed value.
+func newRequestID() (string, error) {
+	return generateRequestID(rand.Reader)
+}
+
+// resolveRequestID returns a client-supplied ID when it is well-formed,
+// otherwise a freshly generated random one. If generation fails the error is
+// returned so the caller can fail the request rather than continue with a
+// predictable ID.
+func resolveRequestID(provided string) (string, error) {
+	if validRequestID(provided) {
+		return provided, nil
+	}
+	return newRequestID()
+}
+
+// errRequestIDGeneration signals that no usable request ID could be produced.
+var errRequestIDGeneration = errors.New("request ID generation failed")
+
+// responseRecorder wraps an http.ResponseWriter to capture the first effective
+// response status and the body byte count for access logging. The status is
+// recorded only once: later WriteHeader calls and implicit-200 writes must not
+// overwrite an already-committed status. Unwrap exposes the underlying writer
 // so http.ResponseController keeps working.
 type responseRecorder struct {
 	http.ResponseWriter
-	status int
-	bytes  int
+	status      int
+	wroteHeader bool
+	bytes       int
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
+	if r.wroteHeader {
+		return
+	}
 	r.status = status
+	r.wroteHeader = true
 	r.ResponseWriter.WriteHeader(status)
 }
 
 func (r *responseRecorder) Write(p []byte) (int, error) {
+	if !r.wroteHeader {
+		r.status = http.StatusOK
+		r.wroteHeader = true
+	}
 	n, err := r.ResponseWriter.Write(p)
 	r.bytes += n
 	return n, err
@@ -86,6 +108,10 @@ func (r *responseRecorder) Write(p []byte) (int, error) {
 func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 func (r *responseRecorder) Flush() {
+	if !r.wroteHeader {
+		r.status = http.StatusOK
+		r.wroteHeader = true
+	}
 	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -97,7 +123,12 @@ func (r *responseRecorder) Flush() {
 // to avoid log spam.
 func (s *Server) requestObservability(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		id := normalizeRequestID(request.Header.Get("X-Request-ID"))
+		id, err := resolveRequestID(request.Header.Get("X-Request-ID"))
+		if err != nil {
+			s.log.Error(errRequestIDGeneration.Error(), "error", err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
 		request = request.WithContext(withRequestID(request.Context(), id))
 		w.Header().Set("X-Request-ID", id)
 		recorder := &responseRecorder{ResponseWriter: w, status: http.StatusOK}

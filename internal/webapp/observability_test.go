@@ -3,6 +3,7 @@ package webapp
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -200,6 +201,108 @@ func TestHealthAndReadinessCarryRequestID(t *testing.T) {
 		}
 	}
 }
+
+// TestResponseRecorderFirstStatusWins verifies the recorder keeps the first
+// effective status and never lets later WriteHeader or implicit-200 writes
+// overwrite it.
+func TestResponseRecorderFirstStatusWins(t *testing.T) {
+	cases := []struct {
+		name   string
+		handle func(http.ResponseWriter)
+		want   int
+	}{
+		{"WriteHeader then WriteHeader", func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusCreated)
+			w.WriteHeader(http.StatusInternalServerError)
+		}, http.StatusCreated},
+		{"Write then WriteHeader", func(w http.ResponseWriter) {
+			_, _ = w.Write([]byte("body"))
+			w.WriteHeader(http.StatusInternalServerError)
+		}, http.StatusOK},
+		{"no explicit write", func(http.ResponseWriter) {}, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buffer bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buffer, nil))
+			server := &Server{log: logger}
+			handler := server.requestObservability(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				tc.handle(w)
+			}))
+			request := httptest.NewRequest(http.MethodGet, "/some-path", nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			entry := decodeAccessLog(t, buffer.Bytes())
+			if statusOf(entry["status"]) != tc.want {
+				t.Fatalf("status=%v, want %d", entry["status"], tc.want)
+			}
+		})
+	}
+}
+
+// TestGenerateRequestIDFailure verifies generateRequestID surfaces a failed or
+// short read as an error (never a zero ID) and produces 32 lowercase hex on the
+// normal path.
+func TestGenerateRequestIDFailure(t *testing.T) {
+	if id, err := generateRequestID(failingReader{}); err == nil || id != "" {
+		t.Fatalf("expected error and empty id, got id=%q err=%v", id, err)
+	}
+	id, err := generateRequestID(strings.NewReader("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(id) != 32 || !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(id) {
+		t.Fatalf("unexpected normal id: %q", id)
+	}
+}
+
+// TestProbeEndpointsSkipAccessLog verifies /healthz and a successful /readyz do
+// not write an "http request" access log, while a failing /readyz still records
+// the readiness error.
+func TestProbeEndpointsSkipAccessLog(t *testing.T) {
+	var buffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buffer, nil))
+	database, err := store.Open(filepath.Join(t.TempDir(), "probe.log.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := authn.New("0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(database, &capturedSender{}, manager, config.Web{Enabled: true, PublicBaseURL: "http://example.test"}, time.UTC, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	client := httpServer.Client()
+
+	if _, err := client.Get(httpServer.URL + "/healthz"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Get(httpServer.URL + "/readyz"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buffer.String(), "http request") {
+		t.Fatalf("probe endpoints produced access log: %s", buffer.String())
+	}
+
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Get(httpServer.URL + "/readyz"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buffer.String(), "readiness probe failed") {
+		t.Fatalf("failing readyz did not record readiness error: %s", buffer.String())
+	}
+}
+
+// failingReader always returns an error, simulating a crypto/rand failure.
+type failingReader struct{}
+
+func (failingReader) Read(_ []byte) (int, error) { return 0, errors.New("boom") }
 
 func decodeAccessLog(t *testing.T, raw []byte) map[string]any {
 	t.Helper()
