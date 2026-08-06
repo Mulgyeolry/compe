@@ -299,6 +299,57 @@ func TestProbeEndpointsSkipAccessLog(t *testing.T) {
 	}
 }
 
+// TestObservabilityFailureKeepsSecurityHeaders verifies that when request ID
+// generation fails the downstream handler does not run, the response is a
+// generic HTTP 500 that leaks no internal error and still carries the security
+// headers, and no forged request ID is echoed.
+func TestObservabilityFailureKeepsSecurityHeaders(t *testing.T) {
+	var buffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buffer, nil))
+	server := &Server{log: logger}
+
+	downstreamRan := false
+	handler := server.securityHeaders(server.requestObservabilityWithGenerator(
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			downstreamRan = true
+		}),
+		func() (string, error) { return "", errors.New("boom") },
+	))
+
+	request := httptest.NewRequest(http.MethodGet, "/some-path", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if downstreamRan {
+		t.Fatal("downstream handler ran despite request ID generation failure")
+	}
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", response.Code)
+	}
+	body := response.Body.String()
+	if strings.Contains(body, "boom") {
+		t.Fatalf("internal error leaked in response body: %q", body)
+	}
+	if strings.TrimSpace(body) != http.StatusText(http.StatusInternalServerError) {
+		t.Fatalf("body=%q, want generic %q", body, http.StatusText(http.StatusInternalServerError))
+	}
+	if id := response.Header().Get("X-Request-ID"); id != "" {
+		t.Fatalf("forged/fixed X-Request-ID returned on failure: %q", id)
+	}
+	if csp := response.Header().Get("Content-Security-Policy"); csp == "" {
+		t.Fatal("Content-Security-Policy header missing on failure response")
+	}
+	if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options=%q, want nosniff", got)
+	}
+	if got := response.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Fatalf("X-Frame-Options=%q, want DENY", got)
+	}
+	if !strings.Contains(buffer.String(), "request ID generation failed") {
+		t.Fatalf("access log missing generation failure: %s", buffer.String())
+	}
+}
+
 // failingReader always returns an error, simulating a crypto/rand failure.
 type failingReader struct{}
 

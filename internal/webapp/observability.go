@@ -61,14 +61,14 @@ func newRequestID() (string, error) {
 }
 
 // resolveRequestID returns a client-supplied ID when it is well-formed,
-// otherwise a freshly generated random one. If generation fails the error is
-// returned so the caller can fail the request rather than continue with a
-// predictable ID.
-func resolveRequestID(provided string) (string, error) {
+// otherwise a freshly generated random one via generate. If generation fails
+// the error is returned so the caller can fail the request rather than continue
+// with a predictable ID.
+func resolveRequestID(provided string, generate func() (string, error)) (string, error) {
 	if validRequestID(provided) {
 		return provided, nil
 	}
-	return newRequestID()
+	return generate()
 }
 
 // errRequestIDGeneration signals that no usable request ID could be produced.
@@ -122,8 +122,16 @@ func (r *responseRecorder) Flush() {
 // structured access log after the handler runs. Probe endpoints are suppressed
 // to avoid log spam.
 func (s *Server) requestObservability(next http.Handler) http.Handler {
+	return s.requestObservabilityWithGenerator(next, newRequestID)
+}
+
+// requestObservabilityWithGenerator is requestObservability with an injectable
+// request ID generator for testing. It produces no fixed or zero ID on failure:
+// a generator error is logged internally and answered with a generic HTTP 500
+// before the downstream handler runs.
+func (s *Server) requestObservabilityWithGenerator(next http.Handler, generate func() (string, error)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		id, err := resolveRequestID(request.Header.Get("X-Request-ID"))
+		id, err := resolveRequestID(request.Header.Get("X-Request-ID"), generate)
 		if err != nil {
 			s.log.Error(errRequestIDGeneration.Error(), "error", err)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
