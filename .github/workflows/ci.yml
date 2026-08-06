@@ -95,3 +95,61 @@ jobs:
           test "$(docker image inspect \
             --format '{{.Config.User}}' \
             competition-assistant:ci)" = "appuser"
+
+      - name: Smoke test production container
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          container_name="competition-assistant-ci"
+
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              docker logs "$container_name" || true
+            fi
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          docker run --detach \
+            --name "$container_name" \
+            --publish 127.0.0.1:18080:8080 \
+            --env WEB_LISTEN_ADDR=:8080 \
+            --env PUBLIC_BASE_URL=http://127.0.0.1:18080 \
+            --env APP_SECRET=0123456789abcdef0123456789abcdef \
+            --env 'APPRISE_SENDER_URL=mailtos://sender%40example.com:ci-password@smtp.example.com:465/?from=sender%40example.com&mode=ssl' \
+            --volume "$PWD/sources.example.yaml:/app/config/sources.yaml:ro" \
+            competition-assistant:ci
+
+          for attempt in $(seq 1 30); do
+            if health_body="$(
+              curl --fail --silent --show-error \
+                http://127.0.0.1:18080/healthz 2>/dev/null
+            )"; then
+              break
+            fi
+
+            if [ "$attempt" -eq 30 ]; then
+              echo "production container did not become healthy"
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          test "$health_body" = "ok"
+
+          ready_body="$(
+            curl --fail --silent --show-error \
+              http://127.0.0.1:18080/readyz
+          )"
+          test "$ready_body" = "ready"
+
+          test "$(
+            docker inspect \
+              --format '{{.State.Running}}' \
+              "$container_name"
+          )" = "true"
