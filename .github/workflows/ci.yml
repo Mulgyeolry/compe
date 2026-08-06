@@ -118,6 +118,7 @@ jobs:
             --name "$container_name" \
             --publish 127.0.0.1:18080:8080 \
             --env WEB_LISTEN_ADDR=:8080 \
+            --env 'APP_SCHEDULE=@every 87600h' \
             --env PUBLIC_BASE_URL=http://127.0.0.1:18080 \
             --env APP_SECRET=0123456789abcdef0123456789abcdef \
             --env 'APPRISE_SENDER_URL=mailtos://sender%40example.com:ci-password@smtp.example.com:465/?from=sender%40example.com&mode=ssl' \
