@@ -37,10 +37,21 @@ type readinessChecker interface {
 	Ping(context.Context) error
 }
 
+// userDisabler is the consumer-owned, single-method dependency the unsubscribe
+// flow needs to disable a user.
+type userDisabler interface {
+	DisableUser(
+		ctx context.Context,
+		userID int64,
+		now time.Time,
+	) error
+}
+
 type Server struct {
 	store         *store.Store
 	sessionLookup sessionLookup
 	readiness     readinessChecker
+	userDisabler  userDisabler
 	sender        notifier.RecipientSender
 	auth          *authn.Manager
 	web           config.Web
@@ -116,7 +127,7 @@ func New(database *store.Store, sender notifier.RecipientSender, manager *authn.
 	if err != nil {
 		return nil, fmt.Errorf("parse web templates: %w", err)
 	}
-	server := &Server{store: database, sessionLookup: database, readiness: database, sender: sender, auth: manager, web: web, log: logger, location: location, now: time.Now, template: templates, lastTestMail: make(map[int64]time.Time)}
+	server := &Server{store: database, sessionLookup: database, readiness: database, userDisabler: database, sender: sender, auth: manager, web: web, log: logger, location: location, now: time.Now, template: templates, lastTestMail: make(map[int64]time.Time)}
 	mux := http.NewServeMux()
 	staticFiles, err := fs.Sub(assets, "static")
 	if err != nil {
@@ -369,7 +380,7 @@ func (s *Server) unsubscribe(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "退订链接无效或已损坏。", http.StatusBadRequest)
 		return
 	}
-	if err := s.store.DisableUser(request.Context(), userID, s.now()); err != nil {
+	if err := s.userDisabler.DisableUser(request.Context(), userID, s.now()); err != nil {
 		s.internalError(w, request, err)
 		return
 	}
