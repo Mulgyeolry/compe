@@ -1,6 +1,7 @@
 package webapp
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/mail"
@@ -13,6 +14,17 @@ import (
 	"competition-assistant/internal/store"
 	"competition-assistant/internal/subscription"
 )
+
+// sessionLookup is the consumer-owned, single-method dependency currentUser
+// needs to resolve a session token to a user. It deliberately exposes no other
+// database operations so the Web layer can be tested without SQLite.
+type sessionLookup interface {
+	UserBySession(
+		ctx context.Context,
+		tokenHash string,
+		now time.Time,
+	) (model.User, error)
+}
 
 func (s *Server) requestCode(w http.ResponseWriter, request *http.Request) {
 	guestToken, err := s.guestToken(request)
@@ -127,7 +139,7 @@ func (s *Server) currentUser(request *http.Request) (model.User, string, bool) {
 	if err != nil || cookie.Value == "" {
 		return model.User{}, "", false
 	}
-	user, err := s.store.UserBySession(request.Context(), s.auth.SessionHash(cookie.Value), s.now())
+	user, err := s.sessionLookup.UserBySession(request.Context(), s.auth.SessionHash(cookie.Value), s.now())
 	if err != nil {
 		return model.User{}, "", false
 	}
