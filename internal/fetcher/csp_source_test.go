@@ -76,17 +76,18 @@ func TestFetchGetsCSPDetailBody(t *testing.T) {
 	}
 }
 
-// TestCcfCspSourceNoLongerPointsAtFramesetHomepage guards the sources.yaml
-// change: the ccf-csp page source must use the GET-able CMS listing URL and not
-// the frameset homepage.
+// TestCcfCspSourceNoLongerPointsAtFramesetHomepage guards the
+// sources.example.yaml change: the ccf-csp page source must use the GET-able
+// CMS listing URL and not the frameset homepage. The committed template
+// (sources.example.yaml) is checked, not the gitignored local sources.yaml.
 func TestCcfCspSourceNoLongerPointsAtFramesetHomepage(t *testing.T) {
-	raw, err := os.ReadFile("../../sources.yaml")
+	raw, err := os.ReadFile("../../sources.example.yaml")
 	if err != nil {
-		t.Fatalf("read sources.yaml: %v", err)
+		t.Fatalf("read sources.example.yaml: %v", err)
 	}
 	content := string(raw)
 	if !strings.Contains(content, "id: ccf-csp") {
-		t.Fatal("sources.yaml missing ccf-csp source")
+		t.Fatal("sources.example.yaml missing ccf-csp source")
 	}
 	if strings.Contains(content, "id: ccf-csp\n    name: CCF CSP 官网\n    kind: page\n    url: https://www.cspro.org/\n") {
 		t.Fatal("ccf-csp still points at the frameset homepage https://www.cspro.org/")
