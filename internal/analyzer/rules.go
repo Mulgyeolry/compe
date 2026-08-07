@@ -18,17 +18,28 @@ import (
 )
 
 var (
-	yearPattern             = regexp.MustCompile(`20\d{2}`)
-	dateTokenPattern        = `20\d{2}\s*[年./-]\s*\d{1,2}\s*[月./-]\s*\d{1,2}\s*日?(?:\s*\d{1,2}\s*(?::|：|时)\s*\d{0,2}\s*分?)?`
-	datePartsPattern        = regexp.MustCompile(`(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})\s*日?(?:\s*(\d{1,2})\s*(?::|：|时)\s*(\d{0,2})\s*分?)?`)
-	dateRangePattern        = regexp.MustCompile(`(?:报名|注册)(?:开始)?(?:时间)?\s*[：:]?\s*(` + dateTokenPattern + `)\s*(?:至|到|—|–|~|～)\s*(` + dateTokenPattern + `)`)
+	yearPattern = regexp.MustCompile(`20\d{2}`)
+	// dateTokenPattern requires an explicit full year. It is used by
+	// standalone start/end/deadline patterns so a year-less date is never
+	// guessed and an archived page cannot be mis-bound to the current edition.
+	dateTokenPattern = `20\d{2}\s*[年./-]\s*\d{1,2}\s*[月./-]\s*\d{1,2}\s*日?(?:\s*\d{1,2}\s*(?::|：|时)\s*\d{0,2}\s*分?)?`
+	// dateTokenLaxPattern allows the leading year to be omitted. It is used
+	// ONLY for the right-hand side of a range expression, where the year is
+	// inherited from the explicitly-dated left-hand side. The left-hand side
+	// still requires an explicit year via dateTokenPattern.
+	dateTokenLaxPattern = `(?:(?:20\d{2})\s*[年./-]\s*)?\d{1,2}\s*[月./-]\s*\d{1,2}\s*日?(?:\s*\d{1,2}\s*(?::|：|时)\s*\d{0,2}\s*分?)?`
+	datePartsPattern    = regexp.MustCompile(`(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})\s*日?(?:\s*(\d{1,2})\s*(?::|：|时)\s*(\d{0,2})\s*分?)?`)
+	// datePartsLaxPattern captures an optional leading year so the year can be
+	// inherited from the range's start when the page omits it.
+	datePartsLaxPattern     = regexp.MustCompile(`(?:(20\d{2})\s*[年./-]\s*)?(\d{1,2})\s*[月./-]\s*(\d{1,2})\s*日?(?:\s*(\d{1,2})\s*(?::|：|时)\s*(\d{0,2})\s*分?)?`)
+	dateRangePattern        = regexp.MustCompile(`(?:报名|注册)(?:开始)?(?:时间)?\s*[：:]?\s*(` + dateTokenPattern + `)\s*(?:至|到|—|–|~|～)\s*(` + dateTokenLaxPattern + `)`)
 	startPattern            = regexp.MustCompile(`(?:报名|注册)(?:开始|开放)(?:时间)?\s*[：:]?\s*(` + dateTokenPattern + `)`)
 	endPattern              = regexp.MustCompile(`(?:报名|注册)(?:截止|结束)(?:时间)?\s*[：:]?\s*(` + dateTokenPattern + `)`)
 	looseEndPattern         = regexp.MustCompile(`(?:报名|注册)[^。；;\n]{0,80}?(?:截止(?:时间)?(?:为|至|到|于)?|结束(?:时间)?(?:为|至|到|于)?|即日起(?:至|到))\s*[：:]?\s*(` + dateTokenPattern + `)`)
 	organizerPattern        = regexp.MustCompile(`(?:主办方|主办单位|主办机构)\s*[：:]\s*([^。；;]{2,100})`)
 	feePattern              = regexp.MustCompile(`(?:报名费|参赛费|比赛费用|赛事费用|参赛费用)\s*[：:为]?\s*(?:人民币)?\s*(\d+(?:\.\d{1,2})?\s*元(?:\s*(?:/|每)(?:人|队))?)`)
 	upcomingPattern         = regexp.MustCompile(`(?:将于|计划于)[^。！？；;\n]{0,60}(?:开赛|开始比赛)`)
-	competitionRangePattern = regexp.MustCompile(`(?:比赛|竞赛|赛事)(?:时间|赛程)\s*[:：]?\s*(` + dateTokenPattern + `)\s*(?:至|到|—|-|~|～)\s*(` + dateTokenPattern + `)`)
+	competitionRangePattern = regexp.MustCompile(`(?:比赛|竞赛|赛事)(?:时间|赛程)\s*[:：]?\s*(` + dateTokenPattern + `)\s*(?:至|到|—|-|~|～)\s*(` + dateTokenLaxPattern + `)`)
 	competitionStartPattern = regexp.MustCompile(`(?:开赛|比赛开始|竞赛开始|赛事开始)(?:时间)?\s*[:：]?\s*(` + dateTokenPattern + `)`)
 	competitionEndPattern   = regexp.MustCompile(`(?:比赛|竞赛|赛事)(?:结束|截止)(?:时间)?\s*[:：]?\s*(` + dateTokenPattern + `)`)
 )
@@ -607,9 +618,37 @@ func extractCompetitionDates(text string, loc *time.Location) (*time.Time, strin
 // pattern first, then falling back to individual start/end patterns. It is
 // shared by registration and competition date extraction so the two paths
 // cannot drift in parsing behavior.
+//
+// The left-hand date of a range must carry an explicit year. The right-hand
+// date may omit the year, in which case it inherits the left-hand year so a
+// page like "2026年6月1日8:00至9月19日17:00" resolves to the same edition.
+// Inheriting the year is a range-only behaviour: standalone start/end/deadline
+// patterns still require an explicit year and never guess. If inheriting the
+// year would place the end before the start (a cross-year year-less range), the
+// whole range is rejected rather than fabricating a wrapped date. The raw
+// evidence strings always mirror the original page text verbatim.
 func extractDateRange(text string, loc *time.Location, rangePattern, startPat, endPat *regexp.Regexp) (*time.Time, string, *time.Time, string) {
 	if match := rangePattern.FindStringSubmatch(text); len(match) == 3 {
-		return parseDate(match[1], loc), strings.TrimSpace(match[1]), parseDate(match[2], loc), strings.TrimSpace(match[2])
+		start := parseDate(match[1], loc)
+		if start == nil {
+			// The left-hand side of a range must be an explicit full date.
+			return nil, "", nil, ""
+		}
+		startRaw := strings.TrimSpace(match[1])
+		end := parseDate(match[2], loc)
+		if end == nil {
+			// Right-hand side omitted the year; inherit it from the start.
+			end = parseDateInheritYear(match[2], start.Year(), loc)
+		}
+		if end == nil {
+			return nil, "", nil, ""
+		}
+		if end.Before(*start) {
+			// A year-less end that lands before the start would imply a
+			// wrapped/cross-year range. Refuse it instead of guessing.
+			return nil, "", nil, ""
+		}
+		return start, startRaw, end, strings.TrimSpace(match[2])
 	}
 	var start, end *time.Time
 	var startRaw, endRaw string
@@ -620,6 +659,43 @@ func extractDateRange(text string, loc *time.Location, rangePattern, startPat, e
 		end, endRaw = parseDate(match[1], loc), strings.TrimSpace(match[1])
 	}
 	return start, startRaw, end, endRaw
+}
+
+// parseDateInheritYear parses a date that may omit its year, filling in
+// inheritYear when no explicit year is present. It returns nil when the raw
+// text carries no usable month/day or the resulting date is invalid. It never
+// guesses a year on its own: the caller always supplies the year to inherit.
+func parseDateInheritYear(raw string, inheritYear int, loc *time.Location) *time.Time {
+	parts := datePartsLaxPattern.FindStringSubmatch(raw)
+	if len(parts) != 6 {
+		return nil
+	}
+	year := inheritYear
+	if parts[1] != "" {
+		if _, err := fmt.Sscanf(parts[1], "%d", &year); err != nil {
+			return nil
+		}
+	}
+	values := make([]int, 4)
+	for i := 2; i < len(parts); i++ {
+		if parts[i] != "" {
+			if _, err := fmt.Sscanf(parts[i], "%d", &values[i-2]); err != nil {
+				return nil
+			}
+		}
+	}
+	month, day, hour, minute := values[0], values[1], values[2], values[3]
+	if hour == 24 && minute == 0 {
+		hour, minute = 23, 59
+	}
+	if year < 2000 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 {
+		return nil
+	}
+	parsed := time.Date(year, time.Month(month), day, hour, minute, 0, 0, loc)
+	if parsed.Year() != year || int(parsed.Month()) != month || parsed.Day() != day {
+		return nil
+	}
+	return &parsed
 }
 
 type datedEvidence struct {

@@ -40,7 +40,7 @@ func TestPartialResultIsRetriedOnNextScan(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(raw, "只判断") {
 			atomic.AddInt32(&classificationCalls, 1)
-			_, _ = io.WriteString(w, chatCompletionTestResponse(`{"schema_version":"competition-audit-v6","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`))
+			_, _ = io.WriteString(w, chatCompletionTestResponse(`{"schema_version":"competition-audit-v7","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`))
 			return
 		}
 		atomic.AddInt32(&extractionCalls, 1)
@@ -52,9 +52,9 @@ func TestPartialResultIsRetriedOnNextScan(t *testing.T) {
 		}
 		var content string
 		if strings.Contains(raw, "html-1") {
-			content = `{"schema_version":"competition-audit-v6","identity":{"edition":{"value":"2026","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"}},"facts":{"registration_start":{"value":"2026年8月1日","evidence":"报名时间为2026年8月1日至2026年9月20日","edition":"2026","confidence":"high"},"registration_end":{"value":"2026年9月20日","evidence":"报名时间为2026年8月1日至2026年9月20日","edition":"2026","confidence":"high"}},"events":[{"type":"registration_opened","evidence":"本赛事面向全国高校公开报名，现已开放报名","edition":"2026","confidence":"high"}]}`
+			content = `{"schema_version":"competition-audit-v7","identity":{"edition":{"value":"2026","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"}},"facts":{"registration_start":{"value":"2026年8月1日","evidence":"报名时间为2026年8月1日至2026年9月20日","edition":"2026","confidence":"high"},"registration_end":{"value":"2026年9月20日","evidence":"报名时间为2026年8月1日至2026年9月20日","edition":"2026","confidence":"high"}},"events":[{"type":"registration_opened","evidence":"本赛事面向全国高校公开报名，现已开放报名","edition":"2026","confidence":"high"}]}`
 		} else {
-			content = `{"schema_version":"competition-audit-v6","identity":{"edition":{"value":"2026","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"},"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"fee":{"value":"50元/人","evidence":"报名费为50元/人","edition":"2026","confidence":"high"}}}`
+			content = `{"schema_version":"competition-audit-v7","identity":{"edition":{"value":"2026","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"},"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"fee":{"value":"50元/人","evidence":"报名费为50元/人","edition":"2026","confidence":"high"}}}`
 		}
 		_, _ = io.WriteString(w, chatCompletionTestResponse(content))
 	}))

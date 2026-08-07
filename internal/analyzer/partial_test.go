@@ -33,11 +33,11 @@ func TestEnrichSegmentFailureDoesNotCancelSiblings(t *testing.T) {
 		if strings.Contains(string(body), "segment-b") {
 			segmentBCalls.Add(1)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v6","identity":{"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"registration_end":{"value":"2026年9月20日","evidence":"报名截止时间为2026年9月20日","edition":"2026","confidence":"high"}},"events":[{"type":"registration_opened","evidence":"本赛事现已开放报名","edition":"2026","confidence":"high"}]}`)))
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v7","identity":{"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"registration_end":{"value":"2026年9月20日","evidence":"报名截止时间为2026年9月20日","edition":"2026","confidence":"high"}},"events":[{"type":"registration_opened","evidence":"本赛事现已开放报名","edition":"2026","confidence":"high"}]}`)))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v6"}`)))
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v7"}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
@@ -95,7 +95,7 @@ func TestEnrichInsufficientSuccessReturnsPlainError(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		if strings.Contains(string(body), "segment-good") {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v6","identity":{"organizer":{"value":"主办方","evidence":"主办方：主办方","edition":"2026","confidence":"high"}}}`)))
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v7","identity":{"organizer":{"value":"主办方","evidence":"主办方：主办方","edition":"2026","confidence":"high"}}}`)))
 			return
 		}
 		http.Error(w, "model unavailable", http.StatusServiceUnavailable)
@@ -142,7 +142,7 @@ func TestEnrichParentCancellationIsNotPartial(t *testing.T) {
 			default:
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v6"}`)))
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v7"}`)))
 			return
 		}
 		http.Error(w, "model unavailable", http.StatusServiceUnavailable)
@@ -431,7 +431,7 @@ func TestAnalyzeRetainsStableFieldsOnPartialExtraction(t *testing.T) {
 		raw := string(body)
 		if strings.Contains(raw, "只判断") {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v6","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v7","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
 			return
 		}
 		if strings.Contains(raw, "segment-a") {
@@ -439,7 +439,7 @@ func TestAnalyzeRetainsStableFieldsOnPartialExtraction(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v6","identity":{"edition":{"value":"2026","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"},"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"fee":{"value":"50元/人","evidence":"报名费为50元/人","edition":"2026","confidence":"high"}}}`)))
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v7","identity":{"edition":{"value":"2026","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"},"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"fee":{"value":"50元/人","evidence":"报名费为50元/人","edition":"2026","confidence":"high"}}}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
