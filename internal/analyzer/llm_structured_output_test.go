@@ -31,7 +31,7 @@ func captureRequestBody(t *testing.T, content string) (*httptest.Server, *[]stri
 func TestChatParamsRequestBodyDisablesThinking(t *testing.T) {
 	// Test A: the outgoing HTTP JSON body must carry both
 	// "thinking":{"type":"disabled"} and "response_format":{"type":"json_object"}.
-	content := `{"schema_version":"competition-audit-v8","document_type":"listing","source_role":"official_primary","computer_related":false,"competition_announcement":false,"rejection_reason":"列表页"}`
+	content := `{"schema_version":"competition-audit-v9","document_type":"listing","source_role":"official_primary","computer_related":false,"competition_announcement":false,"rejection_reason":"列表页"}`
 	server, bodies := captureRequestBody(t, content)
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
 	t.Setenv("OPENAI_API_KEY", "test-key")
@@ -59,7 +59,7 @@ func TestChatParamsRequestBodyDisablesThinking(t *testing.T) {
 func TestClassifyRetriesOnceOnEmptyContentThenSucceeds(t *testing.T) {
 	// Test B: first response is an empty message.content, the retry returns a
 	// valid classification JSON. Exactly 2 calls, success, no failure.
-	valid := `{"schema_version":"competition-audit-v8","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`
+	valid := `{"schema_version":"competition-audit-v9","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -126,7 +126,7 @@ func TestClassifyPersistentEmptyContentFailsAfterTwoCalls(t *testing.T) {
 func TestEnrichSegmentRetriesOnceOnEmptyContentThenSucceeds(t *testing.T) {
 	// Test D: a single extraction segment gets an empty first response and a
 	// valid second one; the segment succeeds and is not counted as failed.
-	valid := `{"schema_version":"competition-audit-v8","identity":{"organizer":{"value":"主办方","evidence":"主办方：组委会","edition":"2026","confidence":"high"}},"facts":{},"events":[]}`
+	valid := `{"schema_version":"competition-audit-v9","identity":{"organizer":{"value":"主办方","evidence":"主办方：组委会","edition":"2026","confidence":"high"}},"facts":{},"events":[]}`
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -167,7 +167,7 @@ func noChoicesResponse() string {
 }
 
 func TestClassifyRetriesOnNoChoicesThenSucceeds(t *testing.T) {
-	valid := `{"schema_version":"competition-audit-v8","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`
+	valid := `{"schema_version":"competition-audit-v9","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

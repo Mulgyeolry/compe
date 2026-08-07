@@ -143,7 +143,7 @@ func TestPendingAnalysisPreservesExistingCanonicalData(t *testing.T) {
 	if err := raw.QueryRow(`SELECT analysis_result_json FROM observations WHERE url=? ORDER BY seen_at DESC,id DESC LIMIT 1`, docVal.URL).Scan(&audit); err != nil {
 		t.Fatalf("read latest observation audit: %v", err)
 	}
-	if !strings.Contains(audit, "competition-audit-v8") {
+	if !strings.Contains(audit, "competition-audit-v9") {
 		t.Errorf("latest observation audit does not record v7: %s", audit)
 	}
 	if !strings.Contains(audit, "empty classification content") {
@@ -170,12 +170,12 @@ func TestSuccessfulUpgradeStillClearsInvalidatedFacts(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if calls.Add(1) == 1 {
 			// First call is the classification pass.
-			_, _ = w.Write([]byte(chatCompletionTestResponse(`{"schema_version":"competition-audit-v8","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			_, _ = w.Write([]byte(chatCompletionTestResponse(`{"schema_version":"competition-audit-v9","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
 			return
 		}
 		// Subsequent calls are the enrichment pass; they omit the stale v6
 		// registration end so a successful v7 upgrade may clear it.
-		_, _ = w.Write([]byte(chatCompletionTestResponse(`{"schema_version":"competition-audit-v8","identity":{"organizer":{"value":"中国研究生数学建模竞赛组织委员会","evidence":"主办方：中国研究生数学建模竞赛组织委员会","edition":"2026","confidence":"high"}},"facts":{"registration_start":{"value":"2026年6月1日8:00","evidence":"报名时间：2026年6月1日8:00","edition":"2026","confidence":"high"}},"events":[{"type":"registration_opened","evidence":"本赛事现已开放报名","edition":"2026","confidence":"high"}]}`)))
+		_, _ = w.Write([]byte(chatCompletionTestResponse(`{"schema_version":"competition-audit-v9","identity":{"organizer":{"value":"中国研究生数学建模竞赛组织委员会","evidence":"主办方：中国研究生数学建模竞赛组织委员会","edition":"2026","confidence":"high"}},"facts":{"registration_start":{"value":"2026年6月1日8:00","evidence":"报名时间：2026年6月1日8:00","edition":"2026","confidence":"high"}},"events":[{"type":"registration_opened","evidence":"本赛事现已开放报名","edition":"2026","confidence":"high"}]}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
