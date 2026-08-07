@@ -94,6 +94,17 @@ var publicParticipationMarkers = []string{
 	"全市高校", "全省高校", "各高校均可", "社会公众",
 }
 
+// publicCampusFallbackMarkers are explicit "open to the public" participation
+// scope expressions strong enough to accept a campus-forwarded page's
+// deterministic ruleAnalysis facts. A bare "全国", or a competition-name
+// qualifier such as 全国大学生/中国研究生/全国研究生, is deliberately NOT included:
+// "关于组织我校学生参加全国XX大赛" names 全国 yet is still a campus-internal
+// forwarding notice. Only unambiguous participation-scope wording counts.
+var publicCampusFallbackMarkers = []string{
+	"面向全国", "面向全国高校", "面向全国研究生", "面向全国大学生", "面向全球", "面向社会",
+	"面向社会公众", "面向所有高校", "全国高校均可", "各高校均可", "社会公众", "公开报名",
+}
+
 type Analyzer struct {
 	location *time.Location
 	focus    []string
@@ -188,6 +199,16 @@ func (a *Analyzer) Analyze(ctx context.Context, candidate model.Candidate, doc m
 		// single tiny request, keeping long-context extraction calls for
 		// genuine announcements only.
 		if !classificationCanUpdateCanonical(classification) {
+			if a.canUsePublicCampusRulesFallback(candidate, doc, competition, classification) {
+				// The AI rejected the page as campus-internal/forwarding, but the
+				// deterministic rules already extracted strong public-competition
+				// evidence (explicit participation scope, no campus-internal
+				// markers, at least one complete dated range). Keep those
+				// ruleAnalysis facts without calling Enrich and without
+				// promoting trust or source role.
+				competition.ExtractionAudit = buildCampusRulesFallbackAudit(competition, doc, now, a.llm.ModelName())
+				return competition, true, nil
+			}
 			return competition, false, nil
 		}
 		result, extractionErr := a.llm.Enrich(ctx, candidate, doc)
@@ -293,6 +314,54 @@ func lowValueReason(candidate model.Candidate, doc model.Document, text string) 
 		}
 	}
 	return ""
+}
+
+// canUsePublicCampusRulesFallback reports whether a page that the AI
+// classification rejected as campus-internal/forwarding may still keep its
+// deterministic ruleAnalysis facts. It is deliberately narrow: it fires only
+// for campus-like rejections of a strongly computer-competition-related,
+// non-low-trust page whose text shows an explicit public participation scope,
+// no campus-internal markers, and at least one complete dated range. It never
+// re-runs Enrich and never promotes trust or source role.
+func (a *Analyzer) canUsePublicCampusRulesFallback(candidate model.Candidate, doc model.Document, competition model.Competition, classification AIClassification) bool {
+	// A. Low-trust sources never fall back.
+	if competition.Trust == model.TrustLow {
+		return false
+	}
+	// B. The AI must at least confirm the page is computer-competition related.
+	if !classification.ComputerRelated {
+		return false
+	}
+	// C. Only campus-like misclassification may be rescued. Listing,
+	// post-event-news and community pages never fall back, even with dates.
+	if classification.SourceRole != SourceCampusForward && classification.DocumentType != DocumentCampusInternal {
+		return false
+	}
+	switch classification.DocumentType {
+	case DocumentListing, DocumentPostEventNews, DocumentCommunity:
+		return false
+	}
+	// D. The candidate must be strongly competition-related deterministically.
+	if competition.FitScore < 60 {
+		return false
+	}
+	// E. The page must not carry any campus-internal evidence. This check is
+	// repeated here as the safety boundary even though lowValueReason already
+	// ran earlier.
+	scope := candidate.Title + " " + doc.Title + " " + doc.Text
+	if containsAny(scope, campusInternalMarkers) || containsAny(scope, explicitCampusCompetitionMarkers) {
+		return false
+	}
+	// F. An explicit public participation scope is required. A bare 全国 or a
+	// competition-name qualifier (全国大学生/中国研究生/全国研究生) is not enough.
+	if !containsAny(scope, publicCampusFallbackMarkers) {
+		return false
+	}
+	// G. At least one complete dated range is required; a single date is not
+	// enough. This keeps the PR #16 range-year safety intact.
+	regComplete := competition.RegistrationStart != nil && competition.RegistrationEnd != nil
+	compComplete := competition.CompetitionStart != nil && competition.CompetitionEnd != nil
+	return regComplete || compComplete
 }
 
 func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, trust model.Trust, text string, score int, now time.Time) model.Competition {
@@ -955,6 +1024,25 @@ func buildRuleAudit(doc model.Document, now time.Time, facts map[string]model.Fa
 		InputHash:       analysisInputHash(doc),
 		AcceptedFields:  sortedFactKeys(facts),
 		AnalyzedAt:      now,
+	}
+}
+
+// buildCampusRulesFallbackAudit records a public-campus rules-only fallback:
+// the AI classification was rejected (campus forwarding), no Enrich was called,
+// and only the deterministic ruleAnalysis facts were accepted. It is not logged
+// as an AI extraction success.
+func buildCampusRulesFallbackAudit(competition model.Competition, doc model.Document, now time.Time, modelName string) model.AnalysisAudit {
+	return model.AnalysisAudit{
+		AnalyzerVersion: AIAnalyzerVersion,
+		Model:           modelName,
+		InputHash:       analysisInputHash(doc),
+		RawResponses:    append([]string(nil), competition.ExtractionAudit.RawResponses...),
+		AcceptedFields:  sortedFactKeys(competition.Facts),
+		Rejections: []model.AnalysisRejection{{
+			Field:  "document_type",
+			Reason: "AI classification rejected the page as campus forwarding; deterministic public-campus rules fallback accepted evidenced facts.",
+		}},
+		AnalyzedAt: now,
 	}
 }
 

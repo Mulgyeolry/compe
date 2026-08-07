@@ -13,7 +13,7 @@ import (
 	"competition-assistant/internal/model"
 )
 
-const AIAnalyzerVersion = "competition-audit-v7"
+const AIAnalyzerVersion = "competition-audit-v8"
 
 // PendingCandidateError means the page was credible enough to retain as a
 // minimal competition candidate, but AI verification must be retried before
