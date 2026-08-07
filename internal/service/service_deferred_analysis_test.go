@@ -132,7 +132,8 @@ func TestPendingAnalysisPreservesExistingCanonicalData(t *testing.T) {
 		t.Errorf("canonical content_hash = %q, want %q", saved.ContentHash, hash)
 	}
 
-	// 2. The observation audit must record the v7 failure (EOF).
+	// 2. The observation audit must record the v7 failure. The empty-content
+	// retry now surfaces a clear message instead of a vague EOF.
 	raw, err := sql.Open("sqlite", cfg.DBPath)
 	if err != nil {
 		t.Fatal(err)
@@ -145,8 +146,8 @@ func TestPendingAnalysisPreservesExistingCanonicalData(t *testing.T) {
 	if !strings.Contains(audit, "competition-audit-v7") {
 		t.Errorf("latest observation audit does not record v7: %s", audit)
 	}
-	if !strings.Contains(audit, "EOF") {
-		t.Errorf("latest observation audit does not record the EOF failure: %s", audit)
+	if !strings.Contains(audit, "empty classification content") {
+		t.Errorf("latest observation audit does not record the empty-content failure: %s", audit)
 	}
 
 	// 3. The retry baseline must be cleared so a later scan re-analyses the page.
