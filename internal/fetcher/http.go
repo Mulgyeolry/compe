@@ -665,7 +665,11 @@ func (c *HTTPCollector) fetchHTML(ctx context.Context, target string) (model.Doc
 	if err != nil {
 		return model.Document{}, nil, err
 	}
-	defer resp.Body.Close()
+	// Explicit ownership: the original (shell) response body is closed exactly
+	// once by this deferred closure, regardless of whether a JS redirect follow
+	// happens or any early return occurs.
+	shellBody := resp.Body
+	defer func() { _ = shellBody.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBytes+1))
 	if err != nil {
 		return model.Document{}, nil, err
@@ -687,19 +691,20 @@ func (c *HTTPCollector) fetchHTML(ctx context.Context, target string) (model.Doc
 			if resolved, err := resolveSameHostJSRedirect(finalURL, rawTarget); err == nil {
 				resp2, err2 := c.doRequest(ctx, resolved, botHeaders())
 				if err2 == nil {
-					// Read the redirected body before closing the old shell body.
+					// resp2 has its own independent ownership: its body is closed
+					// exactly once by this deferred closure on every path (early
+					// returns included). The original shell body stays owned by
+					// shellBody's closure above, so nothing is double-closed or
+					// leaked, and we never rely on reassigning resp.
+					targetBody := resp2.Body
+					defer func() { _ = targetBody.Close() }()
 					body, err = io.ReadAll(io.LimitReader(resp2.Body, c.maxBytes+1))
 					if err != nil {
-						resp2.Body.Close()
 						return model.Document{}, nil, err
 					}
 					if int64(len(body)) > c.maxBytes {
-						resp2.Body.Close()
 						return model.Document{}, nil, fmt.Errorf("response exceeds %d bytes", c.maxBytes)
 					}
-					// Close the old shell body; from here the deferred
-					// resp.Body.Close() (resp now == resp2) owns resp2.Body.
-					resp.Body.Close()
 					resp = resp2
 					contentType = strings.ToLower(resp2.Header.Get("Content-Type"))
 					finalURL = canonicalURL(resp2.Request.URL.String())

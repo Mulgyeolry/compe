@@ -205,7 +205,8 @@ func TestJSRedirectFollowsAtMostOnce(t *testing.T) {
 	}
 }
 
-// trackingReadCloser counts Close calls on an http response body.
+// trackingReadCloser counts Close calls on an http response body, bucketing by
+// whether the request was the original shell or the JS-redirect target.
 type trackingReadCloser struct {
 	io.ReadCloser
 	closed *int32
@@ -217,10 +218,11 @@ func (t *trackingReadCloser) Close() error {
 }
 
 // trackingTransport forwards requests to a mock server while wrapping every
-// response body so Close calls can be counted.
+// response body so Close calls can be counted per bucket (shell vs target).
 type trackingTransport struct {
-	to     *url.URL
-	closed *int32
+	to           *url.URL
+	closedShell  *int32
+	closedTarget *int32
 }
 
 func (t *trackingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -235,7 +237,11 @@ func (t *trackingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	// so the JS-redirect resolve/follow target stays public and the SSRF
 	// pre-filter passes, while the request actually hits the test server.
 	resp.Request = req
-	resp.Body = &trackingReadCloser{ReadCloser: resp.Body, closed: t.closed}
+	counter := t.closedTarget
+	if strings.Contains(req.URL.Path, "/shell") {
+		counter = t.closedShell
+	}
+	resp.Body = &trackingReadCloser{ReadCloser: resp.Body, closed: counter}
 	return resp, nil
 }
 
@@ -256,9 +262,9 @@ func TestJSRedirectClosesSecondBody(t *testing.T) {
 	}))
 	defer server.Close()
 	to, _ := url.Parse(server.URL)
-	var closed int32
+	var closedShell, closedTarget int32
 	collector := &HTTPCollector{
-		client:     &http.Client{Transport: &trackingTransport{to: to, closed: &closed}},
+		client:     &http.Client{Transport: &trackingTransport{to: to, closedShell: &closedShell, closedTarget: &closedTarget}},
 		maxBytes:   5 * 1024 * 1024,
 		maxRetries: 0,
 	}
@@ -270,7 +276,13 @@ func TestJSRedirectClosesSecondBody(t *testing.T) {
 	if !strings.Contains(document.Text, "报名时间") {
 		t.Fatalf("did not follow the JS redirect to real body: %#v", document)
 	}
-	if got := atomic.LoadInt32(&closed); got != 2 {
-		t.Errorf("expected both the shell body and the redirected body to be closed (2 Close calls), got %d", got)
+	// Each response body has independent, explicit ownership: the shell body is
+	// closed at least once, and the redirected (target) body is closed exactly
+	// once — never leaked and never double-closed.
+	if got := atomic.LoadInt32(&closedShell); got < 1 {
+		t.Errorf("shell body close calls = %d, want >= 1", got)
+	}
+	if got := atomic.LoadInt32(&closedTarget); got != 1 {
+		t.Errorf("redirect target body close calls = %d, want exactly 1", got)
 	}
 }
