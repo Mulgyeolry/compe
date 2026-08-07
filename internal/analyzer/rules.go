@@ -297,7 +297,13 @@ func lowValueReason(candidate model.Candidate, doc model.Document, text string) 
 	if containsAny(title, genericListingTitleMarkers) {
 		return "generic listing page"
 	}
-	if containsAny(title+" "+text, explicitCampusCompetitionMarkers) {
+	// Match explicit campus-competition markers on a lightly normalised copy of
+	// title+text: strip whitespace and both full-width/half-width brackets so a
+	// phrase like "（校级）选拔赛" is seen as "校级选拔赛" and matches "校级选拔".
+	// This closes the gap where "校级"+"选拔赛" separated by brackets/punctuation
+	// would otherwise slip past the deterministic gate.
+	normalisedScope := normalizeForMarkerMatch(title + " " + text)
+	if containsAny(normalisedScope, explicitCampusCompetitionMarkers) {
 		return "explicit campus-internal competition"
 	}
 	parsed, _ := url.Parse(doc.URL)
@@ -328,8 +334,11 @@ func (a *Analyzer) canUsePublicCampusRulesFallback(candidate model.Candidate, do
 	if competition.Trust == model.TrustLow {
 		return false
 	}
-	// B. The AI must at least confirm the page is computer-competition related.
-	if !classification.ComputerRelated {
+	// B. The candidate/doc must explicitly match the deterministic focus list
+	// (the project's curated computer/CS competition inventory). This replaces
+	// reliance on the AI's free-form computer_related output, which is unstable
+	// for e.g. math-modelling competitions the focus list already covers.
+	if !containsAny(candidate.Title+" "+doc.Title+" "+doc.Text, a.focus) {
 		return false
 	}
 	// C. Only campus-like misclassification may be rescued. Listing,
@@ -1110,6 +1119,18 @@ func containsAny(text string, terms []string) bool {
 		}
 	}
 	return false
+}
+
+// normalizeForMarkerMatch strips whitespace and both full-width and half-width
+// brackets from text so deterministic marker matching is robust to punctuation
+// like "（校级）选拔赛" (which would otherwise not contain the contiguous
+// substring "校级选拔"). It is only used for marker detection, never for raw
+// evidence storage.
+func normalizeForMarkerMatch(text string) string {
+	for _, sep := range []string{" ", "\t", "\n", "\r", "（", "）", "(", ")", "【", "】", "[", "]", "：", ":", "，", ",", "。", ".", "、"} {
+		text = strings.ReplaceAll(text, sep, "")
+	}
+	return text
 }
 
 func domainMatch(host string, domains []string) bool {
