@@ -229,7 +229,16 @@ func (s *Service) processCandidate(ctx context.Context, source config.Source, ca
 			"source", source.ID, "url", doc.URL, "name", competition.Name)
 		return nil
 	}
-	competition.AnalyzerVersion = s.analyzer.Version()
+	// Only a successful analyzer result may claim the canonical competition has
+	// been analysed by the current analyzer version. A deferred/pending attempt
+	// (AI EOF, empty response, etc.) must not bump canonical AnalyzerVersion:
+	// doing so would make resolveSourceConflicts treat it as an analyzer upgrade
+	// and clear previously confirmed v6 lifecycle/date fields. The v7 attempt is
+	// still recorded in the observation audit above, and RetryDocumentOnNextScan
+	// keeps the page eligible for re-analysis on a later scan.
+	if !pendingCandidate {
+		competition.AnalyzerVersion = s.analyzer.Version()
+	}
 	competition.ContentHash = hash
 	old, isNew, err := s.store.UpsertCompetition(ctx, competition, source.ID, now)
 	if err != nil {
