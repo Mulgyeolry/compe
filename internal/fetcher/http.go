@@ -539,12 +539,48 @@ var jsLineCommentPattern = regexp.MustCompile(`(?m)//[^\r\n]*`)
 // parses simple string literals (concatenated with "+", and also the common
 // `argument = argument + "..."` accumulation used by CSPro CMS); it never
 // executes JavaScript. It returns the raw URL as written.
+// jsHrefRHSVar matches a variable appended after the leading literal on the
+// right-hand side, e.g. `location.href = "base" + argument`.
+var jsHrefRHSVar = regexp.MustCompile(`\+\s*(\w+)`)
+
 func jsRedirectTarget(body []byte) (string, bool) {
-	loc := jsHrefAssign.FindIndex(body)
-	if loc == nil {
-		return "", false
+	text := string(body)
+	searchFrom := 0
+	for {
+		loc := jsHrefAssign.FindStringIndex(text[searchFrom:])
+		if loc == nil {
+			return "", false
+		}
+		absStart := searchFrom + loc[0]
+		if isLineCommented(text, absStart) {
+			// A commented-out location.href is not a real redirect.
+			searchFrom = absStart + (loc[1] - loc[0])
+			continue
+		}
+		rest := text[searchFrom+loc[1]:]
+		base, varName := jsHrefBaseAndVar(rest)
+		if base == "" {
+			return "", false
+		}
+		// Only concatenate literals accumulated into the variable that the
+		// location.href right-hand side actually references.
+		before := text[:absStart]
+		accumulated := jsAccumulatedLiterals(before, varName)
+		return base + accumulated, true
 	}
-	rest := string(body[loc[1]:])
+}
+
+// isLineCommented reports whether the byte at idx in s lies inside a // line
+// comment.
+func isLineCommented(s string, idx int) bool {
+	lineStart := strings.LastIndex(s[:idx], "\n") + 1
+	return strings.Contains(s[lineStart:idx], "//")
+}
+
+// jsHrefBaseAndVar extracts the leading string literal assigned to
+// location.href and, if the right-hand side then concatenates a variable
+// (`location.href = "base" + argument`), the name of that variable.
+func jsHrefBaseAndVar(rest string) (string, string) {
 	var builder strings.Builder
 	pos := 0
 	for pos < len(rest) {
@@ -567,23 +603,23 @@ func jsRedirectTarget(body []byte) (string, bool) {
 		pos += m[1]
 	}
 	base := builder.String()
-	if base == "" {
-		return "", false
+	if m := jsHrefRHSVar.FindStringSubmatch(rest[pos:]); len(m) == 2 {
+		return base, m[1]
 	}
-	// Append literals accumulated into a variable (before the location.href
-	// assignment) so a `location.href = base + argument` shell resolves fully.
-	before := string(body[:loc[0]])
-	accumulated := jsAccumulatedLiterals(before)
-	return base + accumulated, true
+	return base, ""
 }
 
 // jsAccumulatedLiterals concatenates the string literals from self-accumulating
-// assignments (X = X + "lit" / X += "lit"), in order, ignoring line comments.
-func jsAccumulatedLiterals(s string) string {
+// assignments of the referenced variable (X = X + "lit" / X += "lit"), in
+// order, ignoring line comments and unrelated variables.
+func jsAccumulatedLiterals(s, varName string) string {
+	if varName == "" {
+		return ""
+	}
 	clean := jsLineCommentPattern.ReplaceAllString(s, "")
 	var builder strings.Builder
 	for _, m := range jsAccumPattern.FindAllStringSubmatch(clean, -1) {
-		if m[1] == m[2] {
+		if m[1] == varName && m[2] == varName {
 			builder.WriteString(m[3])
 		}
 	}
@@ -651,15 +687,20 @@ func (c *HTTPCollector) fetchHTML(ctx context.Context, target string) (model.Doc
 			if resolved, err := resolveSameHostJSRedirect(finalURL, rawTarget); err == nil {
 				resp2, err2 := c.doRequest(ctx, resolved, botHeaders())
 				if err2 == nil {
-					resp.Body.Close()
-					resp = resp2
+					// Read the redirected body before closing the old shell body.
 					body, err = io.ReadAll(io.LimitReader(resp2.Body, c.maxBytes+1))
 					if err != nil {
+						resp2.Body.Close()
 						return model.Document{}, nil, err
 					}
 					if int64(len(body)) > c.maxBytes {
+						resp2.Body.Close()
 						return model.Document{}, nil, fmt.Errorf("response exceeds %d bytes", c.maxBytes)
 					}
+					// Close the old shell body; from here the deferred
+					// resp.Body.Close() (resp now == resp2) owns resp2.Body.
+					resp.Body.Close()
+					resp = resp2
 					contentType = strings.ToLower(resp2.Header.Get("Content-Type"))
 					finalURL = canonicalURL(resp2.Request.URL.String())
 				}

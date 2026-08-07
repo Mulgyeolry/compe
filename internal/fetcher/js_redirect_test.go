@@ -3,8 +3,10 @@ package fetcher
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -134,6 +136,44 @@ func TestJSRedirectTargetRealCSProShell(t *testing.T) {
 	}
 }
 
+// TestJSRedirectTargetIgnoresUnrelatedVariables: only the accumulated variable
+// actually referenced by the location.href right-hand side is concatenated; an
+// unrelated self-accumulating variable must not leak into the URL.
+func TestJSRedirectTargetIgnoresUnrelatedVariables(t *testing.T) {
+	shell := []byte(`<script>
+	var a = "";
+	a = a + "&foo=1";
+	var b = "";
+	b = b + "&bar=2";
+	window.location.href="/cms/show.action?code=abc" + a;
+</script>`)
+	target, ok := jsRedirectTarget(shell)
+	if !ok {
+		t.Fatal("jsRedirectTarget did not detect a redirect")
+	}
+	want := "/cms/show.action?code=abc&foo=1"
+	if target != want {
+		t.Fatalf("jsRedirectTarget = %q, want %q (unrelated variable must not be included)", target, want)
+	}
+}
+
+// TestJSRedirectTargetIgnoresCommentedHref: a commented-out location.href must
+// not be treated as the real redirect.
+func TestJSRedirectTargetIgnoresCommentedHref(t *testing.T) {
+	shell := []byte(`<script>
+	// window.location.href="/cms/show.action?code=commented";
+	window.location.href="/cms/show.action?code=real" + "&newsid=7";
+</script>`)
+	target, ok := jsRedirectTarget(shell)
+	if !ok {
+		t.Fatal("jsRedirectTarget did not detect the real redirect")
+	}
+	want := "/cms/show.action?code=real&newsid=7"
+	if target != want {
+		t.Fatalf("jsRedirectTarget = %q, want %q (commented href must be skipped)", target, want)
+	}
+}
+
 // TestJSRedirectFollowsAtMostOnce: even if the redirect target is itself
 // another shell, only a single follow happens; it must not recurse.
 func TestJSRedirectFollowsAtMostOnce(t *testing.T) {
@@ -162,5 +202,75 @@ func TestJSRedirectFollowsAtMostOnce(t *testing.T) {
 	}
 	if document.Title != "s2" {
 		t.Errorf("title = %q, want the single-follow target s2 (not deeper s3)", document.Title)
+	}
+}
+
+// trackingReadCloser counts Close calls on an http response body.
+type trackingReadCloser struct {
+	io.ReadCloser
+	closed *int32
+}
+
+func (t *trackingReadCloser) Close() error {
+	atomic.AddInt32(t.closed, 1)
+	return t.ReadCloser.Close()
+}
+
+// trackingTransport forwards requests to a mock server while wrapping every
+// response body so Close calls can be counted.
+type trackingTransport struct {
+	to     *url.URL
+	closed *int32
+}
+
+func (t *trackingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	next := req.Clone(req.Context())
+	next.URL.Scheme = t.to.Scheme
+	next.URL.Host = t.to.Host
+	resp, err := http.DefaultTransport.RoundTrip(next)
+	if err != nil {
+		return nil, err
+	}
+	// Preserve the original public hostname on the response (like routeTransport)
+	// so the JS-redirect resolve/follow target stays public and the SSRF
+	// pre-filter passes, while the request actually hits the test server.
+	resp.Request = req
+	resp.Body = &trackingReadCloser{ReadCloser: resp.Body, closed: t.closed}
+	return resp, nil
+}
+
+// TestJSRedirectClosesSecondBody verifies that after a JS redirect follow, both
+// the original shell response body and the redirected response body are closed
+// (no leak of the second response body).
+func TestJSRedirectClosesSecondBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		switch r.URL.Path {
+		case "/cms/shell":
+			_, _ = fmt.Fprint(w, `<html><head><title>shell</title></head><body><script>window.location.href="/cms/show.action?code=abc" + "&newsid=7";</script></body></html>`)
+		case "/cms/show.action":
+			_, _ = fmt.Fprint(w, `<html><head><title>第42次CCF CSP认证报名通知</title></head><body><main><p>报名时间：2026年5月4日9:00至2026年5月24日23:59。</p></main></body></html>`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	to, _ := url.Parse(server.URL)
+	var closed int32
+	collector := &HTTPCollector{
+		client:     &http.Client{Transport: &trackingTransport{to: to, closed: &closed}},
+		maxBytes:   5 * 1024 * 1024,
+		maxRetries: 0,
+	}
+
+	document, _, err := collector.fetchHTML(context.Background(), "https://contest.example.com/cms/shell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(document.Text, "报名时间") {
+		t.Fatalf("did not follow the JS redirect to real body: %#v", document)
+	}
+	if got := atomic.LoadInt32(&closed); got != 2 {
+		t.Errorf("expected both the shell body and the redirected body to be closed (2 Close calls), got %d", got)
 	}
 }
