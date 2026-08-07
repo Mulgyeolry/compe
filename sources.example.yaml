@@ -142,7 +142,11 @@ sources:
   - id: ccf-csp
     name: CCF CSP 官网
     kind: page
-    url: https://www.cspro.org/
+    # CSP 认证通知公告列表（CSpro CMS，服务端渲染、可普通 GET）。首页
+    # https://www.cspro.org/ 是 frameset 框架页，抓不到正文；此列表页会
+    # 展开历届/历次 CSP 认证通知（含报名通知）的详情链接。URL 使用稳定的
+    # CMS 发布频道 code，不含某一届 newsid。
+    url: https://www.cspro.org/cms/show.action?code=publish_8ac21fad9d27f22a019f5944f2eb00e1&siteid=100000
     trust: high
     limit: 40
 
