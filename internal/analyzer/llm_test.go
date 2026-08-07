@@ -53,7 +53,7 @@ func chatCompletionResponse(content string) string {
 }
 
 func TestClassifyParsesTinyJudgmentResponse(t *testing.T) {
-	content := `{"schema_version":"competition-audit-v7","document_type":"listing","source_role":"official_primary","computer_related":false,"competition_announcement":false,"rejection_reason":"聚合列表页"}`
+	content := `{"schema_version":"competition-audit-v8","document_type":"listing","source_role":"official_primary","computer_related":false,"competition_announcement":false,"rejection_reason":"聚合列表页"}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(chatCompletionResponse(content)))
@@ -76,7 +76,7 @@ func TestClassifyParsesTinyJudgmentResponse(t *testing.T) {
 }
 
 func TestClassifyRejectsUnknownFields(t *testing.T) {
-	content := `{"schema_version":"competition-audit-v7","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"identity":{"name":"x"}}`
+	content := `{"schema_version":"competition-audit-v8","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"identity":{"name":"x"}}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(chatCompletionResponse(content)))
@@ -126,13 +126,13 @@ func TestAnalyzeUsesClassificationGateBeforeExtraction(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(string(body), "只判断") {
 			if classificationCalls.Add(1) == 1 {
-				_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v7","document_type":"listing","source_role":"official_primary","computer_related":false,"competition_announcement":false,"rejection_reason":"聚合列表页"}`)))
+				_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v8","document_type":"listing","source_role":"official_primary","computer_related":false,"competition_announcement":false,"rejection_reason":"聚合列表页"}`)))
 				return
 			}
-			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v7","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v8","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
 			return
 		}
-		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v7","identity":{"name":{"value":"2026全国大学生程序设计大赛","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"},"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"fee":{"value":"50元/人","evidence":"报名费为50元/人","edition":"2026","confidence":"high"}},"events":[{"type":"registration_opened","evidence":"本赛事面向全国高校公开报名，现已开放报名","edition":"2026","confidence":"high"}]}`)))
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v8","identity":{"name":{"value":"2026全国大学生程序设计大赛","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"},"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"fee":{"value":"50元/人","evidence":"报名费为50元/人","edition":"2026","confidence":"high"}},"events":[{"type":"registration_opened","evidence":"本赛事面向全国高校公开报名，现已开放报名","edition":"2026","confidence":"high"}]}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
