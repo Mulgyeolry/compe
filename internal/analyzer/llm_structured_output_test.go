@@ -160,6 +160,65 @@ func TestEnrichSegmentRetriesOnceOnEmptyContentThenSucceeds(t *testing.T) {
 	}
 }
 
+// noChoicesResponse is a minimal OpenAI-compatible body with an empty choices
+// array, used to exercise the no-choices retry scope.
+func noChoicesResponse() string {
+	return `{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"test-model","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}`
+}
+
+func TestClassifyRetriesOnNoChoicesThenSucceeds(t *testing.T) {
+	valid := `{"schema_version":"competition-audit-v7","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(noChoicesResponse()))
+			return
+		}
+		_, _ = w.Write([]byte(chatCompletionResponse(valid)))
+	}))
+	defer server.Close()
+	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	modelClient := NewLLMFromEnvironment()
+
+	classification, _, err := modelClient.Classify(context.Background(), model.Candidate{Title: "华为杯"}, model.Document{Title: "2026华为杯", Text: "报名"})
+	if err != nil {
+		t.Fatalf("classify should recover after one no-choices response: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Errorf("endpoint calls=%d, want exactly 2", calls.Load())
+	}
+	if !classification.CompetitionAnnouncement {
+		t.Errorf("expected a valid announcement classification after retry: %#v", classification)
+	}
+	if !modelClient.Enabled() {
+		t.Error("circuit should not be tripped after a successful no-choices retry")
+	}
+}
+
+func TestClassifyPersistentNoChoicesFailsAfterTwoCalls(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(noChoicesResponse()))
+	}))
+	defer server.Close()
+	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	modelClient := NewLLMFromEnvironment()
+
+	if _, _, err := modelClient.Classify(context.Background(), model.Candidate{Title: "华为杯"}, model.Document{Title: "2026华为杯", Text: "报名"}); err == nil {
+		t.Fatal("expected persistent no-choices to fail")
+	}
+	if calls.Load() != 2 {
+		t.Errorf("endpoint calls=%d, want exactly 2 (bounded retry)", calls.Load())
+	}
+}
+
 func TestClassifyNonEmptyInvalidJSONIsNotRetried(t *testing.T) {
 	// Test E: a non-empty but invalid JSON content must NOT be blindly retried.
 	// It keeps the existing validation/deferred behaviour (single call).

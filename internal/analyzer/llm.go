@@ -126,11 +126,15 @@ func thinkingDisabledOption() option.RequestOption {
 // invalid-but-non-empty responses keep the existing validation path and are
 // never blindly retried.
 func (l *LLM) chatCompletionContentRaw(ctx context.Context, system, prompt string, maxTokens int64, timeout time.Duration, emptyErr error) (string, error) {
+	// One logical call shares a single total timeout budget across the at-most
+	// two attempts, so a retry only has the remaining time instead of
+	// doubling the worst-case latency of the whole call. Parent context
+	// cancellation is preserved.
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	attempt := 0
 	for {
-		requestCtx, cancel := context.WithTimeout(ctx, timeout)
 		completion, err := l.client.Chat.Completions.New(requestCtx, l.chatParams(system, prompt, maxTokens), thinkingDisabledOption())
-		cancel()
 		if err != nil {
 			return "", err
 		}
