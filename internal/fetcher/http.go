@@ -517,6 +517,113 @@ func (c *HTTPCollector) Fetch(ctx context.Context, target string) (model.Documen
 	return doc, err
 }
 
+// jsHrefAssign matches an assignment to (window.)location.href.
+var jsHrefAssign = regexp.MustCompile(`(?i)(?:window\.)?location\.href\s*=\s*`)
+
+// jsStringLit matches a single- or double-quoted JS string literal.
+var jsStringLit = regexp.MustCompile(`"([^"]*)"|'([^']*)'`)
+
+// jsAccumPattern matches a self-accumulating string assignment like
+// `argument = argument + "&siteid=100000"` or `argument += "&newsid=..."`, which
+// is how some CMS shells (e.g. CSPro) build the query string before assigning
+// it to location.href. Go's regexp has no backreferences, so the variable name
+// is captured twice and compared in code. Only the string literal is extracted;
+// no JS is executed.
+var jsAccumPattern = regexp.MustCompile(`(?m)(\w+)\s*(?:\+=|=)\s*(\w+)\s*\+\s*"([^"]*)"`)
+
+// jsLineCommentPattern matches a // line comment so commented-out assignments
+// are not double-counted.
+var jsLineCommentPattern = regexp.MustCompile(`(?m)//[^\r\n]*`)
+
+// jsRedirectTarget extracts the literal URL assigned to location.href. It only
+// parses simple string literals (concatenated with "+", and also the common
+// `argument = argument + "..."` accumulation used by CSPro CMS); it never
+// executes JavaScript. It returns the raw URL as written.
+func jsRedirectTarget(body []byte) (string, bool) {
+	loc := jsHrefAssign.FindIndex(body)
+	if loc == nil {
+		return "", false
+	}
+	rest := string(body[loc[1]:])
+	var builder strings.Builder
+	pos := 0
+	for pos < len(rest) {
+		m := jsStringLit.FindStringSubmatchIndex(rest[pos:])
+		if m == nil {
+			break
+		}
+		// The text between the previous literal and this one must be only
+		// whitespace/`+`; otherwise the literal run ended (e.g. at `;`).
+		if strings.TrimSpace(strings.ReplaceAll(rest[pos:pos+m[0]], "+", "")) != "" {
+			break
+		}
+		var val string
+		if m[2] >= 0 {
+			val = rest[pos+m[2] : pos+m[3]]
+		} else {
+			val = rest[pos+m[4] : pos+m[5]]
+		}
+		builder.WriteString(val)
+		pos += m[1]
+	}
+	base := builder.String()
+	if base == "" {
+		return "", false
+	}
+	// Append literals accumulated into a variable (before the location.href
+	// assignment) so a `location.href = base + argument` shell resolves fully.
+	before := string(body[:loc[0]])
+	accumulated := jsAccumulatedLiterals(before)
+	return base + accumulated, true
+}
+
+// jsAccumulatedLiterals concatenates the string literals from self-accumulating
+// assignments (X = X + "lit" / X += "lit"), in order, ignoring line comments.
+func jsAccumulatedLiterals(s string) string {
+	clean := jsLineCommentPattern.ReplaceAllString(s, "")
+	var builder strings.Builder
+	for _, m := range jsAccumPattern.FindAllStringSubmatch(clean, -1) {
+		if m[1] == m[2] {
+			builder.WriteString(m[3])
+		}
+	}
+	return builder.String()
+}
+
+// htmlShellEmpty reports whether an HTML body has no meaningful visible text
+// (after removing scripts/styles), i.e. it looks like an empty shell that may
+// only contain a JS redirect.
+func htmlShellEmpty(body []byte) bool {
+	document, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	document.Find("script,style,noscript,svg").Remove()
+	text := normalizeSpace(document.Find("body").Text())
+	return len(text) < 50
+}
+
+// resolveSameHostJSRedirect resolves a raw JS redirect URL against base and
+// requires the result to stay on the same host, to prevent an open redirect.
+func resolveSameHostJSRedirect(base, raw string) (string, error) {
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	resolved := baseURL.ResolveReference(ref)
+	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+		return "", fmt.Errorf("unsupported JS redirect scheme %q", resolved.Scheme)
+	}
+	if resolved.Host != baseURL.Host {
+		return "", fmt.Errorf("cross-host JS redirect to %q", resolved.Host)
+	}
+	return resolved.String(), nil
+}
+
 func (c *HTTPCollector) fetchHTML(ctx context.Context, target string) (model.Document, *goquery.Document, error) {
 	resp, err := c.doRequest(ctx, target, botHeaders())
 	if err != nil {
@@ -532,6 +639,34 @@ func (c *HTTPCollector) fetchHTML(ctx context.Context, target string) (model.Doc
 	}
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	finalURL := canonicalURL(resp.Request.URL.String())
+
+	// Follow a single simple JS redirect when the page is an empty/near-empty
+	// HTML shell. Some CMS (e.g. CSPro) serve a shell whose only meaningful
+	// content is `window.location.href = "..."`; the real body is at that
+	// literal URL. We never execute JS: we only resolve the literal, require it
+	// to stay on the same host, and fetch it through the SSRF-protected
+	// doRequest. A shell is followed at most once (no recursive redirects).
+	if htmlShellEmpty(body) {
+		if rawTarget, ok := jsRedirectTarget(body); ok {
+			if resolved, err := resolveSameHostJSRedirect(finalURL, rawTarget); err == nil {
+				resp2, err2 := c.doRequest(ctx, resolved, botHeaders())
+				if err2 == nil {
+					resp.Body.Close()
+					resp = resp2
+					body, err = io.ReadAll(io.LimitReader(resp2.Body, c.maxBytes+1))
+					if err != nil {
+						return model.Document{}, nil, err
+					}
+					if int64(len(body)) > c.maxBytes {
+						return model.Document{}, nil, fmt.Errorf("response exceeds %d bytes", c.maxBytes)
+					}
+					contentType = strings.ToLower(resp2.Header.Get("Content-Type"))
+					finalURL = canonicalURL(resp2.Request.URL.String())
+				}
+			}
+		}
+	}
+
 	if strings.Contains(contentType, "pdf") || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".pdf") {
 		text, err := extractPDF(ctx, body)
 		if err != nil {
