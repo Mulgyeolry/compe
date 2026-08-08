@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"competition-assistant/internal/config"
 	"competition-assistant/internal/model"
@@ -555,5 +556,71 @@ func TestEvidenceExtractorEmptyFactsNotAnError(t *testing.T) {
 	}
 	if len(result.Facts) != 0 {
 		t.Fatalf("expected empty facts, got %+v", result.Facts)
+	}
+}
+
+// TestBuildResearchEvidenceDocumentExcerptHardBound verifies the external page
+// text (Title + Text) shares one rune budget: an overlong title is truncated
+// and can no longer leak its tail, and the excerpt never exceeds the bound.
+func TestBuildResearchEvidenceDocumentExcerptHardBound(t *testing.T) {
+	doc := model.Document{
+		Title: strings.Repeat("标", maxResearchEvidenceDocumentRunes+1000) + "TITLE_TAIL_SENTINEL",
+		Text:  "TEXT_TAIL_SENTINEL",
+	}
+	excerpt := buildResearchEvidenceDocumentExcerpt(doc)
+	if utf8.RuneCountInString(excerpt) > maxResearchEvidenceDocumentRunes {
+		t.Fatalf("excerpt runes=%d exceed bound %d", utf8.RuneCountInString(excerpt), maxResearchEvidenceDocumentRunes)
+	}
+	if strings.Contains(excerpt, "TITLE_TAIL_SENTINEL") {
+		t.Fatalf("overlong title tail must not leak into the bounded excerpt")
+	}
+	if strings.Contains(excerpt, "TEXT_TAIL_SENTINEL") {
+		t.Fatalf("text must not appear: the title consumed the whole budget")
+	}
+}
+
+// TestBuildResearchEvidenceDocumentExcerptIncludesTitleAndText verifies normal
+// short title and text both appear in the bounded excerpt.
+func TestBuildResearchEvidenceDocumentExcerptIncludesTitleAndText(t *testing.T) {
+	doc := model.Document{
+		Title: "2026 全国大学生程序设计大赛",
+		Text:  "报名截止时间为2026年4月9日。",
+	}
+	excerpt := buildResearchEvidenceDocumentExcerpt(doc)
+	if !strings.Contains(excerpt, doc.Title) {
+		t.Fatalf("title must be in the excerpt, got: %s", excerpt)
+	}
+	if !strings.Contains(excerpt, doc.Text) {
+		t.Fatalf("text must be in the excerpt, got: %s", excerpt)
+	}
+}
+
+// TestEvidenceExtractorDocumentPromptHardBound proves the full user prompt sent
+// to the LLM carries only the bounded excerpt: the raw (unbounded) Document.Title
+// never appears in the prompt, and the overlong title's tail sentinel is absent.
+func TestEvidenceExtractorDocumentPromptHardBound(t *testing.T) {
+	var captured string
+	analyzer := evidenceTestAnalyzer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatCompletionResponse(validEvidenceFactsJSON())))
+	})
+
+	req := evidenceRequest()
+	req.Document.Title = strings.Repeat("标", maxResearchEvidenceDocumentRunes+1000) + "TITLE_TAIL_SENTINEL"
+	req.Document.Text = "TEXT_TAIL_SENTINEL"
+	if _, err := analyzer.ExtractEvidenceFacts(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if captured == "" {
+		t.Fatal("no LLM request captured")
+	}
+	if strings.Contains(captured, "TITLE_TAIL_SENTINEL") {
+		t.Fatalf("overlong title tail must not reach the LLM prompt")
+	}
+	// The raw unbounded title must not appear in full anywhere in the prompt.
+	if strings.Contains(captured, req.Document.Title) {
+		t.Fatalf("raw unbounded Document.Title must not appear in the prompt")
 	}
 }
