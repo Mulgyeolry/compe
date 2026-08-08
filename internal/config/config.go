@@ -41,6 +41,23 @@ type Discovery struct {
 	AnnouncementFreshnessDays int `yaml:"announcement_freshness_days"`
 }
 
+// EvidenceResearch controls how evidence-gap research is scheduled. A
+// competition with missing dates is only admitted to research when its gap is
+// "due": never-researched gaps are due now, retryable/unresolved gaps become due
+// again after their cooldown, and a budget bounds how many competitions enter a
+// single run.
+type EvidenceResearch struct {
+	// MaxCompetitionsPerRun caps how many competition sessions are admitted to
+	// a single planning pass.
+	MaxCompetitionsPerRun int `yaml:"max_competitions_per_run"`
+	// RetryCooldownHours is the short cooldown after a transient (retryable)
+	// research failure.
+	RetryCooldownHours int `yaml:"retry_cooldown_hours"`
+	// UnresolvedCooldownHours is the long cooldown after a real but unsuccessful
+	// (unresolved) research attempt.
+	UnresolvedCooldownHours int `yaml:"unresolved_cooldown_hours"`
+}
+
 // Alert controls operator notifications when a data source becomes unhealthy.
 // A source is considered failed when discovery or candidate fetch errors, and
 // the operator is notified only after the source has failed for
@@ -92,10 +109,11 @@ type Config struct {
 	AppriseURL    string         `yaml:"apprise_url"`
 	HighDomains   []string       `yaml:"high_trust_domains"`
 	MediumDomains []string       `yaml:"medium_trust_domains"`
-	Fetch         Fetch          `yaml:"fetch"`
-	Alert         Alert          `yaml:"alert"`
-	Discovery     Discovery      `yaml:"discovery"`
-	Keywords      Keywords       `yaml:"keywords"`
+	Fetch         Fetch            `yaml:"fetch"`
+	Alert         Alert            `yaml:"alert"`
+	Discovery     Discovery        `yaml:"discovery"`
+	EvidenceResearch EvidenceResearch `yaml:"evidence_research"`
+	Keywords      Keywords         `yaml:"keywords"`
 	Enrichment    Enrichment     `yaml:"enrichment"`
 	Retention     Retention      `yaml:"retention"`
 	Sources       []Source       `yaml:"sources"`
@@ -153,6 +171,15 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Discovery.AnnouncementFreshnessDays == 0 {
 		cfg.Discovery.AnnouncementFreshnessDays = 90
+	}
+	if cfg.EvidenceResearch.MaxCompetitionsPerRun == 0 {
+		cfg.EvidenceResearch.MaxCompetitionsPerRun = 5
+	}
+	if cfg.EvidenceResearch.RetryCooldownHours == 0 {
+		cfg.EvidenceResearch.RetryCooldownHours = 6
+	}
+	if cfg.EvidenceResearch.UnresolvedCooldownHours == 0 {
+		cfg.EvidenceResearch.UnresolvedCooldownHours = 72
 	}
 	if cfg.Enrichment.MaxSources == 0 {
 		cfg.Enrichment.MaxSources = 5
@@ -246,6 +273,15 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Discovery.AnnouncementFreshnessDays < 1 || cfg.Discovery.AnnouncementFreshnessDays > 3650 {
 		return errors.New("discovery.announcement_freshness_days must be between 1 and 3650")
+	}
+	if cfg.EvidenceResearch.MaxCompetitionsPerRun < 1 || cfg.EvidenceResearch.MaxCompetitionsPerRun > 100 {
+		return errors.New("evidence_research.max_competitions_per_run must be between 1 and 100")
+	}
+	if cfg.EvidenceResearch.RetryCooldownHours < 1 || cfg.EvidenceResearch.RetryCooldownHours > 168 {
+		return errors.New("evidence_research.retry_cooldown_hours must be between 1 and 168")
+	}
+	if cfg.EvidenceResearch.UnresolvedCooldownHours < 1 || cfg.EvidenceResearch.UnresolvedCooldownHours > 720 {
+		return errors.New("evidence_research.unresolved_cooldown_hours must be between 1 and 720")
 	}
 	if cfg.Retention.Enabled {
 		if cfg.Retention.ObservationDays < 7 || cfg.Retention.ObservationDays > 3650 {

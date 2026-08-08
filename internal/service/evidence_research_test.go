@@ -198,14 +198,19 @@ func researchTestConfig(t *testing.T) config.Config {
 		DBPath: filepath.Join(t.TempDir(), "research.db"),
 		Discovery: config.Discovery{AnnouncementFreshnessDays: 30},
 		Fetch:     config.Fetch{TimeoutSeconds: 3, MaxBytes: 1024 * 1024, MaxCandidates: 20},
+		EvidenceResearch: config.EvidenceResearch{
+			MaxCompetitionsPerRun:   5,
+			RetryCooldownHours:      6,
+			UnresolvedCooldownHours: 72,
+		},
 	}
 }
 
-// TestRunEvidenceResearchDetectionFindsPersistedCanonicalWithoutObservationChange
-// proves that detection reads the persisted canonical set directly: a
+// TestRunEvidenceResearchPlanningFindsPersistedCanonicalWithoutObservationChange
+// proves that planning reads the persisted canonical set directly: a
 // competition inserted via UpsertCompetition — with no new candidate or
-// observation change in this pass — is still surfaced as a research session.
-func TestRunEvidenceResearchDetectionFindsPersistedCanonicalWithoutObservationChange(t *testing.T) {
+// observation change in this pass — is still surfaced as a due research session.
+func TestRunEvidenceResearchPlanningFindsPersistedCanonicalWithoutObservationChange(t *testing.T) {
 	cfg := researchTestConfig(t)
 	app, database := researchTestService(t, cfg)
 	ctx := context.Background()
@@ -233,8 +238,8 @@ func TestRunEvidenceResearchDetectionFindsPersistedCanonicalWithoutObservationCh
 	}
 
 	// The phase is read-only: no events and no notifications are produced.
-	if err := app.runEvidenceResearchDetection(ctx, researchNow()); err != nil {
-		t.Fatalf("runEvidenceResearchDetection: %v", err)
+	if err := app.runEvidenceResearchPlanning(ctx, researchNow()); err != nil {
+		t.Fatalf("runEvidenceResearchPlanning: %v", err)
 	}
 	activeAfter, err := database.ListActiveCompetitions(ctx)
 	if err != nil {
@@ -396,4 +401,287 @@ func TestEvidenceResearchExcludesInvalidCanonicalsFromFullSet(t *testing.T) {
 	if len(sessions) != 0 {
 		t.Fatalf("finished/previous-edition/low-trust must not enter research, got %d sessions", len(sessions))
 	}
+}
+
+// --- Planner tests ---
+
+func researchCfg() config.EvidenceResearch {
+	return config.EvidenceResearch{MaxCompetitionsPerRun: 5, RetryCooldownHours: 6, UnresolvedCooldownHours: 72}
+}
+
+// sessionFor builds a research session with one gap of the given field.
+func sessionFor(id int64, fields ...model.EvidenceField) model.ResearchSession {
+	var gaps []model.EvidenceGap
+	for _, field := range fields {
+		gaps = append(gaps, model.EvidenceGap{Field: field, Reason: model.ResearchReasonMissing})
+	}
+	return model.ResearchSession{CompetitionID: id, Gaps: gaps}
+}
+
+func TestResearchNextRetryAtPolicy(t *testing.T) {
+	now := researchNow()
+	cfg := researchCfg()
+	if got := researchNextRetryAt(model.ResearchStateRetryable, now, cfg); got == nil || !got.Equal(now.Add(6*time.Hour)) {
+		t.Fatalf("retryable cooldown = %v, want +6h", got)
+	}
+	if got := researchNextRetryAt(model.ResearchStateUnresolved, now, cfg); got == nil || !got.Equal(now.Add(72*time.Hour)) {
+		t.Fatalf("unresolved cooldown = %v, want +72h", got)
+	}
+	if got := researchNextRetryAt(model.ResearchStateResolved, now, cfg); got != nil {
+		t.Fatalf("resolved must have no next_retry_at, got %v", got)
+	}
+	if got := researchNextRetryAt(model.ResearchStateSkipped, now, cfg); got != nil {
+		t.Fatalf("skipped must have no next_retry_at, got %v", got)
+	}
+}
+
+func TestPlanDueResearchSessionsNeverResearchedIsDue(t *testing.T) {
+	sessions := []model.ResearchSession{sessionFor(1, model.EvidenceCompetitionEnd)}
+	due, stats := planDueResearchSessions(sessions, nil, researchNow(), 5)
+	if len(due) != 1 || len(due[0].Gaps) != 1 {
+		t.Fatalf("expected 1 due session, got %+v", due)
+	}
+	if stats.detectedSessions != 1 || stats.dueSessions != 1 {
+		t.Fatalf("stats mismatch: %+v", stats)
+	}
+}
+
+func TestPlanDueResearchSessionsFutureCooldownNotDue(t *testing.T) {
+	now := researchNow()
+	state := model.EvidenceResearchState{CompetitionID: 1, Field: model.EvidenceCompetitionEnd, Status: model.ResearchStateRetryable, NextRetryAt: researchRetryAtService(now, 24)}
+	sessions := []model.ResearchSession{sessionFor(1, model.EvidenceCompetitionEnd)}
+	due, stats := planDueResearchSessions(sessions, []model.EvidenceResearchState{state}, now, 5)
+	if len(due) != 0 {
+		t.Fatalf("gap in future cooldown must not be due, got %+v", due)
+	}
+	if stats.deferredCooldown != 1 {
+		t.Fatalf("expected 1 deferred_cooldown, got %d", stats.deferredCooldown)
+	}
+}
+
+func TestPlanDueResearchSessionsRetryTimeReachedIsDue(t *testing.T) {
+	now := researchNow()
+	// next_retry_at is exactly now → due.
+	state := model.EvidenceResearchState{CompetitionID: 1, Field: model.EvidenceCompetitionEnd, Status: model.ResearchStateUnresolved, NextRetryAt: researchRetryAtService(now, 0)}
+	sessions := []model.ResearchSession{sessionFor(1, model.EvidenceCompetitionEnd)}
+	due, _ := planDueResearchSessions(sessions, []model.EvidenceResearchState{state}, now, 5)
+	if len(due) != 1 {
+		t.Fatalf("retry time reached must be due, got %+v", due)
+	}
+}
+
+func TestPlanDueResearchSessionsOnlyDueGapsIncluded(t *testing.T) {
+	now := researchNow()
+	// registration_end is in cooldown; competition_start has no state (due);
+	// competition_end retry time reached (due).
+	states := []model.EvidenceResearchState{
+		{CompetitionID: 1, Field: model.EvidenceRegistrationEnd, Status: model.ResearchStateRetryable, NextRetryAt: researchRetryAtService(now, 24)},
+		{CompetitionID: 1, Field: model.EvidenceCompetitionEnd, Status: model.ResearchStateRetryable, NextRetryAt: researchRetryAtService(now, 0)},
+	}
+	sessions := []model.ResearchSession{sessionFor(1, model.EvidenceRegistrationEnd, model.EvidenceCompetitionStart, model.EvidenceCompetitionEnd)}
+	due, _ := planDueResearchSessions(sessions, states, now, 5)
+	if len(due) != 1 {
+		t.Fatalf("expected 1 due session, got %+v", due)
+	}
+	var fields []model.EvidenceField
+	for _, gap := range due[0].Gaps {
+		fields = append(fields, gap.Field)
+	}
+	if len(fields) != 2 || fields[0] != model.EvidenceCompetitionStart || fields[1] != model.EvidenceCompetitionEnd {
+		t.Fatalf("expected only due gaps (competition_start, competition_end), got %v", fields)
+	}
+}
+
+func TestPlanDueResearchSessionsBudgetCapsCompetitions(t *testing.T) {
+	now := researchNow()
+	// Three competitions, each missing one date, no states (all never-researched).
+	sessions := []model.ResearchSession{
+		sessionFor(1, model.EvidenceCompetitionEnd),
+		sessionFor(2, model.EvidenceCompetitionEnd),
+		sessionFor(3, model.EvidenceCompetitionEnd),
+	}
+	due, stats := planDueResearchSessions(sessions, nil, now, 2)
+	if len(due) != 2 {
+		t.Fatalf("expected 2 due sessions under budget 2, got %d", len(due))
+	}
+	if stats.deferredBudget != 1 {
+		t.Fatalf("expected 1 deferred_budget, got %d", stats.deferredBudget)
+	}
+}
+
+func TestPlanDueResearchSessionsBudgetDoesNotMutateBacklog(t *testing.T) {
+	now := researchNow()
+	sessions := []model.ResearchSession{
+		sessionFor(1, model.EvidenceCompetitionEnd),
+		sessionFor(2, model.EvidenceCompetitionEnd),
+		sessionFor(3, model.EvidenceCompetitionEnd),
+	}
+	// Keep a reference to the input before planning.
+	originalLen := len(sessions)
+	originalGapCount := 0
+	for _, session := range sessions {
+		originalGapCount += len(session.Gaps)
+	}
+	due, _ := planDueResearchSessions(sessions, nil, now, 1)
+	if len(sessions) != originalLen {
+		t.Fatalf("input sessions slice must not be mutated")
+	}
+	stillGapCount := 0
+	for _, session := range sessions {
+		stillGapCount += len(session.Gaps)
+	}
+	if stillGapCount != originalGapCount {
+		t.Fatalf("input gaps were mutated")
+	}
+	if len(due) != 1 {
+		t.Fatalf("expected 1 due session, got %d", len(due))
+	}
+}
+
+func TestPlanDueResearchSessionsDeterministicOrder(t *testing.T) {
+	now := researchNow()
+	// competition 5 has a resolved-state re-due (priority 1), competitions 2 and 9
+	// are never-researched (priority 0). Never-researched come first, sorted by ID.
+	sessions := []model.ResearchSession{
+		sessionFor(5, model.EvidenceCompetitionEnd),
+		sessionFor(9, model.EvidenceCompetitionEnd),
+		sessionFor(2, model.EvidenceCompetitionEnd),
+	}
+	states := []model.EvidenceResearchState{
+		{CompetitionID: 5, Field: model.EvidenceCompetitionEnd, Status: model.ResearchStateResolved, NextRetryAt: nil},
+	}
+	due, _ := planDueResearchSessions(sessions, states, now, 5)
+	var ids []int64
+	for _, session := range due {
+		ids = append(ids, session.CompetitionID)
+	}
+	// Never-researched (2, 9) first, then re-due resolved (5).
+	if len(ids) != 3 || ids[0] != 2 || ids[1] != 9 || ids[2] != 5 {
+		t.Fatalf("unexpected due order: %v", ids)
+	}
+}
+
+func TestPlanDueResearchSessionsResolvedStateRedue(t *testing.T) {
+	now := researchNow()
+	// A previously-resolved gap reappears (canonical field is nil again): the old
+	// resolved state must NOT permanently lock it out → re-due.
+	state := model.EvidenceResearchState{CompetitionID: 1, Field: model.EvidenceCompetitionStart, Status: model.ResearchStateResolved, NextRetryAt: nil}
+	sessions := []model.ResearchSession{sessionFor(1, model.EvidenceCompetitionStart)}
+	due, _ := planDueResearchSessions(sessions, []model.EvidenceResearchState{state}, now, 5)
+	if len(due) != 1 {
+		t.Fatalf("reappearing gap under resolved state must be re-due, got %+v", due)
+	}
+}
+
+func TestPlanDueResearchSessionsSkippedStateDoesNotLock(t *testing.T) {
+	now := researchNow()
+	// Same for skipped: a still-eligible gap under a skipped state must not be
+	// permanently blocked.
+	state := model.EvidenceResearchState{CompetitionID: 1, Field: model.EvidenceCompetitionEnd, Status: model.ResearchStateSkipped, NextRetryAt: nil}
+	sessions := []model.ResearchSession{sessionFor(1, model.EvidenceCompetitionEnd)}
+	due, _ := planDueResearchSessions(sessions, []model.EvidenceResearchState{state}, now, 5)
+	if len(due) != 1 {
+		t.Fatalf("still-eligible gap under skipped state must be re-due, got %+v", due)
+	}
+}
+
+func researchRetryAtService(base time.Time, hours int) *time.Time {
+	value := base.Add(time.Duration(hours) * time.Hour)
+	return &value
+}
+
+// --- Integration tests ---
+
+// TestEvidenceResearchPlanningRespectsCooldownState verifies that a persisted
+// cooldown state keeps a gap out of the due session in the same run, while a
+// never-researched gap is admitted.
+func TestEvidenceResearchPlanningRespectsCooldownState(t *testing.T) {
+	cfg := researchTestConfig(t)
+	_, database := researchTestService(t, cfg)
+	ctx := context.Background()
+	now := researchNow()
+
+	// One competition missing both registration_start and competition_end.
+	competition := competitionWithDates()
+	competition.ID = 1
+	competition.EntityKey = "cooldown-canonical"
+	competition.OfficialURL = "https://contest.example.com/cooldown"
+	competition.RegistrationStart = nil
+	competition.CompetitionEnd = nil
+	if _, isNew, err := database.UpsertCompetition(ctx, competition, "test", now); err != nil || !isNew {
+		t.Fatalf("upsert canonical: isNew=%v err=%v", isNew, err)
+	}
+	// competition_end is in cooldown (next_retry_at in the future).
+	competitionSaved, err := database.GetCompetition(ctx, competition.EntityKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	future := now.Add(48 * time.Hour)
+	if err := database.RecordEvidenceResearchAttempt(ctx, competitionSaved.ID, model.EvidenceCompetitionEnd, model.ResearchStateUnresolved, now, &future, "no evidence"); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := database.ListCompetitions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	states, err := database.ListEvidenceResearchStates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := buildEvidenceResearchSessions(all, now, researchFreshness())
+	due, _ := planDueResearchSessions(sessions, states, now, cfg.EvidenceResearch.MaxCompetitionsPerRun)
+	if len(due) != 1 {
+		t.Fatalf("expected 1 due session, got %+v", due)
+	}
+	// Only registration_start is due; competition_end is in cooldown.
+	if len(due[0].Gaps) != 1 || due[0].Gaps[0].Field != model.EvidenceRegistrationStart {
+		t.Fatalf("expected only registration_start due, got %+v", due[0].Gaps)
+	}
+}
+
+// TestEvidenceResearchPlanningDoesNotIncrementAttempt verifies the planning
+// phase never records an attempt (no attempt_count change, no new state rows),
+// mutates canonical facts, or produces events.
+func TestEvidenceResearchPlanningDoesNotIncrementAttempt(t *testing.T) {
+	cfg := researchTestConfig(t)
+	app, database := researchTestService(t, cfg)
+	ctx := context.Background()
+	now := researchNow()
+
+	competition := competitionWithDates()
+	competition.EntityKey = "no-attempt-canonical"
+	competition.OfficialURL = "https://contest.example.com/no-attempt"
+	competition.CompetitionEnd = nil
+	if _, isNew, err := database.UpsertCompetition(ctx, competition, "test", now); err != nil || !isNew {
+		t.Fatalf("upsert canonical: isNew=%v err=%v", isNew, err)
+	}
+	saved, err := database.GetCompetition(ctx, competition.EntityKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.runEvidenceResearchPlanning(ctx, now); err != nil {
+		t.Fatalf("runEvidenceResearchPlanning: %v", err)
+	}
+
+	// No state rows were created by planning.
+	states, err := database.ListEvidenceResearchStates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 0 {
+		t.Fatalf("planning must not create research state rows, got %d", len(states))
+	}
+	// Canonical is unchanged.
+	after, err := database.GetCompetitionByID(ctx, saved.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.CompetitionEnd != nil {
+		t.Fatalf("planning must not mutate canonical facts")
+	}
+	// The phase is structurally read-only: runEvidenceResearchPlanning only reads
+	// competitions + research states, plans due sessions, and logs. It never
+	// writes, so it cannot produce events or notifications.
 }

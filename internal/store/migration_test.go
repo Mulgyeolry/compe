@@ -84,9 +84,10 @@ WHERE competition_id=? AND event_type='registration_opened' AND event_key='regis
 	assertCount(t, database, `SELECT COUNT(*) FROM schema_migrations WHERE version=1 AND name='baseline_current_schema'`, 1)
 }
 
-// TestFreshDatabaseMigratesToVersion1 verifies a brand-new database gets the
-// complete schema and records exactly one migration: version 1.
-func TestFreshDatabaseMigratesToVersion1(t *testing.T) {
+// TestFreshDatabaseMigratesToLatestVersion verifies a brand-new database gets
+// the complete schema and records all supported migrations (v1 baseline plus the
+// evidence_research_state v2 migration).
+func TestFreshDatabaseMigratesToLatestVersion(t *testing.T) {
 	t.Parallel()
 	database, err := Open(filepath.Join(t.TempDir(), "fresh.db"))
 	if err != nil {
@@ -103,8 +104,10 @@ func TestFreshDatabaseMigratesToVersion1(t *testing.T) {
 	for _, table := range coreTables {
 		assertCount(t, database, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='`+table+`'`, 1)
 	}
-	assertCount(t, database, `SELECT COUNT(*) FROM schema_migrations`, 1)
+	assertCount(t, database, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence_research_state'`, 1)
+	assertCount(t, database, `SELECT COUNT(*) FROM schema_migrations`, 2)
 	assertCount(t, database, `SELECT COUNT(*) FROM schema_migrations WHERE version=1 AND name='baseline_current_schema'`, 1)
+	assertCount(t, database, `SELECT COUNT(*) FROM schema_migrations WHERE version=2 AND name='evidence_research_state'`, 1)
 }
 
 // TestReopenDoesNotRerunMigration verifies closing and reopening a database does
@@ -124,8 +127,9 @@ func TestReopenDoesNotRerunMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	assertCount(t, database, `SELECT COUNT(*) FROM schema_migrations`, 1)
+	assertCount(t, database, `SELECT COUNT(*) FROM schema_migrations`, 2)
 	assertCount(t, database, `SELECT COUNT(*) FROM schema_migrations WHERE version=1 AND name='baseline_current_schema'`, 1)
+	assertCount(t, database, `SELECT COUNT(*) FROM schema_migrations WHERE version=2 AND name='evidence_research_state'`, 1)
 }
 
 // TestLegacyDatabaseGetsMissingColumns verifies a pre-migration database that
@@ -188,8 +192,8 @@ func TestFutureSchemaVersionRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = Open(path)
-	if err == nil || !strings.Contains(err.Error(), "newer than supported version 1") {
-		t.Fatalf("expected future-version error containing 'newer than supported version 1', got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "newer than supported version 2") {
+		t.Fatalf("expected future-version error containing 'newer than supported version 2', got: %v", err)
 	}
 }
 

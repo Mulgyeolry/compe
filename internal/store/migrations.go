@@ -27,6 +27,11 @@ var migrations = []migration{
 		name:    "baseline_current_schema",
 		up:      baselineCurrentSchemaUp,
 	},
+	{
+		version: 2,
+		name:    "evidence_research_state",
+		up:      evidenceResearchStateUp,
+	},
 }
 
 // validateMigrations checks the static migration definitions before any database
@@ -317,6 +322,36 @@ CREATE INDEX IF NOT EXISTS idx_user_competition_choices_competition ON user_comp
 		}
 	}
 	return removeLegacyNotifications(tx)
+}
+
+// evidenceResearchStateUp creates the evidence_research_state table that records
+// the scheduling history of individual evidence-research attempts for a
+// competition field. It is deliberately a separate forward-only migration so the
+// version 1 baseline history is untouched. The table stores only attempt
+// outcomes / cooldown scheduling — it is not a second source of truth for
+// competition data, and never holds evidence body text (the canonical
+// Competition remains the source of truth; real evidence lives in the
+// FactEvidence / research-audit chain). A competition delete cascades to its
+// research-state rows via the foreign key.
+func evidenceResearchStateUp(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+CREATE TABLE IF NOT EXISTS evidence_research_state (
+    competition_id INTEGER NOT NULL REFERENCES competitions(id) ON DELETE CASCADE,
+    field TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER,
+    next_retry_at INTEGER,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (competition_id, field),
+    CHECK (attempt_count >= 0),
+    CHECK (field IN ('registration_start','registration_end','competition_start','competition_end')),
+    CHECK (status IN ('retryable','unresolved','resolved','skipped'))
+)
+`)
+	return err
 }
 
 // removeLegacyNotifications migrates deduplication keys from the pre-user
