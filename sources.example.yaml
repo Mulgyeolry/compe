@@ -22,6 +22,15 @@ alert:
 discovery:
   announcement_freshness_days: 90
 
+# Evidence Research 调度：控制"缺资料的 canonical 何时进入研究"。
+# max_competitions_per_run：每轮最多准入几个比赛的研究 session（预算）。
+# retry_cooldown_hours：瞬时失败（网络/临时服务错误）后的短冷却时间。
+# unresolved_cooldown_hours：有效研究但未找到可靠官方证据后的长冷却时间。
+evidence_research:
+  max_competitions_per_run: 5
+  retry_cooldown_hours: 6
+  unresolved_cooldown_hours: 72
+
 # 数据清洗在每次系统扫描结束后执行。去重事件和官方事实不会被删除。
 retention:
   enabled: true

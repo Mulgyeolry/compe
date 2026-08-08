@@ -5,6 +5,7 @@ import (
 	"sort"
 	"time"
 
+	"competition-assistant/internal/config"
 	"competition-assistant/internal/model"
 	"competition-assistant/internal/subscription"
 )
@@ -80,14 +81,144 @@ func buildEvidenceResearchSessions(competitions []model.Competition, now time.Ti
 	return sessions
 }
 
-// runEvidenceResearchDetection is the standalone Evidence Research detection
+// researchNextRetryAt is the centralized, pure cooldown policy. The research
+// executor only reports an outcome; the system decides when a field may be
+// researched again. retryable (transient failure) gets a short cooldown,
+// unresolved (real attempt, no reliable evidence) a long cooldown, and resolved
+// / skipped are terminal with no retry.
+func researchNextRetryAt(status model.ResearchStateStatus, now time.Time, cfg config.EvidenceResearch) *time.Time {
+	switch status {
+	case model.ResearchStateRetryable:
+		value := now.Add(time.Duration(cfg.RetryCooldownHours) * time.Hour)
+		return &value
+	case model.ResearchStateUnresolved:
+		value := now.Add(time.Duration(cfg.UnresolvedCooldownHours) * time.Hour)
+		return &value
+	default: // resolved, skipped
+		return nil
+	}
+}
+
+// researchStateKey addresses one evidence-research state row.
+type researchStateKey struct {
+	competitionID int64
+	field         model.EvidenceField
+}
+
+// researchPlanStats holds the scheduling accounting for one planning pass so the
+// phase can log a compact picture of what is due and what is deferred.
+type researchPlanStats struct {
+	detectedSessions int
+	detectedGaps     int
+	dueSessions      int
+	dueGaps          int
+	deferredCooldown int
+	deferredBudget   int
+}
+
+// planDueResearchSessions is the pure, deterministic due-research planner. It
+// takes the eligible sessions from buildEvidenceResearchSessions plus the
+// recorded EvidenceResearchState and decides, field-by-field, which gaps are due
+// this round, then applies the per-run competition budget. Field-level rules:
+//
+//   - no state for a gap → never researched → due now;
+//   - retryable / unresolved → due when next_retry_at <= now, otherwise cooldown;
+//   - resolved / skipped → the canonical field is still nil (gap exists), so the
+//     historical terminal state must NOT permanently lock it out; it is re-due.
+//
+// A session contains only its due gaps, so one field's cooldown is never
+// bypassed by another gap. A competition counts as one budget unit regardless of
+// how many due gaps it has. Ordering is deterministic: never-researched sessions
+// first, then due-retry sessions, tie-broken by CompetitionID.
+func planDueResearchSessions(sessions []model.ResearchSession, states []model.EvidenceResearchState, now time.Time, maxCompetitionsPerRun int) ([]model.ResearchSession, researchPlanStats) {
+	stateByKey := make(map[researchStateKey]model.EvidenceResearchState, len(states))
+	for _, state := range states {
+		stateByKey[researchStateKey{competitionID: state.CompetitionID, field: state.Field}] = state
+	}
+
+	var stats researchPlanStats
+	stats.detectedSessions = len(sessions)
+	for _, session := range sessions {
+		stats.detectedGaps += len(session.Gaps)
+	}
+
+	type candidate struct {
+		session         model.ResearchSession
+		neverResearched bool
+	}
+	var candidates []candidate
+	for _, session := range sessions {
+		var dueGaps []model.EvidenceGap
+		hasNeverResearched := false
+		hasDue := false
+		for _, gap := range session.Gaps {
+			state, ok := stateByKey[researchStateKey{competitionID: session.CompetitionID, field: gap.Field}]
+			if !ok {
+				dueGaps = append(dueGaps, gap)
+				hasNeverResearched = true
+				hasDue = true
+				continue
+			}
+			switch state.Status {
+			case model.ResearchStateRetryable, model.ResearchStateUnresolved:
+				if state.NextRetryAt != nil && !state.NextRetryAt.After(now) {
+					dueGaps = append(dueGaps, gap)
+					hasDue = true
+				}
+				// else: next_retry_at in the future → cooldown, gap is not due.
+			case model.ResearchStateResolved, model.ResearchStateSkipped:
+				// The gap still exists (canonical field == nil), so the old
+				// terminal state must not permanently block re-research.
+				dueGaps = append(dueGaps, gap)
+				hasDue = true
+			}
+		}
+		if !hasDue {
+			stats.deferredCooldown++
+			continue
+		}
+		candidates = append(candidates, candidate{
+			session:         model.ResearchSession{CompetitionID: session.CompetitionID, Gaps: dueGaps},
+			neverResearched: hasNeverResearched,
+		})
+	}
+
+	// Deterministic ordering: never-researched first, then due-retry; stable by
+	// CompetitionID. No map iteration drives the order.
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].neverResearched != candidates[j].neverResearched {
+			return candidates[i].neverResearched
+		}
+		return candidates[i].session.CompetitionID < candidates[j].session.CompetitionID
+	})
+
+	result := make([]model.ResearchSession, 0, len(candidates))
+	for index, c := range candidates {
+		if index >= maxCompetitionsPerRun {
+			stats.deferredBudget++
+			continue
+		}
+		result = append(result, c.session)
+	}
+	stats.dueSessions = len(result)
+	for _, session := range result {
+		stats.dueGaps += len(session.Gaps)
+	}
+	return result, stats
+}
+
+// runEvidenceResearchPlanning is the standalone Evidence Research planning
 // phase. It is deliberately independent of processCandidate and of the
 // observation "changed" decision: a canonical competition whose original page
-// did not change this round can still enter a session when it is missing a
-// date. Phase 1 only reads canonical competitions, builds sessions and logs
-// counts; it never searches, fetches, calls the LLM, mutates canonical facts,
-// produces events or touches notifications.
-func (s *Service) runEvidenceResearchDetection(ctx context.Context, now time.Time) error {
+// did not change this round can still be planned for research when it is
+// missing a date. It reads the full canonical set, builds eligible sessions,
+// filters by recorded research state and cooldown, applies the per-run budget,
+// and logs scheduling stats. It never searches, fetches, calls the LLM, mutates
+// canonical facts, produces events or touches notifications. Crucially, it must
+// NOT call RecordEvidenceResearchAttempt: being planned is not the same as
+// having executed a research attempt, so attempt_count is only ever incremented
+// by a future research executor.
+func (s *Service) runEvidenceResearchPlanning(ctx context.Context, now time.Time) error {
 	// Read the full canonical set, not the UI/active-list subset. ListActiveCompetitions
 	// pre-filters by status (preview/upcoming/registration_open/ongoing), which would
 	// drop the canonicals most in need of evidence research: StatusUnknown (all dates
@@ -99,11 +230,18 @@ func (s *Service) runEvidenceResearchDetection(ctx context.Context, now time.Tim
 		return err
 	}
 	sessions := buildEvidenceResearchSessions(competitions, now, s.freshnessWindow())
-	totalGaps := 0
-	for _, session := range sessions {
-		totalGaps += len(session.Gaps)
+	states, err := s.store.ListEvidenceResearchStates(ctx)
+	if err != nil {
+		return err
 	}
-	s.log.Info("evidence research detection",
-		"sessions", len(sessions), "gaps", totalGaps)
+	dueSessions, stats := planDueResearchSessions(sessions, states, now, s.cfg.EvidenceResearch.MaxCompetitionsPerRun)
+	s.log.Info("evidence research planning",
+		"detected_sessions", stats.detectedSessions,
+		"detected_gaps", stats.detectedGaps,
+		"due_sessions", stats.dueSessions,
+		"due_gaps", stats.dueGaps,
+		"deferred_cooldown", stats.deferredCooldown,
+		"deferred_budget", stats.deferredBudget)
+	_ = dueSessions // planned for a future research executor
 	return nil
 }
