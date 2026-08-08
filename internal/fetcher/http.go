@@ -485,6 +485,35 @@ func (c *HTTPCollector) discoverRSS(ctx context.Context, source config.Source) (
 
 func (c *HTTPCollector) discoverSearch(ctx context.Context, source config.Source) ([]model.Candidate, error) {
 	query := strings.ReplaceAll(source.Query, "{year}", strconv.Itoa(time.Now().Year()))
+	results, err := c.searchSearx(ctx, query, source.Limit, source.AllowedDomains)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]model.Candidate, 0, len(results))
+	for _, result := range results {
+		items = append(items, model.Candidate{
+			SourceID:   source.ID,
+			SourceName: source.Name,
+			Title:      result.Title,
+			URL:        result.URL,
+			Snippet:    result.Snippet,
+		})
+	}
+	return items, nil
+}
+
+// searchSearx is the shared, bounded SearXNG search core used by both
+// discoverSearch (configured sources) and the research Search tool. It builds
+// the endpoint from the configured c.searxngURL, talks to SearXNG only through
+// the trusted service client (which may address a private in-network host), and
+// returns filtered, canonicalized, deduplicated discovery clues. It never fetches
+// the result URLs itself.
+//
+// The caller controls the result count via limit; this core applies no 20-result
+// cap, so the configured-source path (source.Limit may exceed 20) is unaffected
+// by the research API's stricter bound. Output fields are bounded here so no
+// unbounded text can enter a future Agent's context.
+func (c *HTTPCollector) searchSearx(ctx context.Context, query string, limit int, allowedDomains []string) ([]ResearchSearchResult, error) {
 	endpoint := c.searxngURL + "/search?format=json&q=" + url.QueryEscape(query)
 	// SearxNG is a trusted in-network service; only this request may use the
 	// service client. The result URLs it returns are untrusted and are fetched
@@ -504,14 +533,36 @@ func (c *HTTPCollector) discoverSearch(ctx context.Context, source config.Source
 	if err := json.NewDecoder(io.LimitReader(resp.Body, c.maxBytes)).Decode(&payload); err != nil {
 		return nil, err
 	}
-	items := make([]model.Candidate, 0, min(len(payload.Results), source.Limit))
+	results := make([]ResearchSearchResult, 0, min(len(payload.Results), limit))
+	seen := make(map[string]bool, len(payload.Results))
 	for _, result := range payload.Results {
-		if len(items) >= source.Limit || !allowedURL(result.URL, source.AllowedDomains) || !isSafeCandidateURL(result.URL) {
+		if len(results) >= limit {
+			break
+		}
+		if !allowedURL(result.URL, allowedDomains) || !isSafeCandidateURL(result.URL) {
 			continue
 		}
-		items = append(items, model.Candidate{SourceID: source.ID, SourceName: source.Name, Title: result.Title, URL: canonicalURL(result.URL), Snippet: normalizeSpace(result.Content)})
+		canonical := canonicalURL(result.URL)
+		// The canonical URL is produced from untrusted input (e.g. a wrapper like
+		// mp.weixin.qq.com whose target_url points somewhere else). Re-validate it
+		// in full: it must still be an allowed, safe public http(s) URL. This
+		// prevents a raw wrapper that passes the first check from unwrapping to a
+		// loopback/localhost/private destination or a non-allowed domain. Dedup
+		// remains keyed on the canonical URL.
+		if canonical == "" ||
+			!allowedURL(canonical, allowedDomains) ||
+			!isSafeCandidateURL(canonical) ||
+			seen[canonical] {
+			continue
+		}
+		seen[canonical] = true
+		results = append(results, ResearchSearchResult{
+			Title:   truncate(normalizeSpace(result.Title), maxResearchSearchTitleRunes),
+			URL:     canonical,
+			Snippet: truncate(normalizeSpace(result.Content), maxResearchSearchSnippetRunes),
+		})
 	}
-	return deduplicate(items), nil
+	return results, nil
 }
 
 func (c *HTTPCollector) Fetch(ctx context.Context, target string) (model.Document, error) {
