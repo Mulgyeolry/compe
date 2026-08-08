@@ -244,3 +244,156 @@ func TestRunEvidenceResearchDetectionFindsPersistedCanonicalWithoutObservationCh
 		t.Fatalf("detection phase must not mutate the canonical set, got %d", len(activeAfter))
 	}
 }
+
+// TestEvidenceResearchIncludesStatusUnknownCanonical proves that a canonical
+// with StatusUnknown (both phases unknown, all four dates missing) is part of
+// the full set used by detection — even though ListActiveCompetitions would
+// drop it — and becomes a research session.
+func TestEvidenceResearchIncludesStatusUnknownCanonical(t *testing.T) {
+	cfg := researchTestConfig(t)
+	_, database := researchTestService(t, cfg)
+	ctx := context.Background()
+
+	competition := competitionWithDates()
+	competition.Name = "2026 XXX 大赛"
+	competition.RegistrationPhase = model.RegistrationUnknown
+	competition.CompetitionPhase = model.CompetitionUnknown
+	competition.Status = model.StatusUnknown
+	competition.RegistrationStart = nil
+	competition.RegistrationEnd = nil
+	competition.CompetitionStart = nil
+	competition.CompetitionEnd = nil
+	competition.Trust = model.TrustHigh
+	if _, isNew, err := database.UpsertCompetition(ctx, competition, "test", researchNow()); err != nil || !isNew {
+		t.Fatalf("upsert canonical: isNew=%v err=%v", isNew, err)
+	}
+
+	// The UI/active-list path would have missed it (proving the bug), while the
+	// full-set path detection now uses must include it.
+	active, err := database.ListActiveCompetitions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range active {
+		if c.ID == competition.ID {
+			t.Fatalf("StatusUnknown canonical must NOT be in the active/UI list")
+		}
+	}
+	all, err := database.ListCompetitions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := buildEvidenceResearchSessions(all, researchNow(), researchFreshness())
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session for StatusUnknown canonical, got %d", len(sessions))
+	}
+	if len(sessions[0].Gaps) != 4 {
+		t.Fatalf("expected 4 gaps for all-missing StatusUnknown canonical, got %d", len(sessions[0].Gaps))
+	}
+}
+
+// TestEvidenceResearchIncludesRegistrationClosedCanonical proves that a
+// registration_closed canonical whose competition dates are still missing is
+// part of the full detection set and yields a session whose gaps at least cover
+// competition_start/competition_end.
+func TestEvidenceResearchIncludesRegistrationClosedCanonical(t *testing.T) {
+	cfg := researchTestConfig(t)
+	_, database := researchTestService(t, cfg)
+	ctx := context.Background()
+
+	regStart := time.Date(2026, 5, 1, 0, 0, 0, 0, researchLocation())
+	regEnd := time.Date(2026, 6, 30, 0, 0, 0, 0, researchLocation())
+	competition := model.Competition{
+		ID:               2,
+		Name:             "2026 XXX 大赛",
+		StatusEvidence:   "2026年8月开赛",
+		OfficialURL:      "https://contest.example.com/2026",
+		Trust:            model.TrustHigh,
+		RegistrationPhase: model.RegistrationClosed,
+		CompetitionPhase:  model.CompetitionUnknown,
+		Status:            model.StatusRegistrationClosed,
+		RegistrationStart: &regStart,
+		RegistrationEnd:   &regEnd,
+		CompetitionStart:  nil,
+		CompetitionEnd:    nil,
+	}
+	if _, isNew, err := database.UpsertCompetition(ctx, competition, "test", researchNow()); err != nil || !isNew {
+		t.Fatalf("upsert canonical: isNew=%v err=%v", isNew, err)
+	}
+
+	all, err := database.ListCompetitions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := buildEvidenceResearchSessions(all, researchNow(), researchFreshness())
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session for registration_closed canonical, got %d", len(sessions))
+	}
+	seenCompStart, seenCompEnd := false, false
+	for _, gap := range sessions[0].Gaps {
+		if gap.Field == model.EvidenceCompetitionStart {
+			seenCompStart = true
+		}
+		if gap.Field == model.EvidenceCompetitionEnd {
+			seenCompEnd = true
+		}
+	}
+	if !seenCompStart || !seenCompEnd {
+		t.Fatalf("registration_closed canonical gaps must cover competition dates, got %+v", sessions[0].Gaps)
+	}
+}
+
+// TestEvidenceResearchExcludesInvalidCanonicalsFromFullSet confirms that
+// switching detection to the full canonical set does not pull finished,
+// previous-edition, or low-trust competitions into research sessions.
+func TestEvidenceResearchExcludesInvalidCanonicalsFromFullSet(t *testing.T) {
+	cfg := researchTestConfig(t)
+	_, database := researchTestService(t, cfg)
+	ctx := context.Background()
+
+	// finished
+	finished := competitionWithDates()
+	finished.ID = 101
+	finished.EntityKey = "finished-2026"
+	finished.Name = "2026 XXX 大赛"
+	finished.OfficialURL = "https://contest.example.com/finished"
+	finished.CompetitionPhase = model.CompetitionFinished
+	finished.Status = model.StatusFinished
+	finished.CompetitionEnd = nil
+	if _, _, err := database.UpsertCompetition(ctx, finished, "test", researchNow()); err != nil {
+		t.Fatal(err)
+	}
+	// previous edition
+	previous := competitionWithDates()
+	previous.ID = 102
+	previous.EntityKey = "previous-2024"
+	previous.Name = "2024 XXX 大赛"
+	previous.OfficialURL = "https://contest.example.com/previous"
+	previous.CompetitionEnd = nil
+	if _, _, err := database.UpsertCompetition(ctx, previous, "test", researchNow()); err != nil {
+		t.Fatal(err)
+	}
+	// low trust
+	lowTrust := competitionWithDates()
+	lowTrust.ID = 103
+	lowTrust.EntityKey = "lowtrust-2026"
+	lowTrust.Name = "2026 XXX 大赛"
+	lowTrust.OfficialURL = "https://contest.example.com/lowtrust"
+	lowTrust.Trust = model.TrustLow
+	lowTrust.CompetitionEnd = nil
+	if _, _, err := database.UpsertCompetition(ctx, lowTrust, "test", researchNow()); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := database.ListCompetitions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("expected 3 persisted canonicals, got %d", len(all))
+	}
+	sessions := buildEvidenceResearchSessions(all, researchNow(), researchFreshness())
+	if len(sessions) != 0 {
+		t.Fatalf("finished/previous-edition/low-trust must not enter research, got %d sessions", len(sessions))
+	}
+}

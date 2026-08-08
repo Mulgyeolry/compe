@@ -88,7 +88,13 @@ func buildEvidenceResearchSessions(competitions []model.Competition, now time.Ti
 // counts; it never searches, fetches, calls the LLM, mutates canonical facts,
 // produces events or touches notifications.
 func (s *Service) runEvidenceResearchDetection(ctx context.Context, now time.Time) error {
-	competitions, err := s.store.ListActiveCompetitions(ctx)
+	// Read the full canonical set, not the UI/active-list subset. ListActiveCompetitions
+	// pre-filters by status (preview/upcoming/registration_open/ongoing), which would
+	// drop the canonicals most in need of evidence research: StatusUnknown (all dates
+	// unknown) and StatusRegistrationClosed (registration over but competition dates
+	// still missing). Research eligibility itself is decided later by
+	// evidenceResearchEligible, so no status pre-filter belongs here.
+	competitions, err := s.store.ListCompetitions(ctx)
 	if err != nil {
 		return err
 	}
