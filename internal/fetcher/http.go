@@ -395,6 +395,8 @@ func (c *HTTPCollector) Discover(ctx context.Context, source config.Source) ([]m
 		return c.discoverRSS(ctx, source)
 	case "search":
 		return c.discoverSearch(ctx, source)
+	case "ccpc_api":
+		return c.discoverCCPC(ctx, source)
 	default:
 		return nil, fmt.Errorf("unsupported source kind %q", source.Kind)
 	}
@@ -513,6 +515,11 @@ func (c *HTTPCollector) discoverSearch(ctx context.Context, source config.Source
 }
 
 func (c *HTTPCollector) Fetch(ctx context.Context, target string) (model.Document, error) {
+	// CCPC article URLs (/a/{id}.html) are served by the public archive API
+	// instead of the SPA shell.
+	if id, ok := ccpcArticleID(target); ok {
+		return c.fetchCCPCArticle(ctx, id, target)
+	}
 	doc, _, err := c.fetchHTML(ctx, target)
 	return doc, err
 }
