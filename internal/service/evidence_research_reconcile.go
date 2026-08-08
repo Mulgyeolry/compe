@@ -230,7 +230,7 @@ func (s *Service) reconcileEvidenceResearchField(
 	}
 	if !researchFieldNil(current, fieldResult.Field) {
 		existing := researchFieldDate(current, fieldResult.Field)
-		if existing != nil && model.DayStart(*existing).Equal(model.DayStart(fact.Date)) {
+		if existing != nil && researchSameCalendarDate(*existing, fact.Date) {
 			// Canonical already holds the same date → resolved, no write.
 			return researchReconcileFieldResult{
 				Field:         fieldResult.Field,
@@ -248,10 +248,13 @@ func (s *Service) reconcileEvidenceResearchField(
 		}
 	}
 
-	// Build the supplement + lifecycle inference.
+	// Build the supplement + lifecycle inference. The stored date is the UTC
+	// calendar day of the research fact so that storage/reload and comparison are
+	// independent of the timezone the fact was constructed in.
+	supplementDate := researchCalendarDay(fact.Date)
 	supplement := store.EvidenceResearchSupplement{
 		Field: fieldResult.Field,
-		Date:  model.DayStart(fact.Date),
+		Date:  supplementDate,
 		Raw:   strings.TrimSpace(fact.Raw),
 		Fact: model.FactEvidence{
 			Value:      strings.TrimSpace(fact.Raw),
@@ -264,7 +267,7 @@ func (s *Service) reconcileEvidenceResearchField(
 		},
 	}
 	next := current
-	applyResearchDate(&next, fieldResult.Field, model.DayStart(fact.Date), strings.TrimSpace(fact.Raw))
+	applyResearchDate(&next, fieldResult.Field, supplementDate, strings.TrimSpace(fact.Raw))
 	lifecycle, phaseChanged := researchLifecycleAfterSupplement(next, now)
 	supplement.RegistrationPhase = lifecycle.RegistrationPhase
 	supplement.CompetitionPhase = lifecycle.CompetitionPhase
@@ -307,7 +310,7 @@ func (s *Service) reconcileEvidenceResearchField(
 	// Verify the saved canonical actually holds the research date before
 	// recording resolved.
 	savedDate := researchFieldDate(saved, fieldResult.Field)
-	if savedDate == nil || !model.DayStart(*savedDate).Equal(model.DayStart(fact.Date)) {
+	if savedDate == nil || !researchSameCalendarDate(*savedDate, fact.Date) {
 		return researchReconcileFieldResult{
 			Field:         fieldResult.Field,
 			Outcome:       evidenceResearchRejected,
@@ -359,6 +362,20 @@ func applyResearchDate(competition *model.Competition, field model.EvidenceField
 		competition.CompetitionEnd = &date
 		competition.CompetitionEndRaw = raw
 	}
+}
+
+// researchCalendarDay returns the UTC calendar day (00:00 UTC) of a date, used
+// as the canonical stored date so storage/reload and comparison are independent
+// of the source timezone.
+func researchCalendarDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// researchSameCalendarDate reports whether two times fall on the same UTC
+// calendar date. Canonical dates are stored as unix instants and reloaded in
+// UTC, so comparison must use UTC calendar days.
+func researchSameCalendarDate(a, b time.Time) bool {
+	return researchCalendarDay(a).Equal(researchCalendarDay(b))
 }
 
 // researchFieldDate returns the current date pointer for a field (nil if none).

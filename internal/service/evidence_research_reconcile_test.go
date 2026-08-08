@@ -164,12 +164,12 @@ func TestReconcileFoundSameAuthorityAccepted(t *testing.T) {
 	if !decision.CanonicalChanged {
 		t.Fatalf("expected canonical change")
 	}
-	// Verify canonical now holds the date.
+	// Verify canonical now holds the calendar date.
 	after, err := database.GetCompetitionByID(ctx, persisted.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.RegistrationEnd == nil || !after.RegistrationEnd.Equal(time.Date(2026, 4, 9, 0, 0, 0, 0, researchLocation())) {
+	if after.RegistrationEnd == nil || !researchSameCalendarDate(*after.RegistrationEnd, time.Date(2026, 4, 9, 0, 0, 0, 0, researchLocation())) {
 		t.Fatalf("registration_end not supplemented: %v", after.RegistrationEnd)
 	}
 }

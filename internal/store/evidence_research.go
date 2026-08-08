@@ -277,26 +277,33 @@ func applyResearchDate(competition *model.Competition, field model.EvidenceField
 	}
 }
 
+// researchDay normalizes a time to its UTC calendar day. Dates are stored as
+// unix instants and reloaded in UTC, so all calendar comparisons must use UTC
+// days to be independent of the timezone a caller constructed the date with.
+func researchDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+}
+
 // researchSupplementConsistency checks the incoming date against the existing
 // canonical lifecycle (registration_start <= registration_end and
-// competition_start <= competition_end).
+// competition_start <= competition_end). Comparison is on UTC calendar days.
 func researchSupplementConsistency(competition model.Competition, supplement EvidenceResearchSupplement) error {
-	date := model.DayStart(supplement.Date)
+	date := researchDay(supplement.Date)
 	switch supplement.Field {
 	case model.EvidenceRegistrationStart:
-		if competition.RegistrationEnd != nil && model.DayStart(*competition.RegistrationEnd).Before(date) {
+		if competition.RegistrationEnd != nil && researchDay(*competition.RegistrationEnd).Before(date) {
 			return errors.New("registration_start would be after existing registration_end")
 		}
 	case model.EvidenceRegistrationEnd:
-		if competition.RegistrationStart != nil && model.DayStart(*competition.RegistrationStart).After(date) {
+		if competition.RegistrationStart != nil && researchDay(*competition.RegistrationStart).After(date) {
 			return errors.New("registration_end would be before existing registration_start")
 		}
 	case model.EvidenceCompetitionStart:
-		if competition.CompetitionEnd != nil && model.DayStart(*competition.CompetitionEnd).Before(date) {
+		if competition.CompetitionEnd != nil && researchDay(*competition.CompetitionEnd).Before(date) {
 			return errors.New("competition_start would be after existing competition_end")
 		}
 	case model.EvidenceCompetitionEnd:
-		if competition.CompetitionStart != nil && model.DayStart(*competition.CompetitionStart).After(date) {
+		if competition.CompetitionStart != nil && researchDay(*competition.CompetitionStart).After(date) {
 			return errors.New("competition_end would be before existing competition_start")
 		}
 	}
