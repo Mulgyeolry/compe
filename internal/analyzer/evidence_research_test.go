@@ -624,3 +624,43 @@ func TestEvidenceExtractorDocumentPromptHardBound(t *testing.T) {
 		t.Fatalf("raw unbounded Document.Title must not appear in the prompt")
 	}
 }
+
+// TestEvidenceExtractorModelEditionCannotOverrideEvidenceYear verifies a model
+// cannot relabel a 2025 evidence date as edition 2026: the authoritative edition
+// is derived from the evidence date, and the conflicting model edition is
+// rejected.
+func TestEvidenceExtractorModelEditionCannotOverrideEvidenceYear(t *testing.T) {
+	req := evidenceRequest()
+	req.Document.Text = "报名截止时间为2025年4月9日。"
+	payload := `{"schema_version":"research-evidence-v1","facts":[{"field":"registration_end","value":"2025年4月9日","evidence":"报名截止时间为2025年4月9日","edition":"2026","confidence":"high"}]}`
+	analyzer := evidenceTestAnalyzer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatCompletionResponse(payload)))
+	})
+	result, err := analyzer.ExtractEvidenceFacts(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Facts) != 0 {
+		t.Fatalf("model edition must not override evidence year, got %+v", result.Facts)
+	}
+}
+
+// TestEvidenceExtractorRejectsModelEditionConflict verifies a model edition that
+// conflicts with the deterministic evidence date is rejected.
+func TestEvidenceExtractorRejectsModelEditionConflict(t *testing.T) {
+	req := evidenceRequest()
+	req.Document.Text = "报名截止时间为2026年4月9日。"
+	payload := `{"schema_version":"research-evidence-v1","facts":[{"field":"registration_end","value":"2026年4月9日","evidence":"报名截止时间为2026年4月9日","edition":"2025","confidence":"high"}]}`
+	analyzer := evidenceTestAnalyzer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatCompletionResponse(payload)))
+	})
+	result, err := analyzer.ExtractEvidenceFacts(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Facts) != 0 {
+		t.Fatalf("conflicting model edition must be rejected, got %+v", result.Facts)
+	}
+}

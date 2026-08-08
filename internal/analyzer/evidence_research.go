@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -310,16 +311,20 @@ func (a *Analyzer) validateSingleEvidenceFact(req ResearchEvidenceRequest, fullT
 		return reject("value date is not reproducible from evidence")
 	}
 
-	// Edition binding.
-	edition := strings.TrimSpace(fact.Edition)
-	if edition == "" {
-		edition = deriveEditionFromEvidence(evidence)
+	// Edition binding. The authoritative edition is derived deterministically
+	// from the evidence-reproducible date (parsed.Year()), never from the model's
+	// declaration. Because Value must parseDate and must be reproduced from the
+	// Evidence verbatim, parsed.Year() is effectively the evidence's own year.
+	deterministicEdition := strconv.Itoa(parsed.Year())
+	if !sameEdition(req.Edition, deterministicEdition) {
+		return reject("evidence date belongs to a different edition")
 	}
-	if edition == "" {
-		return reject("no edition can be bound")
-	}
-	if !sameEdition(req.Edition, edition) {
-		return reject("edition does not match requested edition")
+	// The model's edition, if provided, is only a consistency check: it must
+	// agree with the deterministic edition. It is never used as the final source
+	// of truth, so a model cannot relabel a 2025 evidence date as 2026.
+	modelEdition := strings.TrimSpace(fact.Edition)
+	if modelEdition != "" && !sameEdition(modelEdition, deterministicEdition) {
+		return reject("model edition conflicts with evidence date")
 	}
 
 	return ResearchEvidenceFact{
@@ -327,19 +332,10 @@ func (a *Analyzer) validateSingleEvidenceFact(req ResearchEvidenceRequest, fullT
 		Date:       model.DayStart(*parsed),
 		Raw:        strings.TrimSpace(fact.Value),
 		Evidence:   fact.Evidence,
-		Edition:    edition,
+		Edition:    deterministicEdition,
 		SourceURL:  req.Document.URL,
 		Confidence: normalizeAIConfidence(fact.Confidence),
 	}, nil
-}
-
-// deriveEditionFromEvidence tries to recover the edition (a year) from a
-// candidate's evidence string.
-func deriveEditionFromEvidence(evidence string) string {
-	if year := yearIn(evidence); year != 0 {
-		return fmt.Sprintf("%d", year)
-	}
-	return ""
 }
 
 // datesInEvidenceContain reports whether any deterministic date extracted from
