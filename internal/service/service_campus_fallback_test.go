@@ -26,7 +26,7 @@ import (
 func TestCampusRulesFallbackRecoversPublicCompetition(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(chatCompletionTestResponse(`{"schema_version":"competition-audit-v9","document_type":"campus_internal","source_role":"campus_forwarding","computer_related":true,"competition_announcement":false,"rejection_reason":"校内转发通知，非官方主办方发布的有效公告"}`)))
+		_, _ = w.Write([]byte(chatCompletionTestResponse(`{"schema_version":"competition-audit-v10","document_type":"campus_internal","source_role":"campus_forwarding","computer_related":true,"competition_announcement":false,"rejection_reason":"校内转发通知，非官方主办方发布的有效公告"}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
@@ -82,7 +82,7 @@ func TestCampusRulesFallbackRecoversPublicCompetition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load canonical: %v", err)
 	}
-	if saved.AnalyzerVersion != "competition-audit-v9" {
+	if saved.AnalyzerVersion != "competition-audit-v10" {
 		t.Errorf("canonical analyzer_version = %q, want v8", saved.AnalyzerVersion)
 	}
 	if saved.Trust != model.TrustMedium {
@@ -129,7 +129,7 @@ func TestCampusRulesFallbackRecoversPublicCompetition(t *testing.T) {
 func TestAnalyzerVersionBumpReanalyzesSameHash(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(chatCompletionTestResponse(`{"schema_version":"competition-audit-v9","document_type":"campus_internal","source_role":"campus_forwarding","computer_related":true,"competition_announcement":false,"rejection_reason":"校内转发通知"}`)))
+		_, _ = w.Write([]byte(chatCompletionTestResponse(`{"schema_version":"competition-audit-v10","document_type":"campus_internal","source_role":"campus_forwarding","computer_related":true,"competition_announcement":false,"rejection_reason":"校内转发通知"}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")

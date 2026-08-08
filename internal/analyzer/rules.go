@@ -42,6 +42,18 @@ var (
 	competitionRangePattern = regexp.MustCompile(`(?:比赛|竞赛|赛事)(?:时间|赛程)\s*[:：]?\s*(` + dateTokenPattern + `)\s*(?:至|到|—|-|~|～)\s*(` + dateTokenLaxPattern + `)`)
 	competitionStartPattern = regexp.MustCompile(`(?:开赛|比赛开始|竞赛开始|赛事开始)(?:时间)?\s*[:：]?\s*(` + dateTokenPattern + `)`)
 	competitionEndPattern   = regexp.MustCompile(`(?:比赛|竞赛|赛事)(?:结束|截止)(?:时间)?\s*[:：]?\s*(` + dateTokenPattern + `)`)
+	// competitionDayRangePattern matches a competition date range whose
+	// right-hand side only states a day (e.g. "26" or "26日"), inheriting the
+	// year and month from the explicitly-dated left-hand side. It supports both
+	// the explicit "比赛/竞赛/赛事时间：" form and a natural-language
+	// "将于...~...举行/举办" expression. It is used ONLY for competition dates;
+	// registration ranges keep the stricter dateTokenLaxPattern and are never
+	// broadened to a day-only end.
+	competitionDayRangePattern = regexp.MustCompile(
+		`(?:(?:比赛|竞赛|赛事)(?:时间|赛程)?\s*[:：]?\s*|(?:将于|计划于|定于)[^。！？；;\n]{0,40}?)` +
+			`(` + dateTokenPattern + `)\s*(?:至|到|—|–|-|~|～)\s*(\d{1,2})\s*日?` +
+			`(?:[^。！？；;\n]{0,40}?(?:举行|举办|开幕|开赛|召开|开始|进行))?`,
+	)
 )
 
 var defaultFocus = []string{
@@ -689,7 +701,42 @@ func extractDates(text string, loc *time.Location) (*time.Time, string, *time.Ti
 }
 
 func extractCompetitionDates(text string, loc *time.Location) (*time.Time, string, *time.Time, string) {
-	return extractDateRange(text, loc, competitionRangePattern, competitionStartPattern, competitionEndPattern)
+	start, startRaw, end, endRaw := extractDateRange(text, loc, competitionRangePattern, competitionStartPattern, competitionEndPattern)
+	if start != nil && end != nil {
+		return start, startRaw, end, endRaw
+	}
+	// A competition range whose right-hand side only states a day ("25~26" /
+	// "25日至26日" / "将于25~26日举行") inherits year and month from the
+	// explicitly-dated left-hand side. This is competition-only: registration
+	// dates are parsed by extractDates and never get this day-only fallback.
+	if dStart, dRaw, dEnd, dEndRaw := extractCompetitionDayRange(text, loc); dStart != nil && dEnd != nil {
+		return dStart, dRaw, dEnd, dEndRaw
+	}
+	return start, startRaw, end, endRaw
+}
+
+// extractCompetitionDayRange parses a competition range whose right-hand side
+// states only a day. The left-hand side must be an explicit full year+month+day
+// date (validated against the real calendar). The right-hand day inherits year
+// and month from it, but only when it does not sort before the start day; a
+// "30日~2日" pattern would imply a cross-month range and is rejected rather than
+// guessed.
+func extractCompetitionDayRange(text string, loc *time.Location) (*time.Time, string, *time.Time, string) {
+	match := competitionDayRangePattern.FindStringSubmatch(text)
+	if len(match) != 3 {
+		return nil, "", nil, ""
+	}
+	start := parseDate(match[1], loc)
+	if start == nil {
+		// The left-hand side must be an explicit, valid full date.
+		return nil, "", nil, ""
+	}
+	startRaw := strings.TrimSpace(match[1])
+	end := parseDayOnlyEnd(match[2], *start, loc)
+	if end == nil || end.Before(*start) {
+		return nil, "", nil, ""
+	}
+	return start, startRaw, end, strings.TrimSpace(match[2])
 }
 
 // extractDateRange parses a (start, end) date pair from text using a range
@@ -771,6 +818,27 @@ func parseDateInheritYear(raw string, inheritYear int, loc *time.Location) *time
 	}
 	parsed := time.Date(year, time.Month(month), day, hour, minute, 0, 0, loc)
 	if parsed.Year() != year || int(parsed.Month()) != month || parsed.Day() != day {
+		return nil
+	}
+	return &parsed
+}
+
+// parseDayOnlyEnd parses the right-hand side of a competition range when it
+// states only a day ("26" or "26日"), inheriting the year and month from the
+// explicitly-dated start. It validates against the real calendar and refuses
+// the range when the day sorts before the start day, so a cross-month pattern
+// such as "4月30日~2日" is never guessed.
+func parseDayOnlyEnd(raw string, start time.Time, loc *time.Location) *time.Time {
+	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), "日"))
+	var day int
+	if _, err := fmt.Sscanf(trimmed, "%d", &day); err != nil {
+		return nil
+	}
+	if day < 1 || day > 31 || day < start.Day() {
+		return nil
+	}
+	parsed := time.Date(start.Year(), start.Month(), day, start.Hour(), start.Minute(), 0, 0, loc)
+	if parsed.Year() != start.Year() || int(parsed.Month()) != int(start.Month()) || parsed.Day() != day {
 		return nil
 	}
 	return &parsed
