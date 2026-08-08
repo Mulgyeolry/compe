@@ -107,10 +107,22 @@ func yearFromResearchText(text string) int {
 	return 0
 }
 
+// errEvidenceResearchEditionUnknown means the canonical carries no explicit year
+// anywhere, so the edition cannot be determined. This is a normal
+// "not researchable" state, not an invariant failure.
+var errEvidenceResearchEditionUnknown = errors.New("cannot determine canonical research edition")
+
+// errEvidenceResearchEditionConflict means the canonical carries explicit years
+// that disagree. This is a canonical/invariant conflict: the session is not
+// executable and must surface as an executor error, never as an unresolved
+// candidate result.
+var errEvidenceResearchEditionConflict = errors.New("conflicting canonical research edition")
+
 // evidenceResearchEdition derives the research edition deterministically from
 // the canonical competition (Name year, known lifecycle dates, OfficialURL year).
-// It never guesses with FirstSeen.Year() or time.Now().Year(). Conflicting
-// explicit years make the session non-executable.
+// It never guesses with FirstSeen.Year() or time.Now().Year(). No explicit year
+// returns errEvidenceResearchEditionUnknown; conflicting explicit years return
+// errEvidenceResearchEditionConflict.
 func evidenceResearchEdition(competition model.Competition) (string, error) {
 	seen := make(map[int]bool)
 	var years []int
@@ -135,10 +147,10 @@ func evidenceResearchEdition(competition model.Competition) (string, error) {
 	}
 	addYear(yearFromResearchText(competition.OfficialURL))
 	if len(years) == 0 {
-		return "", errors.New("cannot determine canonical research edition")
+		return "", errEvidenceResearchEditionUnknown
 	}
 	if len(years) > 1 {
-		return "", fmt.Errorf("conflicting research edition years: %v", years)
+		return "", fmt.Errorf("%w: %v", errEvidenceResearchEditionConflict, years)
 	}
 	return strconv.Itoa(years[0]), nil
 }
@@ -272,17 +284,22 @@ func executeEvidenceResearchSession(
 	fields := normalizeEvidenceResearchGaps(session.Gaps)
 	edition, err := evidenceResearchEdition(competition)
 	if err != nil {
-		// Cannot research deterministically: no explicit year anywhere. Do not
-		// search; report every requested field as unresolved with a short reason.
-		execution := evidenceResearchExecution{CompetitionID: competition.ID, Edition: ""}
-		for _, field := range fields {
-			execution.Fields = append(execution.Fields, evidenceResearchFieldResult{
-				Field:     field,
-				Outcome:   evidenceResearchUnresolved,
-				LastError: "cannot determine canonical research edition",
-			})
+		if errors.Is(err, errEvidenceResearchEditionUnknown) {
+			// No explicit year anywhere: a normal, not-researchable state. Do not
+			// search; report every requested field as unresolved with a short reason.
+			execution := evidenceResearchExecution{CompetitionID: competition.ID, Edition: ""}
+			for _, field := range fields {
+				execution.Fields = append(execution.Fields, evidenceResearchFieldResult{
+					Field:     field,
+					Outcome:   evidenceResearchUnresolved,
+					LastError: "cannot determine canonical research edition",
+				})
+			}
+			return execution, nil
 		}
-		return execution, nil
+		// A conflicting canonical edition is an invariant failure, not an
+		// unresolved candidate outcome: surface it as an executor error.
+		return evidenceResearchExecution{}, fmt.Errorf("evidence executor: derive edition: %w", err)
 	}
 
 	sessionCtx, cancel := context.WithTimeout(ctx, evidenceResearchSessionTimeout)
@@ -348,10 +365,12 @@ func executeEvidenceResearchSession(
 		if visited[rawURL] {
 			return
 		}
-		visited[rawURL] = true
+		// Budget check BEFORE marking visited: a URL that is never fetched (because
+		// the budget is already exhausted) must not be recorded as visited.
 		if execution.FetchCalls >= maxEvidenceResearchFetches {
 			return
 		}
+		visited[rawURL] = true
 		execution.FetchCalls++
 		doc, fetchErr := tools.Fetch(sessionCtx, rawURL)
 		if fetchErr != nil {
@@ -371,9 +390,14 @@ func executeEvidenceResearchSession(
 		tryFetch(competition.OfficialURL)
 	}
 
-	// Search rounds, while gaps remain.
+	// Search rounds, while gaps remain and there is still Fetch budget left.
+	// Once maxEvidenceResearchFetches is reached, further Search is pointless
+	// (no URL could be fetched), so the loop stops immediately.
 	round := 1
-	for len(remaining) > 0 && round <= maxEvidenceResearchSearchRounds && !stop() {
+	for len(remaining) > 0 &&
+		round <= maxEvidenceResearchSearchRounds &&
+		execution.FetchCalls < maxEvidenceResearchFetches &&
+		!stop() {
 		if execution.SearchCalls >= maxEvidenceResearchSearchRounds {
 			break
 		}
@@ -398,10 +422,9 @@ func executeEvidenceResearchSession(
 			break
 		}
 		for _, result := range resultsPayload {
-			if len(remaining) == 0 {
-				break
-			}
-			if stop() {
+			if len(remaining) == 0 ||
+				execution.FetchCalls >= maxEvidenceResearchFetches ||
+				stop() {
 				break
 			}
 			tryFetch(result.URL)

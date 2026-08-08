@@ -784,3 +784,63 @@ func TestExecutorQueryDeterministic(t *testing.T) {
 		t.Fatalf("query must be deterministic: %q vs %q", q1, q2)
 	}
 }
+
+// TestExecutorStopsSearchingWhenFetchBudgetExhausted verifies that once the
+// Fetch budget (5) is reached, the executor stops issuing further Search calls
+// instead of running pointless round 2/3 searches.
+func TestExecutorStopsSearchingWhenFetchBudgetExhausted(t *testing.T) {
+	competition := executorTestCompetition()
+	session := executorTestSession(model.EvidenceRegistrationEnd, model.EvidenceCompetitionStart, model.EvidenceRegistrationStart, model.EvidenceCompetitionEnd)
+	tools := &researchToolsFake{
+		searchFn: func(_ context.Context, _ fetcher.ResearchSearchRequest) ([]fetcher.ResearchSearchResult, error) {
+			// Return plenty of distinct URLs so the Fetch budget is the limiter.
+			var results []fetcher.ResearchSearchResult
+			for i := 0; i < 12; i++ {
+				results = append(results, fetcher.ResearchSearchResult{URL: "https://example.com/p" + string(rune('a'+i))})
+			}
+			return results, nil
+		},
+		fetchFn: func(_ context.Context, raw string) (model.Document, error) {
+			// No facts ever resolved → remaining stays non-empty.
+			return model.Document{URL: raw, Title: "页", Text: "无日期"}, nil
+		},
+	}
+	extractor := &researchExtractorFake{}
+	execution, err := executeEvidenceResearchSession(context.Background(), tools, extractor, competition, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// OfficialURL (1) + round-1 search (4 more) = exactly 5 fetches.
+	if execution.FetchCalls != maxEvidenceResearchFetches {
+		t.Fatalf("FetchCalls=%d want %d", execution.FetchCalls, maxEvidenceResearchFetches)
+	}
+	// Only round 1 search happens; no pointless round 2/3 once Fetch budget is gone.
+	if execution.SearchCalls != 1 {
+		t.Fatalf("SearchCalls=%d want 1 (no round 2/3 after fetch budget exhausted)", execution.SearchCalls)
+	}
+	if tools.searchCount() != execution.SearchCalls {
+		t.Fatalf("tools.searchCount=%d != execution.SearchCalls=%d", tools.searchCount(), execution.SearchCalls)
+	}
+	if tools.fetchCount() != execution.FetchCalls {
+		t.Fatalf("tools.fetchCount=%d != execution.FetchCalls=%d", tools.fetchCount(), execution.FetchCalls)
+	}
+}
+
+// TestExecutorConflictingEditionIsError verifies that a canonical with explicit
+// but conflicting years surfaces as an executor error (not unresolved), with no
+// Search/Fetch performed.
+func TestExecutorConflictingEditionIsError(t *testing.T) {
+	competition := executorTestCompetition()
+	competition.Name = "2026某某大赛"
+	competition.RegistrationEnd = ptrTime(2025, 4, 9)
+	session := executorTestSession(model.EvidenceRegistrationEnd)
+	tools := &researchToolsFake{}
+	extractor := &researchExtractorFake{}
+	_, err := executeEvidenceResearchSession(context.Background(), tools, extractor, competition, session)
+	if err == nil {
+		t.Fatal("conflicting edition must surface as an executor error")
+	}
+	if tools.searchCount() != 0 || tools.fetchCount() != 0 {
+		t.Fatalf("conflicting edition must not search/fetch, got %d searches %d fetches", tools.searchCount(), tools.fetchCount())
+	}
+}
