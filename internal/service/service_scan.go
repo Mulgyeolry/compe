@@ -98,6 +98,16 @@ func (s *Service) run(ctx context.Context) error {
 		return errors.New("all configured sources failed")
 	}
 
+	// Evidence Research detection is a standalone phase: it runs after source
+	// scanning and before event commit, and is independent of processCandidate
+	// and the observation "changed" decision. A canonical competition whose page
+	// did not change this round can still surface here because it is missing a
+	// date. Phase 1 is read-only: it never searches, fetches, calls the LLM,
+	// mutates canonical facts, produces events or touches notifications.
+	if err := s.runEvidenceResearchDetection(ctx, now); err != nil {
+		s.log.Warn("evidence research detection failed", "error", err)
+	}
+
 	users, err := s.store.ListNotificationUsers(ctx)
 	if err != nil {
 		return err
