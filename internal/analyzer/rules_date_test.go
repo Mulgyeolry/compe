@@ -180,6 +180,24 @@ func TestCompetitionFullYearMonthDayRangeStillParses(t *testing.T) {
 	}
 }
 
+func TestCompetitionDayOnlyRightEndWithExplicitTimeIsRejected(t *testing.T) {
+	// "比赛时间：2026年4月25日8:00~26日18:00" — the right end writes its own
+	// explicit time. The day-only fallback must refuse it rather than capture
+	// "26日" and wrongly inherit the left-hand 08:00 as 26日08:00.
+	start, _, end, _ := extractCompetitionDates("比赛时间：2026年4月25日8:00~26日18:00", shanghai)
+	if start != nil || end != nil {
+		t.Fatalf("day-only end with explicit right time must be rejected, got start=%v end=%v", start, end)
+	}
+}
+
+func TestCompetitionDayOnlyRightEndWithShiTimeIsRejected(t *testing.T) {
+	// Same rejection for the "18时" variant.
+	start, _, end, _ := extractCompetitionDates("比赛时间：2026年4月25日8:00~26日18时", shanghai)
+	if start != nil || end != nil {
+		t.Fatalf("day-only end with explicit 时 time must be rejected, got start=%v end=%v", start, end)
+	}
+}
+
 func TestRegistrationRangeUnaffectedByDayOnlySupport(t *testing.T) {
 	// Registration dates must NOT gain the day-only right-end behaviour: a
 	// "报名时间：2026年4月25~26" must stay unparsed rather than inherit a month.

@@ -52,6 +52,99 @@ func chatCompletionResponse(content string) string {
 	return fmt.Sprintf(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":%s},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, encoded)
 }
 
+// TestAnalyzePreservesNarrowDayOnlyCompetitionRange verifies the full
+// LLM-enabled Analyze path: the model accepts the CCPC announcement but its
+// extraction returns no competition dates, so the narrow deterministic
+// day-only competition range (explicit full start + same-month bare-day end)
+// is the only rule fact that survives the AI merge.
+func TestAnalyzePreservesNarrowDayOnlyCompetitionRange(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v10","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			return
+		}
+		// Extraction accepts the page but provides NO competition dates.
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v10","identity":{"name":{"value":"第11届中国大学生程序设计竞赛（CCPC）总决赛","evidence":"第11届中国大学生程序设计竞赛（CCPC）总决赛将于2026年4月25~26在南阳举行","edition":"2026","confidence":"high"}},"facts":{},"events":[]}`)))
+	}))
+	defer server.Close()
+	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	analysis := New(config.Config{Location: shanghai})
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, shanghai)
+
+	ccpc := model.Document{
+		Title: "第11届中国大学生程序设计竞赛（CCPC）总决赛",
+		URL:   "https://ccpc.io/a/377.html",
+		Text:  "第11届中国大学生程序设计竞赛（CCPC）总决赛将于2026年4月25~26在南阳举行。",
+	}
+	competition, relevant, err := analysis.Analyze(context.Background(), model.Candidate{Title: ccpc.Title}, ccpc, model.TrustHigh, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !relevant {
+		t.Fatal("CCPC official announcement failed the classification gate")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected exactly 2 LLM requests (classification + extraction), got %d", calls.Load())
+	}
+	if competition.CompetitionStart == nil || competition.CompetitionEnd == nil {
+		t.Fatalf("narrow day-only competition range was dropped by mergeAI: start=%v end=%v", competition.CompetitionStart, competition.CompetitionEnd)
+	}
+	wantStart := time.Date(2026, 4, 25, 0, 0, 0, 0, shanghai)
+	wantEnd := time.Date(2026, 4, 26, 0, 0, 0, 0, shanghai)
+	if !competition.CompetitionStart.Equal(wantStart) {
+		t.Errorf("competition_start = %v, want %v", competition.CompetitionStart, wantStart)
+	}
+	if !competition.CompetitionEnd.Equal(wantEnd) {
+		t.Errorf("competition_end = %v, want %v", competition.CompetitionEnd, wantEnd)
+	}
+}
+
+// TestAnalyzeDoesNotLeakOrdinaryRuleDatesThroughMergeAI proves that only the
+// narrow day-only competition range may survive an AI merge: an ordinary
+// page-wide registration range that the model does not confirm must be cleared,
+// not resurrected by ruleAnalysis.
+func TestAnalyzeDoesNotLeakOrdinaryRuleDatesThroughMergeAI(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v10","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			return
+		}
+		// Extraction provides a fee only — no registration or competition dates.
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v10","identity":{"name":{"value":"2026全国大学生程序设计大赛","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"}},"facts":{"fee":{"value":"50元/人","evidence":"报名费为50元/人","edition":"2026","confidence":"high"}},"events":[]}`)))
+	}))
+	defer server.Close()
+	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	analysis := New(config.Config{Location: shanghai})
+	now := time.Date(2026, 5, 1, 0, 0, 0, 0, shanghai)
+
+	announcement := model.Document{
+		Title: "2026全国大学生程序设计大赛报名通知",
+		URL:   "https://example.com/2026",
+		Text:  "2026全国大学生程序设计大赛报名通知。报名时间：2026年6月1日8:00至9月19日17:00。报名费为50元/人。",
+	}
+	competition, relevant, err := analysis.Analyze(context.Background(), model.Candidate{Title: announcement.Title}, announcement, model.TrustHigh, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !relevant {
+		t.Fatal("official announcement failed the classification gate")
+	}
+	if competition.RegistrationStart != nil || competition.RegistrationEnd != nil {
+		t.Errorf("ordinary rule registration range leaked through mergeAI: start=%v end=%v", competition.RegistrationStart, competition.RegistrationEnd)
+	}
+	if competition.CompetitionStart != nil || competition.CompetitionEnd != nil {
+		t.Errorf("unexpected competition dates leaked: start=%v end=%v", competition.CompetitionStart, competition.CompetitionEnd)
+	}
+}
+
 func TestClassifyParsesTinyJudgmentResponse(t *testing.T) {
 	content := `{"schema_version":"competition-audit-v10","document_type":"listing","source_role":"official_primary","computer_related":false,"competition_announcement":false,"rejection_reason":"聚合列表页"}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
