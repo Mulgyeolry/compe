@@ -364,11 +364,13 @@ func applyResearchDate(competition *model.Competition, field model.EvidenceField
 	}
 }
 
-// researchCalendarDay returns the UTC calendar day (00:00 UTC) of a date, used
-// as the canonical stored date so storage/reload and comparison are independent
-// of the source timezone.
+// researchCalendarDay returns the UTC calendar day (00:00 UTC) of a date's
+// absolute instant. Dates are stored as unix instants and reloaded in UTC, so
+// the comparison/storage day is the UTC day of the instant, independent of the
+// timezone a caller constructed the date with.
 func researchCalendarDay(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 // researchSameCalendarDate reports whether two times fall on the same UTC

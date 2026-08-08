@@ -277,11 +277,12 @@ func applyResearchDate(competition *model.Competition, field model.EvidenceField
 	}
 }
 
-// researchDay normalizes a time to its UTC calendar day. Dates are stored as
-// unix instants and reloaded in UTC, so all calendar comparisons must use UTC
-// days to be independent of the timezone a caller constructed the date with.
+// researchDay returns the UTC calendar day of a date's absolute instant. Dates
+// are stored as unix instants and reloaded in UTC, so all calendar comparisons
+// must use the UTC day of the instant.
 func researchDay(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 // researchSupplementConsistency checks the incoming date against the existing
