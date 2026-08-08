@@ -5,10 +5,32 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"competition-assistant/internal/model"
 )
+
+// maxEvidenceResearchErrorRunes caps how much of a research attempt's error
+// diagnostic is persisted. The evidence_research_state table is a scheduling
+// metadata store, so last_error must never hold page bodies or large LLM output
+// that an error chain might accidentally include. The limit is measured in
+// runes so multi-byte UTF-8 (e.g. Chinese) is never split mid-character.
+const maxEvidenceResearchErrorRunes = 500
+
+// truncateEvidenceResearchError normalizes an error diagnostic before it is
+// persisted: surrounding whitespace is trimmed and the value is truncated to
+// maxEvidenceResearchErrorRunes runes. Truncation is rune-aware, never a byte
+// slice cut, so the result is always valid UTF-8.
+func truncateEvidenceResearchError(value string) string {
+	value = strings.TrimSpace(value)
+	if utf8.RuneCountInString(value) <= maxEvidenceResearchErrorRunes {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:maxEvidenceResearchErrorRunes])
+}
 
 // ListEvidenceResearchStates returns every recorded evidence-research scheduling
 // state, ordered by (competition_id, field) for deterministic output. A
@@ -76,6 +98,12 @@ func (s *Store) RecordEvidenceResearchAttempt(
 			return fmt.Errorf("%s must not carry a next_retry_at", status)
 		}
 	}
+
+	// Enforce the scheduling-metadata boundary here, at the Store edge, so every
+	// insert/upsert goes through the same truncation regardless of who the caller
+	// is. The single UPSERT uses the same value for both the insert and the
+	// conflict-update branch, so there is exactly one boundary.
+	lastError = truncateEvidenceResearchError(lastError)
 
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO evidence_research_state

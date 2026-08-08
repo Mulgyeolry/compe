@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"competition-assistant/internal/model"
 )
@@ -278,5 +280,113 @@ func TestListEvidenceResearchStatesEmpty(t *testing.T) {
 	}
 	if len(states) != 0 {
 		t.Fatalf("expected no states, got %d", len(states))
+	}
+}
+
+// persistedLastError reads back the stored last_error for a competition field.
+func persistedLastError(t *testing.T, database *Store, competitionID int64, field model.EvidenceField) string {
+	t.Helper()
+	var value string
+	if err := database.db.QueryRow(`SELECT last_error FROM evidence_research_state WHERE competition_id=? AND field=?`, competitionID, string(field)).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+// TestTruncateEvidenceResearchErrorShortVerbatim verifies short diagnostics are
+// stored unchanged.
+func TestTruncateEvidenceResearchErrorShortVerbatim(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "err-short.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+	attempted := researchTestNow()
+	short := "dial tcp: connection refused"
+	if err := database.RecordEvidenceResearchAttempt(ctx, competitionID, model.EvidenceCompetitionEnd, model.ResearchStateRetryable, attempted, researchRetryAt(attempted, 6), short); err != nil {
+		t.Fatal(err)
+	}
+	if got := persistedLastError(t, database, competitionID, model.EvidenceCompetitionEnd); got != short {
+		t.Fatalf("short last_error = %q, want %q", got, short)
+	}
+}
+
+// TestTruncateEvidenceResearchErrorLongEnglish verifies an overlong ASCII error
+// is truncated to exactly maxEvidenceResearchErrorRunes runes.
+func TestTruncateEvidenceResearchErrorLongEnglish(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "err-long-en.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+	attempted := researchTestNow()
+	long := strings.Repeat("a", maxEvidenceResearchErrorRunes+1000)
+	if err := database.RecordEvidenceResearchAttempt(ctx, competitionID, model.EvidenceCompetitionEnd, model.ResearchStateRetryable, attempted, researchRetryAt(attempted, 6), long); err != nil {
+		t.Fatal(err)
+	}
+	got := persistedLastError(t, database, competitionID, model.EvidenceCompetitionEnd)
+	if len(got) != maxEvidenceResearchErrorRunes {
+		t.Fatalf("english last_error len=%d, want %d", len(got), maxEvidenceResearchErrorRunes)
+	}
+}
+
+// TestTruncateEvidenceResearchErrorLongChineseRuneSafe verifies an overlong
+// multi-byte (Chinese) error is truncated by runes, not bytes, and stays valid
+// UTF-8.
+func TestTruncateEvidenceResearchErrorLongChineseRuneSafe(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "err-long-zh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+	attempted := researchTestNow()
+	// Each Chinese character is 3 bytes in UTF-8, so byte truncation would split
+	// one; the rune-aware helper must keep a whole number of runes.
+	chinese := strings.Repeat("赛", maxEvidenceResearchErrorRunes+200)
+	if err := database.RecordEvidenceResearchAttempt(ctx, competitionID, model.EvidenceCompetitionEnd, model.ResearchStateRetryable, attempted, researchRetryAt(attempted, 6), chinese); err != nil {
+		t.Fatal(err)
+	}
+	got := persistedLastError(t, database, competitionID, model.EvidenceCompetitionEnd)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated last_error is not valid UTF-8: %q", got)
+	}
+	if runeCount := utf8.RuneCountInString(got); runeCount != maxEvidenceResearchErrorRunes {
+		t.Fatalf("chinese last_error rune count=%d, want %d", runeCount, maxEvidenceResearchErrorRunes)
+	}
+}
+
+// TestTruncateEvidenceResearchErrorSecondUpsertNotBypassed verifies that a
+// second UPSERT with an overlong error is also truncated, so a long error cannot
+// bypass the limit by arriving on a later update.
+func TestTruncateEvidenceResearchErrorSecondUpsertNotBypassed(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "err-second.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+	attempted := researchTestNow()
+	// First attempt with a short error, then a second with an overlong one.
+	if err := database.RecordEvidenceResearchAttempt(ctx, competitionID, model.EvidenceCompetitionEnd, model.ResearchStateRetryable, attempted, researchRetryAt(attempted, 6), "first"); err != nil {
+		t.Fatal(err)
+	}
+	long := strings.Repeat("x", maxEvidenceResearchErrorRunes+500)
+	if err := database.RecordEvidenceResearchAttempt(ctx, competitionID, model.EvidenceCompetitionEnd, model.ResearchStateRetryable, attempted, researchRetryAt(attempted, 6), long); err != nil {
+		t.Fatal(err)
+	}
+	got := persistedLastError(t, database, competitionID, model.EvidenceCompetitionEnd)
+	if len(got) != maxEvidenceResearchErrorRunes {
+		t.Fatalf("second-upsert last_error len=%d, want %d", len(got), maxEvidenceResearchErrorRunes)
 	}
 }
