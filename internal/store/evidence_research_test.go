@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -388,5 +389,172 @@ func TestTruncateEvidenceResearchErrorSecondUpsertNotBypassed(t *testing.T) {
 	got := persistedLastError(t, database, competitionID, model.EvidenceCompetitionEnd)
 	if len(got) != maxEvidenceResearchErrorRunes {
 		t.Fatalf("second-upsert last_error len=%d, want %d", len(got), maxEvidenceResearchErrorRunes)
+	}
+}
+
+func supplementFor(field model.EvidenceField, date time.Time) EvidenceResearchSupplement {
+	return EvidenceResearchSupplement{
+		Field: field,
+		Date:  date,
+		Raw:   "2026年4月9日",
+		Fact: model.FactEvidence{
+			Value: "2026年4月9日", Raw: "2026年4月9日", Evidence: "报名截止时间为2026年4月9日",
+			Edition: "2026", SourceURL: "https://example.com/research", Confidence: "high", ObservedAt: researchTestNow(),
+		},
+		RegistrationPhase: model.RegistrationClosed,
+		CompetitionPhase:  model.CompetitionUnknown,
+		StatusEvidence:    "报名截止时间为2026年4月9日",
+	}
+}
+
+func TestApplyEvidenceResearchSupplementApplies(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "supplement-applies.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+
+	supplement := supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC))
+	saved, applied, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, supplement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("expected supplement to apply")
+	}
+	if saved.RegistrationEnd == nil || !saved.RegistrationEnd.Equal(time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("registration_end not persisted: %v", saved.RegistrationEnd)
+	}
+	if saved.RegistrationStartRaw != "" || saved.RegistrationEndRaw != "2026年4月9日" {
+		t.Fatalf("raw not persisted: start=%q end=%q", saved.RegistrationStartRaw, saved.RegistrationEndRaw)
+	}
+	// Facts map must contain the mapped FactEvidence.
+	fact, ok := saved.Facts[model.FactRegistrationEnd]
+	if !ok || fact.SourceURL != "https://example.com/research" {
+		t.Fatalf("fact not inserted: %+v", saved.Facts)
+	}
+}
+
+func TestApplyEvidenceResearchSupplementDoesNotOverwrite(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "supplement-nooverwrite.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+
+	// First fill registration_end.
+	supplement := supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC))
+	if _, applied, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, supplement); err != nil || !applied {
+		t.Fatalf("first apply: applied=%v err=%v", applied, err)
+	}
+	// Second attempt with a different date must NOT overwrite.
+	other := supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC))
+	if _, applied, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, other); err != nil || applied {
+		t.Fatalf("overwrite must be refused: applied=%v err=%v", applied, err)
+	}
+	saved, err := database.GetCompetitionByID(ctx, competitionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.RegistrationEnd == nil || !saved.RegistrationEnd.Equal(time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("canonical must retain the original date, got %v", saved.RegistrationEnd)
+	}
+}
+
+func TestApplyEvidenceResearchSupplementCrossFieldConflict(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "supplement-conflict.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+
+	// Fill registration_start = 2026-04-20.
+	start := supplementFor(model.EvidenceRegistrationStart, time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC))
+	start.RegistrationPhase = model.RegistrationOpen
+	if _, applied, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, start); err != nil || !applied {
+		t.Fatalf("apply start: applied=%v err=%v", applied, err)
+	}
+	afterStart, _ := database.GetCompetitionByID(ctx, competitionID)
+	if afterStart.RegistrationStart == nil || !afterStart.RegistrationStart.Equal(time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("registration_start not persisted before conflict check: %v", afterStart.RegistrationStart)
+	}
+	// registration_end = 2026-04-10 would be before existing start → conflict.
+	end := supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC))
+	_, applied, endErr := database.ApplyEvidenceResearchSupplement(ctx, competitionID, end)
+	if endErr == nil || applied {
+		t.Fatalf("cross-field conflict must error and not apply: applied=%v err=%v", applied, endErr)
+	}
+	if !errors.Is(endErr, ErrEvidenceResearchSupplementConflict) {
+		t.Fatalf("expected ErrEvidenceResearchSupplementConflict, got %v", endErr)
+	}
+}
+
+func TestApplyEvidenceResearchSupplementUnchangedFields(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "supplement-unchanged.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+	before, err := database.GetCompetitionByID(ctx, competitionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	supplement := supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC))
+	if _, applied, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, supplement); err != nil || !applied {
+		t.Fatalf("apply: applied=%v err=%v", applied, err)
+	}
+	after, err := database.GetCompetitionByID(ctx, competitionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.OfficialURL != before.OfficialURL || after.Trust != before.Trust || after.AnalyzerVersion != before.AnalyzerVersion {
+		t.Fatalf("research must not change OfficialURL/Trust/AnalyzerVersion")
+	}
+	if after.Name != before.Name || after.EntityKey != before.EntityKey {
+		t.Fatalf("research must not change identity fields")
+	}
+	if !after.LastSeen.Equal(before.LastSeen) || !after.FirstSeen.Equal(before.FirstSeen) {
+		t.Fatalf("research must not change LastSeen/FirstSeen")
+	}
+}
+
+func TestApplyEvidenceResearchSupplementInvalidInput(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "supplement-invalid.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+
+	if _, _, err := database.ApplyEvidenceResearchSupplement(ctx, 0, supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC))); err == nil {
+		t.Fatal("invalid competition id must error")
+	}
+	badField := supplementFor(model.EvidenceField("fee"), time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC))
+	if _, _, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, badField); err == nil {
+		t.Fatal("invalid field must error")
+	}
+	zero := supplementFor(model.EvidenceRegistrationEnd, time.Time{})
+	if _, _, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, zero); err == nil {
+		t.Fatal("zero date must error")
+	}
+	missing := supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC))
+	missing.Raw = ""
+	if _, _, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, missing); err == nil {
+		t.Fatal("missing raw must error")
 	}
 }

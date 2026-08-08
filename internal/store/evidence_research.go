@@ -133,3 +133,173 @@ func nullTime(value sql.NullInt64) *time.Time {
 	result := time.Unix(value.Int64, 0)
 	return &result
 }
+
+// ErrEvidenceResearchSupplementConflict marks a deterministic contradiction
+// between an incoming research supplement and the canonical lifecycle (e.g.
+// registration_end before the existing registration_start). The reconciler must
+// treat this as a long-cooldown unresolved outcome, not a transient retryable.
+var ErrEvidenceResearchSupplementConflict = errors.New("evidence research supplement conflicts with canonical lifecycle")
+
+// EvidenceResearchSupplement is the narrow, atomic write requested by the
+// reconciler for a single missing lifecycle date field. It deliberately carries
+// only the date + raw + fact evidence and the research-derived lifecycle phases;
+// it can never touch Name/Organizer/OfficialURL/Trust/AnalyzerVersion/ContentHash/
+// EntityKey/FirstSeen/LastSeen/ProblemReleased/etc.
+type EvidenceResearchSupplement struct {
+	Field             model.EvidenceField
+	Date              time.Time
+	Raw               string
+	Fact              model.FactEvidence
+	RegistrationPhase model.RegistrationPhase
+	CompetitionPhase  model.CompetitionPhase
+	StatusEvidence    string
+}
+
+// ApplyEvidenceResearchSupplement atomically supplements one missing lifecycle
+// date field of a canonical competition. It reloads the canonical inside the
+// transaction, refuses to overwrite a non-nil target, enforces cross-field
+// consistency, merges the FactEvidence, and writes the date/raw/facts/lifecycle
+// in one commit (no half-state). LastSeen and every other non-research column
+// are untouched. It returns the saved competition and whether the write applied.
+func (s *Store) ApplyEvidenceResearchSupplement(ctx context.Context, competitionID int64, supplement EvidenceResearchSupplement) (model.Competition, bool, error) {
+	if competitionID < 1 {
+		return model.Competition{}, false, errors.New("invalid competition id")
+	}
+	if !model.ValidEvidenceField(supplement.Field) {
+		return model.Competition{}, false, fmt.Errorf("invalid evidence field %q", supplement.Field)
+	}
+	if supplement.Date.IsZero() {
+		return model.Competition{}, false, errors.New("evidence supplement requires a non-zero date")
+	}
+	if strings.TrimSpace(supplement.Raw) == "" || strings.TrimSpace(supplement.Fact.Evidence) == "" ||
+		strings.TrimSpace(supplement.Fact.SourceURL) == "" || strings.TrimSpace(supplement.Fact.Edition) == "" {
+		return model.Competition{}, false, errors.New("evidence supplement requires raw, evidence, source_url and edition")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Competition{}, false, err
+	}
+	defer tx.Rollback()
+
+	current, err := loadCompetition(tx.QueryRowContext(ctx, competitionSelect+` WHERE id=?`, competitionID))
+	if err != nil {
+		return model.Competition{}, false, err
+	}
+
+	// Target field must still be nil; research supplements missing facts and
+	// must never overwrite an existing value.
+	if !researchFieldNil(current, supplement.Field) {
+		return model.Competition{}, false, nil
+	}
+
+	// Cross-field consistency against the existing canonical lifecycle.
+	if err := researchSupplementConsistency(current, supplement); err != nil {
+		return model.Competition{}, false, fmt.Errorf("%w: %v", ErrEvidenceResearchSupplementConflict, err)
+	}
+
+	// Build the updated in-memory competition and write the narrow columns.
+	next := current
+	applyResearchDate(&next, supplement.Field, supplement.Date, supplement.Raw)
+	next.Facts = cloneFacts(current.Facts)
+	if next.Facts == nil {
+		next.Facts = make(map[string]model.FactEvidence)
+	}
+	next.Facts[string(supplement.Field)] = supplement.Fact
+	next.RegistrationPhase = supplement.RegistrationPhase
+	next.CompetitionPhase = supplement.CompetitionPhase
+	next.StatusEvidence = supplement.StatusEvidence
+	next.Status = model.CompositeStatus(next.RegistrationPhase, next.CompetitionPhase)
+
+	res, err := tx.ExecContext(ctx, `
+UPDATE competitions SET
+    registration_start=?, registration_start_raw=?,
+    registration_end=?, registration_end_raw=?,
+    competition_start=?, competition_start_raw=?,
+    competition_end=?, competition_end_raw=?,
+    facts_json=?, registration_phase=?, competition_phase=?, status=?, status_evidence=?
+WHERE id=?`,
+		nullableTime(next.RegistrationStart), next.RegistrationStartRaw,
+		nullableTime(next.RegistrationEnd), next.RegistrationEndRaw,
+		nullableTime(next.CompetitionStart), next.CompetitionStartRaw,
+		nullableTime(next.CompetitionEnd), next.CompetitionEndRaw,
+		encodeJSON(next.Facts, "{}"), string(next.RegistrationPhase), string(next.CompetitionPhase), string(next.Status), next.StatusEvidence,
+		competitionID)
+	if err != nil {
+		return model.Competition{}, false, err
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return model.Competition{}, false, errors.New("evidence research supplement affected no rows")
+	}
+	if err := tx.Commit(); err != nil {
+		return model.Competition{}, false, err
+	}
+
+	saved, err := s.GetCompetitionByID(ctx, competitionID)
+	if err != nil {
+		return model.Competition{}, false, err
+	}
+	return saved, true, nil
+}
+
+// researchFieldNil reports whether the target field is currently nil on the
+// competition.
+func researchFieldNil(competition model.Competition, field model.EvidenceField) bool {
+	switch field {
+	case model.EvidenceRegistrationStart:
+		return competition.RegistrationStart == nil
+	case model.EvidenceRegistrationEnd:
+		return competition.RegistrationEnd == nil
+	case model.EvidenceCompetitionStart:
+		return competition.CompetitionStart == nil
+	case model.EvidenceCompetitionEnd:
+		return competition.CompetitionEnd == nil
+	default:
+		return true
+	}
+}
+
+// applyResearchDate sets the target date column and raw on a copy.
+func applyResearchDate(competition *model.Competition, field model.EvidenceField, date time.Time, raw string) {
+	switch field {
+	case model.EvidenceRegistrationStart:
+		competition.RegistrationStart = &date
+		competition.RegistrationStartRaw = raw
+	case model.EvidenceRegistrationEnd:
+		competition.RegistrationEnd = &date
+		competition.RegistrationEndRaw = raw
+	case model.EvidenceCompetitionStart:
+		competition.CompetitionStart = &date
+		competition.CompetitionStartRaw = raw
+	case model.EvidenceCompetitionEnd:
+		competition.CompetitionEnd = &date
+		competition.CompetitionEndRaw = raw
+	}
+}
+
+// researchSupplementConsistency checks the incoming date against the existing
+// canonical lifecycle (registration_start <= registration_end and
+// competition_start <= competition_end).
+func researchSupplementConsistency(competition model.Competition, supplement EvidenceResearchSupplement) error {
+	date := model.DayStart(supplement.Date)
+	switch supplement.Field {
+	case model.EvidenceRegistrationStart:
+		if competition.RegistrationEnd != nil && model.DayStart(*competition.RegistrationEnd).Before(date) {
+			return errors.New("registration_start would be after existing registration_end")
+		}
+	case model.EvidenceRegistrationEnd:
+		if competition.RegistrationStart != nil && model.DayStart(*competition.RegistrationStart).After(date) {
+			return errors.New("registration_end would be before existing registration_start")
+		}
+	case model.EvidenceCompetitionStart:
+		if competition.CompetitionEnd != nil && model.DayStart(*competition.CompetitionEnd).Before(date) {
+			return errors.New("competition_start would be after existing competition_end")
+		}
+	case model.EvidenceCompetitionEnd:
+		if competition.CompetitionStart != nil && model.DayStart(*competition.CompetitionStart).After(date) {
+			return errors.New("competition_end would be before existing competition_start")
+		}
+	}
+	return nil
+}
+
