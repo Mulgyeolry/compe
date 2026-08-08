@@ -370,3 +370,80 @@ func TestResearchToolsExposesFetch(t *testing.T) {
 		t.Fatalf("document URL should remain the public target, got %q", doc.URL)
 	}
 }
+
+// TestResearchSearchRejectsCanonicalLoopback verifies that a raw wrapper URL
+// whose canonical target unwraps to a loopback address is rejected.
+func TestResearchSearchRejectsCanonicalLoopback(t *testing.T) {
+	payload := searxResultJSON(
+		[]string{"wrapped", "https://mp.weixin.qq.com/wappoc_appmsgcaptcha?target_url=http%3A%2F%2F127.0.0.1%2Fsecret", "content"},
+	)
+	server, _ := searxTestServer(t, payload, http.StatusOK)
+	collector := researchCollector(t, server)
+	results, err := collector.Search(context.Background(), ResearchSearchRequest{Query: "ccpc", Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("canonical loopback must be rejected, got %+v", results)
+	}
+}
+
+// TestResearchSearchRejectsCanonicalLocalhost verifies a canonical target that
+// unwraps to localhost is rejected.
+func TestResearchSearchRejectsCanonicalLocalhost(t *testing.T) {
+	payload := searxResultJSON(
+		[]string{"wrapped", "https://mp.weixin.qq.com/wappoc_appmsgcaptcha?target_url=http%3A%2F%2Flocalhost%2Fsecret", "content"},
+	)
+	server, _ := searxTestServer(t, payload, http.StatusOK)
+	collector := researchCollector(t, server)
+	results, err := collector.Search(context.Background(), ResearchSearchRequest{Query: "ccpc", Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("canonical localhost must be rejected, got %+v", results)
+	}
+}
+
+// TestResearchSearchRejectsCanonicalOutsideAllowedDomains verifies that a raw
+// wrapper whose canonical destination belongs to a non-allowed domain is
+// rejected even when the raw wrapper itself matches the allow-list.
+func TestResearchSearchRejectsCanonicalOutsideAllowedDomains(t *testing.T) {
+	// canonicalURL unwraps the WeChat captcha wrapper's target_url. The raw URL
+	// is on mp.weixin.qq.com (which the allow-list permits), so the raw check
+	// passes; the canonical destination evil.example.net must then be rejected by
+	// the post-validation because it is not in the allow-list.
+	payload := searxResultJSON(
+		[]string{"wrapped", "https://mp.weixin.qq.com/wappoc_appmsgcaptcha?target_url=https%3A%2F%2Fevil.example.net%2Fpage", "content"},
+	)
+	server, _ := searxTestServer(t, payload, http.StatusOK)
+	collector := researchCollector(t, server)
+	results, err := collector.Search(context.Background(), ResearchSearchRequest{
+		Query:          "ccpc",
+		Limit:          20,
+		AllowedDomains: []string{"mp.weixin.qq.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("canonical destination outside allowed domains must be rejected, got %+v", results)
+	}
+}
+
+// TestResearchSearchCanonicalTrackingURLStillWorks verifies normal tracking URL
+// canonicalization still returns the clean destination.
+func TestResearchSearchCanonicalTrackingURLStillWorks(t *testing.T) {
+	payload := searxResultJSON(
+		[]string{"page", "https://example.com/page?utm_source=x#frag", "content"},
+	)
+	server, _ := searxTestServer(t, payload, http.StatusOK)
+	collector := researchCollector(t, server)
+	results, err := collector.Search(context.Background(), ResearchSearchRequest{Query: "ccpc", Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].URL != "https://example.com/page" {
+		t.Fatalf("canonical tracking URL should normalize, got %+v", results)
+	}
+}

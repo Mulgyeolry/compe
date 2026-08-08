@@ -543,7 +543,16 @@ func (c *HTTPCollector) searchSearx(ctx context.Context, query string, limit int
 			continue
 		}
 		canonical := canonicalURL(result.URL)
-		if canonical == "" || seen[canonical] {
+		// The canonical URL is produced from untrusted input (e.g. a wrapper like
+		// mp.weixin.qq.com whose target_url points somewhere else). Re-validate it
+		// in full: it must still be an allowed, safe public http(s) URL. This
+		// prevents a raw wrapper that passes the first check from unwrapping to a
+		// loopback/localhost/private destination or a non-allowed domain. Dedup
+		// remains keyed on the canonical URL.
+		if canonical == "" ||
+			!allowedURL(canonical, allowedDomains) ||
+			!isSafeCandidateURL(canonical) ||
+			seen[canonical] {
 			continue
 		}
 		seen[canonical] = true
