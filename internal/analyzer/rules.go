@@ -762,34 +762,41 @@ func extractCompetitionDates(text string, loc *time.Location) (*time.Time, strin
 // (报名/注册/缴费/材料提交), so a "报名将于...~...进行" range is never mistaken
 // for competition dates.
 func extractCompetitionDayRange(text string, loc *time.Location) (*time.Time, string, *time.Time, string) {
-	match := competitionDayRangePattern.FindStringSubmatchIndex(text)
-	if len(match) != 8 {
-		return nil, "", nil, ""
+	// Iterate over every candidate match. The first match may be rejected
+	// because it is registration-like, carries an explicit right-side time, or
+	// has an invalid calendar date; a later match may still be a valid
+	// competition range, so we must keep scanning instead of returning nil on
+	// the first rejection.
+	for _, match := range competitionDayRangePattern.FindAllStringSubmatchIndex(text, -1) {
+		if len(match) != 8 {
+			continue
+		}
+		// match indices: [0,1]=full, [2,3]=start, [4,5]=day, [6,7]=right time.
+		// The right-time group is optional and may not participate; its indices
+		// are -1 then, which must be treated as "no explicit time".
+		hasRightTime := match[6] >= 0 && match[7] >= 0 && strings.TrimSpace(text[match[6]:match[7]]) != ""
+		if hasRightTime {
+			// The right end wrote its own explicit time. This fallback does not
+			// support day-only+time, so refuse rather than inherit the left time.
+			continue
+		}
+		// The local clause must be clearly a competition time, not registration.
+		if !competitionDayRangeClauseOK(text, match[0], match[1]) {
+			continue
+		}
+		start := parseDate(text[match[2]:match[3]], loc)
+		if start == nil {
+			// The left-hand side must be an explicit, valid full date.
+			continue
+		}
+		startRaw := strings.TrimSpace(text[match[2]:match[3]])
+		end := parseDayOnlyEnd(text[match[4]:match[5]], *start, loc)
+		if end == nil || end.Before(*start) {
+			continue
+		}
+		return start, startRaw, end, strings.TrimSpace(text[match[4]:match[5]])
 	}
-	// match indices: [0,1]=full, [2,3]=start, [4,5]=day, [6,7]=right time.
-	// The right-time group is optional and may not participate; its indices are
-	// -1 then, which must be treated as "no explicit time".
-	hasRightTime := match[6] >= 0 && match[7] >= 0 && strings.TrimSpace(text[match[6]:match[7]]) != ""
-	if hasRightTime {
-		// The right end wrote its own explicit time. This fallback does not
-		// support day-only+time, so refuse rather than inherit the left time.
-		return nil, "", nil, ""
-	}
-	// The local clause must be clearly a competition time, not registration.
-	if !competitionDayRangeClauseOK(text, match[0], match[1]) {
-		return nil, "", nil, ""
-	}
-	start := parseDate(text[match[2]:match[3]], loc)
-	if start == nil {
-		// The left-hand side must be an explicit, valid full date.
-		return nil, "", nil, ""
-	}
-	startRaw := strings.TrimSpace(text[match[2]:match[3]])
-	end := parseDayOnlyEnd(text[match[4]:match[5]], *start, loc)
-	if end == nil || end.Before(*start) {
-		return nil, "", nil, ""
-	}
-	return start, startRaw, end, strings.TrimSpace(text[match[4]:match[5]])
+	return nil, "", nil, ""
 }
 
 // competitionDayRangeClauseOK guards the day-only competition fallback against
@@ -813,22 +820,34 @@ func competitionDayRangeClauseOK(text string, startIdx, endIdx int) bool {
 	return false
 }
 
+// sentenceDelimiters are the characters that separate one local sentence from
+// the next. They include both full-width (。！？；) and half-width (!?;) marks.
+const sentenceDelimiters = "。！？!?；;\n"
+
 // localClause returns the sentence containing the byte range [startIdx,endIdx),
-// bounded by Chinese/full-width sentence delimiters and line breaks.
+// bounded by Chinese/full-width sentence delimiters and line breaks. Both
+// startIdx/endIdx are byte offsets into text, but the delimiter search is done
+// with the UTF-8-aware strings.LastIndexAny/IndexAny so multi-byte Chinese
+// punctuation (。！？；) is recognized correctly. A sentence from an adjacent
+// clause (e.g. a "报名" line) therefore never bleeds into this one.
 func localClause(text string, startIdx, endIdx int) string {
-	left := startIdx
-	for left > 0 {
-		if strings.ContainsRune("。！？!?；;\n", rune(text[left-1])) {
-			break
-		}
-		left--
+	if startIdx < 0 {
+		startIdx = 0
 	}
-	right := endIdx
-	for right < len(text) {
-		if strings.ContainsRune("。！？!?；;\n", rune(text[right])) {
-			break
-		}
-		right++
+	if endIdx > len(text) {
+		endIdx = len(text)
+	}
+	// Find the last sentence delimiter strictly before startIdx, then the next
+	// sentence delimiter at/after endIdx.
+	left := strings.LastIndexAny(text[:startIdx], sentenceDelimiters) + 1
+	right := strings.IndexAny(text[endIdx:], sentenceDelimiters)
+	if right < 0 {
+		right = len(text)
+	} else {
+		right += endIdx
+	}
+	if left > right {
+		right = left
 	}
 	return text[left:right]
 }

@@ -218,6 +218,68 @@ func TestCompetitionDayOnlyRangeRejectsRegistrationClauseWithCompetitionWord(t *
 	}
 }
 
+func TestCompetitionDayOnlyClauseIsolatedFromPreviousSentence(t *testing.T) {
+	// The "报名" in the previous sentence (after a full-width 。) must not bleed
+	// into the competition clause. This exercises the UTF-8-safe localClause.
+	start, _, end, _ := extractCompetitionDates("报名时间另见通知。总决赛将于2026年4月25~26日举行。", shanghai)
+	if start == nil || end == nil {
+		t.Fatalf("expected competition range after a previous 报名 sentence, got start=%v end=%v", start, end)
+	}
+	if !start.Equal(time.Date(2026, 4, 25, 0, 0, 0, 0, shanghai)) {
+		t.Errorf("start = %v, want 2026-04-25", start)
+	}
+	if !end.Equal(time.Date(2026, 4, 26, 0, 0, 0, 0, shanghai)) {
+		t.Errorf("end = %v, want 2026-04-26", end)
+	}
+}
+
+func TestCompetitionDayOnlyClauseIsolatedFromFollowingSentence(t *testing.T) {
+	// The "报名" in the following sentence must not bleed into the competition
+	// clause either.
+	start, _, end, _ := extractCompetitionDates("总决赛将于2026年4月25~26日举行。报名时间另行通知。", shanghai)
+	if start == nil || end == nil {
+		t.Fatalf("expected competition range before a trailing 报名 sentence, got start=%v end=%v", start, end)
+	}
+	if !start.Equal(time.Date(2026, 4, 25, 0, 0, 0, 0, shanghai)) {
+		t.Errorf("start = %v, want 2026-04-25", start)
+	}
+	if !end.Equal(time.Date(2026, 4, 26, 0, 0, 0, 0, shanghai)) {
+		t.Errorf("end = %v, want 2026-04-26", end)
+	}
+}
+
+func TestCompetitionDayOnlySkipsInvalidCandidateMatches(t *testing.T) {
+	// The first day-only candidate ("报名将于2026年4月20~21日进行") is rejected
+	// as registration-like, but scanning must continue to the valid competition
+	// range in the following sentence.
+	start, _, end, _ := extractCompetitionDates("报名将于2026年4月20~21日进行。总决赛将于2026年4月25~26日举行。", shanghai)
+	if start == nil || end == nil {
+		t.Fatalf("expected later valid competition range, got start=%v end=%v", start, end)
+	}
+	if !start.Equal(time.Date(2026, 4, 25, 0, 0, 0, 0, shanghai)) {
+		t.Errorf("start = %v, want 2026-04-25", start)
+	}
+	if !end.Equal(time.Date(2026, 4, 26, 0, 0, 0, 0, shanghai)) {
+		t.Errorf("end = %v, want 2026-04-26", end)
+	}
+}
+
+func TestCompetitionDayOnlySkipsExplicitRightTimeCandidate(t *testing.T) {
+	// The first candidate carries an explicit right-side time ("21日18:00") and
+	// is rejected, but scanning must continue to the valid range in the next
+	// sentence.
+	start, _, end, _ := extractCompetitionDates("比赛时间：2026年4月20日8:00~21日18:00。总决赛将于2026年4月25~26日举行。", shanghai)
+	if start == nil || end == nil {
+		t.Fatalf("expected later valid competition range, got start=%v end=%v", start, end)
+	}
+	if !start.Equal(time.Date(2026, 4, 25, 0, 0, 0, 0, shanghai)) {
+		t.Errorf("start = %v, want 2026-04-25", start)
+	}
+	if !end.Equal(time.Date(2026, 4, 26, 0, 0, 0, 0, shanghai)) {
+		t.Errorf("end = %v, want 2026-04-26", end)
+	}
+}
+
 func TestRegistrationRangeUnaffectedByDayOnlySupport(t *testing.T) {
 	// Registration dates must NOT gain the day-only right-end behaviour: a
 	// "报名时间：2026年4月25~26" must stay unparsed rather than inherit a month.
