@@ -509,6 +509,11 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	// competition dates entirely. All other rule-extracted dates are cleared.
 	savedCompStart, savedCompStartRaw, savedCompEnd, savedCompEndRaw := base.CompetitionStart, base.CompetitionStartRaw, base.CompetitionEnd, base.CompetitionEndRaw
 	preserveDayOnlyComp := isNarrowDayOnlyCompetitionRange(savedCompStart, savedCompEnd, savedCompStartRaw, savedCompEndRaw)
+	// Preserve the original deterministic FactEvidence for the narrow range so
+	// it can be restored verbatim (including its page-evidence snippet and
+	// SourceURL/trust metadata) rather than rebuilt from a bare-day raw value.
+	savedCompStartFact, savedCompStartFactOK := base.Facts[model.FactCompetitionStart]
+	savedCompEndFact, savedCompEndFactOK := base.Facts[model.FactCompetitionEnd]
 	base.Organizer = ""
 	base.RegistrationStart = nil
 	base.RegistrationStartRaw = ""
@@ -578,9 +583,15 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 		base.CompetitionStartRaw = savedCompStartRaw
 		base.CompetitionEnd = savedCompEnd
 		base.CompetitionEndRaw = savedCompEndRaw
-		edition := result.Identity.Edition.Value
-		putFact(base.Facts, model.FactCompetitionStart, savedCompStartRaw, savedCompStartRaw, savedCompStartRaw, edition, doc.URL, base.Trust, doc.PublishedAtRaw, now)
-		putFact(base.Facts, model.FactCompetitionEnd, savedCompEndRaw, savedCompEndRaw, savedCompEndRaw, edition, doc.URL, base.Trust, doc.PublishedAtRaw, now)
+		// Restore the original deterministic FactEvidence verbatim so the
+		// page-evidence snippet, SourceURL and trust metadata survive the merge.
+		// AI-validated competition dates (handled above) still take precedence.
+		if savedCompStartFactOK {
+			base.Facts[model.FactCompetitionStart] = savedCompStartFact
+		}
+		if savedCompEndFactOK {
+			base.Facts[model.FactCompetitionEnd] = savedCompEndFact
+		}
 	}
 	putAIFact(base.Facts, model.FactTeamRequirement, result.Facts.TeamRequirement, doc.URL, base.Trust, doc.PublishedAtRaw, now)
 	putAIFact(base.Facts, model.FactFee, result.Facts.Fee, doc.URL, base.Trust, doc.PublishedAtRaw, now)
@@ -746,28 +757,80 @@ func extractCompetitionDates(text string, loc *time.Location) (*time.Time, strin
 // "30日~2日" pattern would imply a cross-month range and is rejected rather than
 // guessed. If the right-hand day is followed by an explicit time ("26日18:00" /
 // "26日18时") the whole fallback is rejected: a day-only end must not carry its
-// own time and the left-hand time must never be inherited.
+// own time and the left-hand time must never be inherited. The matched clause
+// must also carry clear competition semantics and must not be registration-like
+// (报名/注册/缴费/材料提交), so a "报名将于...~...进行" range is never mistaken
+// for competition dates.
 func extractCompetitionDayRange(text string, loc *time.Location) (*time.Time, string, *time.Time, string) {
-	match := competitionDayRangePattern.FindStringSubmatch(text)
-	if len(match) != 4 {
+	match := competitionDayRangePattern.FindStringSubmatchIndex(text)
+	if len(match) != 8 {
 		return nil, "", nil, ""
 	}
-	if strings.TrimSpace(match[3]) != "" {
+	// match indices: [0,1]=full, [2,3]=start, [4,5]=day, [6,7]=right time.
+	// The right-time group is optional and may not participate; its indices are
+	// -1 then, which must be treated as "no explicit time".
+	hasRightTime := match[6] >= 0 && match[7] >= 0 && strings.TrimSpace(text[match[6]:match[7]]) != ""
+	if hasRightTime {
 		// The right end wrote its own explicit time. This fallback does not
 		// support day-only+time, so refuse rather than inherit the left time.
 		return nil, "", nil, ""
 	}
-	start := parseDate(match[1], loc)
+	// The local clause must be clearly a competition time, not registration.
+	if !competitionDayRangeClauseOK(text, match[0], match[1]) {
+		return nil, "", nil, ""
+	}
+	start := parseDate(text[match[2]:match[3]], loc)
 	if start == nil {
 		// The left-hand side must be an explicit, valid full date.
 		return nil, "", nil, ""
 	}
-	startRaw := strings.TrimSpace(match[1])
-	end := parseDayOnlyEnd(match[2], *start, loc)
+	startRaw := strings.TrimSpace(text[match[2]:match[3]])
+	end := parseDayOnlyEnd(text[match[4]:match[5]], *start, loc)
 	if end == nil || end.Before(*start) {
 		return nil, "", nil, ""
 	}
-	return start, startRaw, end, strings.TrimSpace(match[2])
+	return start, startRaw, end, strings.TrimSpace(text[match[4]:match[5]])
+}
+
+// competitionDayRangeClauseOK guards the day-only competition fallback against
+// registration-like expressions. It inspects the sentence containing the
+// matched date range: any registration / fee / material-submission marker
+// excludes the clause, and a clear competition-semantic marker must be present.
+// Merely having "比赛/竞赛" earlier in the sentence is not enough, because
+// "比赛报名将于..." is still registration semantics.
+func competitionDayRangeClauseOK(text string, startIdx, endIdx int) bool {
+	clause := localClause(text, startIdx, endIdx)
+	for _, marker := range competitionExclusionMarkers {
+		if strings.Contains(clause, marker) {
+			return false
+		}
+	}
+	for _, marker := range competitionPositiveMarkers {
+		if strings.Contains(clause, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// localClause returns the sentence containing the byte range [startIdx,endIdx),
+// bounded by Chinese/full-width sentence delimiters and line breaks.
+func localClause(text string, startIdx, endIdx int) string {
+	left := startIdx
+	for left > 0 {
+		if strings.ContainsRune("。！？!?；;\n", rune(text[left-1])) {
+			break
+		}
+		left--
+	}
+	right := endIdx
+	for right < len(text) {
+		if strings.ContainsRune("。！？!?；;\n", rune(text[right])) {
+			break
+		}
+		right++
+	}
+	return text[left:right]
 }
 
 // extractDateRange parses a (start, end) date pair from text using a range
@@ -859,6 +922,22 @@ func parseDateInheritYear(raw string, inheritYear int, loc *time.Location) *time
 // range from arbitrary page-wide regex dates (which carry an explicit month
 // and/or year on the end).
 var bareDayPattern = regexp.MustCompile(`^\s*\d{1,2}\s*日?\s*$`)
+
+// competitionExclusionMarkers are the semantics that must never be treated as
+// competition dates. "比赛报名" (competition registration) is still registration,
+// so these markers are checked on the local clause regardless of a surrounding
+// 比赛/竞赛 token.
+var competitionExclusionMarkers = []string{
+	"报名", "注册", "缴费", "交费", "报名费", "参赛缴费", "材料提交", "材料上传", "材料递交",
+}
+
+// competitionPositiveMarkers establish that the local clause describes the
+// competition time itself rather than a registration window. They include the
+// explicit "比赛/竞赛/赛事时间/赛程" prefixes and competition venue/happening
+// verbs such as 举行/举办/开幕/开赛/召开/总决赛.
+var competitionPositiveMarkers = []string{
+	"比赛时间", "竞赛时间", "赛事时间", "赛程", "举行", "举办", "开幕", "开赛", "召开", "总决赛", "决赛",
+}
 
 // isNarrowDayOnlyCompetitionRange reports whether the given competition date
 // pair is exactly the narrow deterministic day-only range: an explicit full

@@ -198,6 +198,26 @@ func TestCompetitionDayOnlyRightEndWithShiTimeIsRejected(t *testing.T) {
 	}
 }
 
+func TestCompetitionDayOnlyRangeRejectsRegistrationClause(t *testing.T) {
+	// "报名将于2026年4月25~26日进行" — 报名 is registration semantics, so the
+	// day-only fallback must not treat it as competition dates even though the
+	// shape matches.
+	start, _, end, _ := extractCompetitionDates("报名将于2026年4月25~26日进行", shanghai)
+	if start != nil || end != nil {
+		t.Fatalf("registration clause must not yield competition dates, got start=%v end=%v", start, end)
+	}
+}
+
+func TestCompetitionDayOnlyRangeRejectsRegistrationClauseWithCompetitionWord(t *testing.T) {
+	// "本次比赛报名将于2026年4月25~26日进行，比赛时间另行通知" — the word 比赛
+	// appears but "比赛报名" is still registration. Competition time is announced
+	// separately. Must NOT be parsed as competition dates.
+	start, _, end, _ := extractCompetitionDates("本次比赛报名将于2026年4月25~26日进行，比赛时间另行通知", shanghai)
+	if start != nil || end != nil {
+		t.Fatalf("registration clause must not yield competition dates, got start=%v end=%v", start, end)
+	}
+}
+
 func TestRegistrationRangeUnaffectedByDayOnlySupport(t *testing.T) {
 	// Registration dates must NOT gain the day-only right-end behaviour: a
 	// "报名时间：2026年4月25~26" must stay unparsed rather than inherit a month.

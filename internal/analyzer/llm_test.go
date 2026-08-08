@@ -101,6 +101,76 @@ func TestAnalyzePreservesNarrowDayOnlyCompetitionRange(t *testing.T) {
 	if !competition.CompetitionEnd.Equal(wantEnd) {
 		t.Errorf("competition_end = %v, want %v", competition.CompetitionEnd, wantEnd)
 	}
+	// The deterministic FactEvidence (including its page-evidence snippet and
+	// SourceURL/trust metadata) must survive the AI merge intact.
+	startFact, ok := competition.Facts[model.FactCompetitionStart]
+	if !ok {
+		t.Fatal("competition_start fact was not restored")
+	}
+	endFact, ok := competition.Facts[model.FactCompetitionEnd]
+	if !ok {
+		t.Fatal("competition_end fact was not restored")
+	}
+	if startFact.SourceURL != ccpc.URL || endFact.SourceURL != ccpc.URL {
+		t.Errorf("fact SourceURL lost: start=%q end=%q, want %q", startFact.SourceURL, endFact.SourceURL, ccpc.URL)
+	}
+	if startFact.Value == "" || endFact.Value == "" {
+		t.Errorf("fact values empty: start=%q end=%q", startFact.Value, endFact.Value)
+	}
+	// The end evidence must not degrade to the bare day "26": it should carry a
+	// real page-evidence snippet.
+	if strings.TrimSpace(endFact.Evidence) == "" || strings.TrimSpace(endFact.Evidence) == "26" || strings.TrimSpace(endFact.Evidence) == "26日" {
+		t.Errorf("competition_end evidence degraded to bare day: %q", endFact.Evidence)
+	}
+	if !strings.Contains(endFact.Evidence, "2026年4月25") {
+		t.Errorf("competition_end evidence does not reference the full range: %q", endFact.Evidence)
+	}
+	if competition.Trust != model.TrustHigh {
+		t.Errorf("trust lost in preserved fact, got %v", competition.Trust)
+	}
+}
+
+// TestAnalyzeDoesNotLeakRegistrationLikeRangeThroughMergeAI proves that a
+// registration-like day-only clause ("报名将于...~...进行") is never treated as
+// competition dates, so nothing is preserved across the AI merge either. Even
+// with AI classification accepting the page and extraction returning no
+// competition dates, CompetitionStart/End must remain nil.
+func TestAnalyzeDoesNotLeakRegistrationLikeRangeThroughMergeAI(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v10","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			return
+		}
+		// Extraction accepts the page but provides no competition dates.
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v10","identity":{"name":{"value":"2026全国大学生程序设计大赛","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"}},"facts":{},"events":[]}`)))
+	}))
+	defer server.Close()
+	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	analysis := New(config.Config{Location: shanghai})
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, shanghai)
+
+	page := model.Document{
+		Title: "2026全国大学生程序设计大赛报名通知",
+		URL:   "https://example.com/2026",
+		Text:  "2026全国大学生程序设计大赛报名通知。本次比赛报名将于2026年4月25~26日进行，比赛时间另行通知。",
+	}
+	competition, relevant, err := analysis.Analyze(context.Background(), model.Candidate{Title: page.Title}, page, model.TrustHigh, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !relevant {
+		t.Fatal("official announcement failed the classification gate")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected exactly 2 LLM requests (classification + extraction), got %d", calls.Load())
+	}
+	if competition.CompetitionStart != nil || competition.CompetitionEnd != nil {
+		t.Errorf("registration-like day-only range leaked through mergeAI as competition dates: start=%v end=%v", competition.CompetitionStart, competition.CompetitionEnd)
+	}
 }
 
 // TestAnalyzeDoesNotLeakOrdinaryRuleDatesThroughMergeAI proves that only the
