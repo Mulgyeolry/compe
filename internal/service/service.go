@@ -36,6 +36,18 @@ type Service struct {
 	auth        *authn.Manager
 	publicURL   string
 	operationMu sync.Mutex
+
+	// evidenceResearchPhaseTimeoutOverride allows tests to shrink the whole-phase
+	// research timeout so the started-session persistence semantics can be
+	// exercised without a real 120s wait. When zero it falls back to
+	// evidenceResearchPhaseTimeout.
+	evidenceResearchPhaseTimeoutOverride time.Duration
+}
+
+// SetEvidenceResearchPhaseTimeout overrides the whole-phase research timeout,
+// primarily for tests of started-session persistence under a phase deadline.
+func (s *Service) SetEvidenceResearchPhaseTimeout(d time.Duration) {
+	s.evidenceResearchPhaseTimeoutOverride = d
 }
 
 // ErrCompetitionExpired guards writes that would act on a competition whose

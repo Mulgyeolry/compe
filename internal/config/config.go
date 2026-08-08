@@ -47,6 +47,11 @@ type Discovery struct {
 // again after their cooldown, and a budget bounds how many competitions enter a
 // single run.
 type EvidenceResearch struct {
+	// Enabled gates whether Evidence Research actually runs. It defaults to
+	// false so a configured LLM never silently starts agent research; when
+	// disabled the pipeline performs zero Search/Fetch/Extractor/ResearchState
+	// work and ordinary source scanning is unchanged.
+	Enabled bool `yaml:"enabled"`
 	// MaxCompetitionsPerRun caps how many competition sessions are admitted to
 	// a single planning pass.
 	MaxCompetitionsPerRun int `yaml:"max_competitions_per_run"`
