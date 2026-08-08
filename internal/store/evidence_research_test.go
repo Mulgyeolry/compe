@@ -558,3 +558,68 @@ func TestApplyEvidenceResearchSupplementInvalidInput(t *testing.T) {
 		t.Fatal("missing raw must error")
 	}
 }
+
+// TestApplyEvidenceResearchSupplementReturnsCurrentWhenTargetPopulated verifies
+// that when the target field is already populated, Apply returns the reloaded
+// current competition with applied=false (never an empty zero-value), so the
+// Reconciler can decide same-date vs different-date from the actual canonical.
+func TestApplyEvidenceResearchSupplementReturnsCurrentWhenTargetPopulated(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "supplement-race-return.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+
+	first := supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC))
+	if _, applied, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, first); err != nil || !applied {
+		t.Fatalf("first apply: applied=%v err=%v", applied, err)
+	}
+	// Second apply targets the now-populated field.
+	second := supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC))
+	saved, applied, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("overwrite must be refused (applied=false)")
+	}
+	if saved.RegistrationEnd == nil || !saved.RegistrationEnd.Equal(time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("applied=false must return the reloaded current (original 04-09), got %v", saved.RegistrationEnd)
+	}
+}
+
+// TestApplyEvidenceResearchSupplementPreservesBusinessCalendarDay verifies that a
+// supplement whose date is 2026-04-09 00:00 +08:00 is persisted and reloaded as
+// the SAME business calendar day 04-09, never shifted to 04-08 by a UTC
+// reinterpretation. The store uses the supplement date's own location as the
+// semantic authority for its calendar day.
+func TestApplyEvidenceResearchSupplementPreservesBusinessCalendarDay(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "supplement-biz-day.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	competitionID := insertResearchCompetition(t, database)
+
+	loc := time.FixedZone("CST", 8*3600)
+	supplement := supplementFor(model.EvidenceRegistrationEnd, time.Date(2026, 4, 9, 0, 0, 0, 0, loc))
+	if _, applied, err := database.ApplyEvidenceResearchSupplement(ctx, competitionID, supplement); err != nil || !applied {
+		t.Fatalf("apply: applied=%v err=%v", applied, err)
+	}
+	saved, err := database.GetCompetitionByID(ctx, competitionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.RegistrationEnd == nil {
+		t.Fatal("registration_end not persisted")
+	}
+	local := saved.RegistrationEnd.In(loc)
+	if local.Year() != 2026 || local.Month() != 4 || local.Day() != 9 {
+		t.Fatalf("canonical date in business location = %d-%02d-%02d, want 2026-04-09", local.Year(), local.Month(), local.Day())
+	}
+}

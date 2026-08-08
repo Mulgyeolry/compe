@@ -307,7 +307,16 @@ func (s *Service) runEvidenceResearchWithTools(ctx context.Context, now time.Tim
 		return nil
 	}
 
-	phaseCtx, cancel := context.WithTimeout(ctx, evidenceResearchPhaseTimeout)
+	// Two contexts are deliberately kept:
+	//   - phaseCtx bounds ONLY the Search/Fetch/Extractor research work.
+	//   - ctx (the parent, uncancelled-by-phase) is used for the short DB
+	//     persistence of a session that ALREADY started, so a global phase
+	//     deadline does not make the state write itself fail immediately.
+	phaseTimeout := evidenceResearchPhaseTimeout
+	if s.evidenceResearchPhaseTimeoutOverride > 0 {
+		phaseTimeout = s.evidenceResearchPhaseTimeoutOverride
+	}
+	phaseCtx, cancel := context.WithTimeout(ctx, phaseTimeout)
 	defer cancel()
 
 	for _, session := range dueSessions {
@@ -320,21 +329,41 @@ func (s *Service) runEvidenceResearchWithTools(ctx context.Context, now time.Tim
 			continue
 		}
 		execution, execErr := executeEvidenceResearchSession(phaseCtx, tools, extractor, competition, session)
+		// Whether execution completed normally or the phase deadline cut it off,
+		// the session HAS started: it counts as one execution, and its per-field
+		// outcomes (retryable/unresolved/found) must still be persisted. Persist
+		// using the parent ctx so the write is not rejected by a canceled
+		// phaseCtx.
 		if execErr != nil {
 			// Fatal executor error (e.g. edition conflict). Mark this session's
 			// fields unresolved with a long cooldown and continue.
 			s.log.Warn("evidence research execution failed", "competition_id", competition.ID, "error", execErr)
-			s.recordUnresolvedForSession(phaseCtx, now, session, execErr.Error())
+			s.recordUnresolvedForSession(ctx, now, session, execErr.Error())
 			continue
 		}
-		s.reconcileAndRecordExecution(phaseCtx, competition, execution, now, eventMap)
+		s.reconcileAndRecordExecution(ctx, competition, execution, now, eventMap)
 	}
 	return nil
 }
 
+// recordEvidenceResearchDecision persists one research-state outcome, never
+// swallowing the write error. A canonical write that already succeeded is NOT
+// rolled back when the state write fails; the failure is surfaced as a warning
+// so the operator can observe the inconsistency.
+func (s *Service) recordEvidenceResearchDecision(ctx context.Context, competitionID int64, field model.EvidenceField, status model.ResearchStateStatus, now time.Time, nextRetryAt *time.Time, lastError string) {
+	if err := s.store.RecordEvidenceResearchAttempt(ctx, competitionID, field, status, now, nextRetryAt, lastError); err != nil {
+		s.log.Warn("record evidence research state failed",
+			"competition_id", competitionID,
+			"field", string(field),
+			"status", string(status),
+			"error", err)
+	}
+}
+
 // recordUnresolvedForSession records every gap field of an un-executable session
 // as unresolved (long cooldown) — used for fatal executor errors like edition
-// conflict, which should not hot-loop every 6 hours.
+// conflict, which should not hot-loop every 6 hours. Write errors are logged,
+// never silently dropped.
 func (s *Service) recordUnresolvedForSession(ctx context.Context, now time.Time, session model.ResearchSession, reason string) {
 	cfg := s.cfg.EvidenceResearch
 	retry := researchNextRetryAt(model.ResearchStateUnresolved, now, cfg)
@@ -342,7 +371,7 @@ func (s *Service) recordUnresolvedForSession(ctx context.Context, now time.Time,
 		if !model.ValidEvidenceField(gap.Field) {
 			continue
 		}
-		_ = s.store.RecordEvidenceResearchAttempt(ctx, session.CompetitionID, gap.Field, model.ResearchStateUnresolved, now, retry, firstNonEmpty(reason, "executor fatal error"))
+		s.recordEvidenceResearchDecision(ctx, session.CompetitionID, gap.Field, model.ResearchStateUnresolved, now, retry, firstNonEmpty(reason, "executor fatal error"))
 	}
 }
 
@@ -351,13 +380,8 @@ func (s *Service) recordUnresolvedForSession(ctx context.Context, now time.Time,
 func (s *Service) reconcileAndRecordExecution(ctx context.Context, competition model.Competition, execution evidenceResearchExecution, now time.Time, eventMap map[int64][]model.Event) {
 	cfg := s.cfg.EvidenceResearch
 	for _, fieldResult := range execution.Fields {
-		if phaseCtxErr := ctx.Err(); phaseCtxErr != nil {
-			// Global phase deadline reached: fields not yet reconciled are not
-			// recorded (planning != execution) and stay due next round.
-			break
-		}
 		decision := s.reconcileEvidenceResearchField(ctx, competition, execution, fieldResult, now, cfg)
-		_ = s.store.RecordEvidenceResearchAttempt(ctx, competition.ID, decision.Field, decision.ResearchState, now, decision.NextRetryAt, firstNonEmpty(decision.LastError, ""))
+		s.recordEvidenceResearchDecision(ctx, competition.ID, decision.Field, decision.ResearchState, now, decision.NextRetryAt, firstNonEmpty(decision.LastError, ""))
 		if decision.CanonicalChanged && decision.SavedCompetition != nil {
 			events := changeEvents(competition, *decision.SavedCompetition, false, now, s.freshnessWindow())
 			if len(events) > 0 {

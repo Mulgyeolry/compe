@@ -75,20 +75,26 @@ func researchAuthorityHost(raw string) string {
 // inference to a canonical copy after a research date is added. It only fills
 // Unknown phases and never regresses an existing non-Unknown phase. It mutates
 // the passed copy and returns it (plus the new StatusEvidence if a phase changed).
+//
+// All calendar-day comparisons use the business/config location (the run's
+// `now.Location()`), never the UTC instant day. A competition is only closed /
+// finished when its deadline is strictly before today: on the deadline day
+// itself it is still open / ongoing (start <= today <= end).
 func researchLifecycleAfterSupplement(competition model.Competition, now time.Time) (model.Competition, bool) {
-	today := model.DayStart(now)
+	loc := now.Location()
+	today := calendarDayIn(now, loc)
 	changed := false
 
 	// Registration phase: only when unknown.
 	if competition.RegistrationPhase == model.RegistrationUnknown {
-		if competition.RegistrationEnd != nil && !model.DayStart(*competition.RegistrationEnd).After(today) {
+		if competition.RegistrationEnd != nil && calendarDayIn(*competition.RegistrationEnd, loc).Before(today) {
 			competition.RegistrationPhase = model.RegistrationClosed
 			changed = true
-		} else if competition.RegistrationStart != nil && model.DayStart(*competition.RegistrationStart).After(today) {
+		} else if competition.RegistrationStart != nil && calendarDayIn(*competition.RegistrationStart, loc).After(today) {
 			competition.RegistrationPhase = model.RegistrationPreview
 			changed = true
 		} else if competition.RegistrationStart != nil && competition.RegistrationEnd != nil &&
-			!model.DayStart(*competition.RegistrationStart).After(today) && !model.DayStart(*competition.RegistrationEnd).Before(today) {
+			!calendarDayIn(*competition.RegistrationStart, loc).After(today) && !calendarDayIn(*competition.RegistrationEnd, loc).Before(today) {
 			competition.RegistrationPhase = model.RegistrationOpen
 			changed = true
 		}
@@ -97,14 +103,14 @@ func researchLifecycleAfterSupplement(competition model.Competition, now time.Ti
 
 	// Competition phase: only when unknown.
 	if competition.CompetitionPhase == model.CompetitionUnknown {
-		if competition.CompetitionEnd != nil && !model.DayStart(*competition.CompetitionEnd).After(today) {
+		if competition.CompetitionEnd != nil && calendarDayIn(*competition.CompetitionEnd, loc).Before(today) {
 			competition.CompetitionPhase = model.CompetitionFinished
 			changed = true
-		} else if competition.CompetitionStart != nil && model.DayStart(*competition.CompetitionStart).After(today) {
+		} else if competition.CompetitionStart != nil && calendarDayIn(*competition.CompetitionStart, loc).After(today) {
 			competition.CompetitionPhase = model.CompetitionUpcoming
 			changed = true
 		} else if competition.CompetitionStart != nil && competition.CompetitionEnd != nil &&
-			!model.DayStart(*competition.CompetitionStart).After(today) && !model.DayStart(*competition.CompetitionEnd).Before(today) {
+			!calendarDayIn(*competition.CompetitionStart, loc).After(today) && !calendarDayIn(*competition.CompetitionEnd, loc).Before(today) {
 			competition.CompetitionPhase = model.CompetitionOngoing
 			changed = true
 		}
@@ -182,8 +188,11 @@ func (s *Service) reconcileEvidenceResearchField(
 		}
 	}
 	fact := *fieldResult.Fact
+	// Business/config location: research fact dates carry the correct semantic
+	// calendar day in this location; never reinterpret them as a UTC day.
+	loc := now.Location()
 
-	// Field mismatch is an invariant error.
+	// Structural invariant check.
 	if fact.Field != fieldResult.Field || fact.Date.IsZero() || !model.ValidEvidenceField(fact.Field) {
 		return researchReconcileFieldResult{
 			Field:         fieldResult.Field,
@@ -194,9 +203,23 @@ func (s *Service) reconcileEvidenceResearchField(
 		}
 	}
 
-	// Edition re-check: execution.Edition == fact.Edition == fact.Date.Year(),
-	// and matches the current canonical edition.
-	canonicalEdition, edErr := evidenceResearchEdition(competition)
+	// Reload the CURRENT canonical. Final admission decisions (edition, authority,
+	// trust, target population) must be based on the reloaded canonical, not the
+	// planning-time copy that may be stale.
+	current, err := s.store.GetCompetitionByID(ctx, competition.ID)
+	if err != nil {
+		retry := researchNextRetryAt(model.ResearchStateRetryable, now, cfg)
+		return researchReconcileFieldResult{
+			Field:         fieldResult.Field,
+			Outcome:       evidenceResearchRejected,
+			ResearchState: model.ResearchStateRetryable,
+			NextRetryAt:   retry,
+			LastError:     firstNonEmpty(err.Error(), "reload canonical failed"),
+		}
+	}
+
+	// Derive the current canonical edition from the reloaded current.
+	canonicalEdition, edErr := evidenceResearchEdition(current)
 	if edErr != nil || execution.Edition == "" || fact.Edition == "" ||
 		fmt.Sprintf("%d", fact.Date.Year()) != fact.Edition ||
 		execution.Edition != fact.Edition ||
@@ -210,36 +233,32 @@ func (s *Service) reconcileEvidenceResearchField(
 		}
 	}
 
-	// Authority gate: same official authority only. Cross-domain is never written.
-	if !sameResearchAuthority(fact.SourceURL, competition.OfficialURL) {
+	// Authority gate against the reloaded current.OfficialURL: cross-domain is
+	// never written.
+	if !sameResearchAuthority(fact.SourceURL, current.OfficialURL) {
 		return reject("research source is outside canonical official authority")
 	}
 
-	// Reload canonical to avoid TOCTOU and detect whether the target was filled
-	// by another path since planning.
-	current, err := s.store.GetCompetitionByID(ctx, competition.ID)
-	if err != nil {
-		retry := researchNextRetryAt(model.ResearchStateRetryable, now, cfg)
-		return researchReconcileFieldResult{
-			Field:         fieldResult.Field,
-			Outcome:       evidenceResearchRejected,
-			ResearchState: model.ResearchStateRetryable,
-			NextRetryAt:   retry,
-			LastError:     firstNonEmpty(err.Error(), "reload canonical failed"),
-		}
+	// TrustLow hard-reject: the reconciler is the final canonical safety boundary.
+	// Even if the planner filtered low-trust canonicals, we must not write a
+	// canonical for one that became low-trust. This is an unresolved (long
+	// cooldown) outcome, never a retryable.
+	if current.Trust == model.TrustLow {
+		return reject("canonical trust is low")
 	}
+
+	// Target already populated? Same date → already_present/resolved, no write.
+	// Different date → conflict/skipped, never overwrite.
 	if !researchFieldNil(current, fieldResult.Field) {
 		existing := researchFieldDate(current, fieldResult.Field)
-		if existing != nil && researchSameCalendarDate(*existing, fact.Date) {
-			// Canonical already holds the same date → resolved, no write.
+		if existing != nil && researchSameCalendarDate(*existing, fact.Date, loc) {
 			return researchReconcileFieldResult{
-				Field:         fieldResult.Field,
-				Outcome:       evidenceResearchAlreadyPresent,
-				ResearchState: model.ResearchStateResolved,
+				Field:            fieldResult.Field,
+				Outcome:          evidenceResearchAlreadyPresent,
+				ResearchState:    model.ResearchStateResolved,
 				SavedCompetition: &current,
 			}
 		}
-		// Canonical holds a different date → do not overwrite, skip.
 		return researchReconcileFieldResult{
 			Field:         fieldResult.Field,
 			Outcome:       evidenceResearchConflict,
@@ -248,10 +267,9 @@ func (s *Service) reconcileEvidenceResearchField(
 		}
 	}
 
-	// Build the supplement + lifecycle inference. The stored date is the UTC
-	// calendar day of the research fact so that storage/reload and comparison are
-	// independent of the timezone the fact was constructed in.
-	supplementDate := researchCalendarDay(fact.Date)
+	// Build the supplement. The stored date is the calendar day of the research
+	// fact IN THE BUSINESS LOCATION, preserving its original semantic day.
+	supplementDate := researchCalendarDay(fact.Date, loc)
 	supplement := store.EvidenceResearchSupplement{
 		Field: fieldResult.Field,
 		Date:  supplementDate,
@@ -262,7 +280,7 @@ func (s *Service) reconcileEvidenceResearchField(
 			Evidence:   fact.Evidence,
 			Edition:    fact.Edition,
 			SourceURL:  fact.SourceURL,
-			Confidence: researchFactConfidence(competition.Trust),
+			Confidence: researchFactConfidence(current.Trust),
 			ObservedAt: now,
 		},
 	}
@@ -271,6 +289,9 @@ func (s *Service) reconcileEvidenceResearchField(
 	lifecycle, phaseChanged := researchLifecycleAfterSupplement(next, now)
 	supplement.RegistrationPhase = lifecycle.RegistrationPhase
 	supplement.CompetitionPhase = lifecycle.CompetitionPhase
+	// Preserve the existing StatusEvidence when the phase is unchanged; only when
+	// an Unknown phase moves to a concrete one do we set it from the research fact.
+	supplement.StatusEvidence = current.StatusEvidence
 	if phaseChanged {
 		supplement.StatusEvidence = fact.Evidence
 	}
@@ -297,20 +318,31 @@ func (s *Service) reconcileEvidenceResearchField(
 		}
 	}
 	if !applied {
-		// Another path filled the field between reload and write (race); treat as
-		// already present / resolved conservatively.
+		// Race: another path filled the field between reload and write. Decide
+		// based on what the canonical now holds: same date → already_present/
+		// resolved; different date → conflict/skipped. Never unconditionally
+		// resolve on applied=false.
+		raceDate := researchFieldDate(saved, fieldResult.Field)
+		if raceDate != nil && researchSameCalendarDate(*raceDate, fact.Date, loc) {
+			return researchReconcileFieldResult{
+				Field:            fieldResult.Field,
+				Outcome:          evidenceResearchAlreadyPresent,
+				ResearchState:    model.ResearchStateResolved,
+				SavedCompetition: &saved,
+			}
+		}
 		return researchReconcileFieldResult{
 			Field:         fieldResult.Field,
-			Outcome:       evidenceResearchAlreadyPresent,
-			ResearchState: model.ResearchStateResolved,
-			SavedCompetition: &saved,
+			Outcome:       evidenceResearchConflict,
+			ResearchState: model.ResearchStateSkipped,
+			LastError:     "canonical field populated by concurrent path with different value",
 		}
 	}
 
 	// Verify the saved canonical actually holds the research date before
 	// recording resolved.
 	savedDate := researchFieldDate(saved, fieldResult.Field)
-	if savedDate == nil || !researchSameCalendarDate(*savedDate, fact.Date) {
+	if savedDate == nil || !researchSameCalendarDate(*savedDate, fact.Date, loc) {
 		return researchReconcileFieldResult{
 			Field:         fieldResult.Field,
 			Outcome:       evidenceResearchRejected,
@@ -364,20 +396,34 @@ func applyResearchDate(competition *model.Competition, field model.EvidenceField
 	}
 }
 
-// researchCalendarDay returns the UTC calendar day (00:00 UTC) of a date's
-// absolute instant. Dates are stored as unix instants and reloaded in UTC, so
-// the comparison/storage day is the UTC day of the instant, independent of the
-// timezone a caller constructed the date with.
-func researchCalendarDay(t time.Time) time.Time {
-	u := t.UTC()
-	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+// calendarDayIn truncates t to the start of its calendar day in loc. This is the
+// business/config-location calendar day, never the UTC instant day. Persisting a
+// date as a unix instant does NOT mean business calendar dates should be defined
+// by UTC: the ResearchFact.Date already carries the correct semantic calendar
+// day in the config location, and storage/DB-internal UTC must not shift it.
+func calendarDayIn(t time.Time, loc *time.Location) time.Time {
+	local := t.In(loc)
+	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
 }
 
-// researchSameCalendarDate reports whether two times fall on the same UTC
-// calendar date. Canonical dates are stored as unix instants and reloaded in
-// UTC, so comparison must use UTC calendar days.
-func researchSameCalendarDate(a, b time.Time) bool {
-	return researchCalendarDay(a).Equal(researchCalendarDay(b))
+// sameCalendarDateIn reports whether two times fall on the same calendar day in
+// the given location.
+func sameCalendarDateIn(a, b time.Time, loc *time.Location) bool {
+	return calendarDayIn(a, loc).Equal(calendarDayIn(b, loc))
+}
+
+// researchCalendarDay returns the calendar day (start of day) of t in the given
+// business location, preserving the original semantic day. It replaces the old
+// UTC-based helper: the research fact date must keep its original calendar day
+// (e.g. 2026-04-09 stays 04-09), never be shifted back a day by a UTC cut.
+func researchCalendarDay(t time.Time, loc *time.Location) time.Time {
+	return calendarDayIn(t, loc)
+}
+
+// researchSameCalendarDate reports whether two times fall on the same business
+// calendar day in loc.
+func researchSameCalendarDate(a, b time.Time, loc *time.Location) bool {
+	return sameCalendarDateIn(a, b, loc)
 }
 
 // researchFieldDate returns the current date pointer for a field (nil if none).

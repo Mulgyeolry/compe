@@ -188,9 +188,13 @@ func (s *Store) ApplyEvidenceResearchSupplement(ctx context.Context, competition
 	}
 
 	// Target field must still be nil; research supplements missing facts and
-	// must never overwrite an existing value.
+	// must never overwrite an existing value. When it is already populated, the
+	// caller (Reconciler) must decide based on the reloaded `current` — is the
+	// existing date the same calendar day (already_present/resolved) or a
+	// different one (conflict/skipped). Returning the current row here is what
+	// makes that applied=false race decision possible.
 	if !researchFieldNil(current, supplement.Field) {
-		return model.Competition{}, false, nil
+		return current, false, nil
 	}
 
 	// Cross-field consistency against the existing canonical lifecycle.
@@ -277,34 +281,41 @@ func applyResearchDate(competition *model.Competition, field model.EvidenceField
 	}
 }
 
-// researchDay returns the UTC calendar day of a date's absolute instant. Dates
-// are stored as unix instants and reloaded in UTC, so all calendar comparisons
-// must use the UTC day of the instant.
+// researchDay returns the calendar day (start of day) of t in the location that
+// the research supplement date carries. The store has no config Location, so the
+// ResearchFact's own semantic location is used as the authority for its calendar
+// day. This deliberately does NOT reinterpret the date as a UTC day: DB
+// persistence uses unix instants, but that is orthogonal to business calendar
+// dates.
 func researchDay(t time.Time) time.Time {
-	u := t.UTC()
-	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+	loc := t.Location()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
 }
 
 // researchSupplementConsistency checks the incoming date against the existing
 // canonical lifecycle (registration_start <= registration_end and
-// competition_start <= competition_end). Comparison is on UTC calendar days.
+// competition_start <= competition_end). Comparison is on business calendar days
+// in the supplement date's own location, never UTC days.
 func researchSupplementConsistency(competition model.Competition, supplement EvidenceResearchSupplement) error {
 	date := researchDay(supplement.Date)
+	// Interpret existing canonical dates in the supplement's semantic location.
+	loc := supplement.Date.Location()
+	sameDay := func(other time.Time) time.Time { return researchDay(other.In(loc)) }
 	switch supplement.Field {
 	case model.EvidenceRegistrationStart:
-		if competition.RegistrationEnd != nil && researchDay(*competition.RegistrationEnd).Before(date) {
+		if competition.RegistrationEnd != nil && sameDay(*competition.RegistrationEnd).Before(date) {
 			return errors.New("registration_start would be after existing registration_end")
 		}
 	case model.EvidenceRegistrationEnd:
-		if competition.RegistrationStart != nil && researchDay(*competition.RegistrationStart).After(date) {
+		if competition.RegistrationStart != nil && sameDay(*competition.RegistrationStart).After(date) {
 			return errors.New("registration_end would be before existing registration_start")
 		}
 	case model.EvidenceCompetitionStart:
-		if competition.CompetitionEnd != nil && researchDay(*competition.CompetitionEnd).Before(date) {
+		if competition.CompetitionEnd != nil && sameDay(*competition.CompetitionEnd).Before(date) {
 			return errors.New("competition_start would be after existing competition_end")
 		}
 	case model.EvidenceCompetitionEnd:
-		if competition.CompetitionStart != nil && researchDay(*competition.CompetitionStart).After(date) {
+		if competition.CompetitionStart != nil && sameDay(*competition.CompetitionStart).After(date) {
 			return errors.New("competition_end would be before existing competition_start")
 		}
 	}
