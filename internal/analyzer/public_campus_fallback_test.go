@@ -171,10 +171,10 @@ func Test8PublicCampusFallbackDoesNotAlterOfficialPath(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if calls.Add(1) == 1 {
-			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v9","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v10","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
 			return
 		}
-		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v9","identity":{"name":{"value":"2026全国大学生程序设计大赛","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"},"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"fee":{"value":"50元/人","evidence":"报名费为50元/人","edition":"2026","confidence":"high"}},"events":[]}`)))
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v10","identity":{"name":{"value":"2026全国大学生程序设计大赛","evidence":"2026全国大学生程序设计大赛","edition":"2026","confidence":"high"},"organizer":{"value":"中国计算机学会","evidence":"主办方：中国计算机学会","edition":"2026","confidence":"high"}},"facts":{"fee":{"value":"50元/人","evidence":"报名费为50元/人","edition":"2026","confidence":"high"}},"events":[]}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
@@ -213,7 +213,7 @@ func TestHuaweiAnalyzeUsesFallbackWithoutEnrich(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		// computer_related=false: the fallback must not depend on AI's unstable
 		// computer_related output.
-		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v9","document_type":"campus_internal","source_role":"campus_forwarding","computer_related":false,"competition_announcement":false,"rejection_reason":"校内转发通知，非官方主办方发布的有效公告，且数学建模竞赛非计算机领域"}`)))
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v10","document_type":"campus_internal","source_role":"campus_forwarding","computer_related":false,"competition_announcement":false,"rejection_reason":"校内转发通知，非官方主办方发布的有效公告，且数学建模竞赛非计算机领域"}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")

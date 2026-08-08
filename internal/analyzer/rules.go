@@ -42,6 +42,22 @@ var (
 	competitionRangePattern = regexp.MustCompile(`(?:比赛|竞赛|赛事)(?:时间|赛程)\s*[:：]?\s*(` + dateTokenPattern + `)\s*(?:至|到|—|-|~|～)\s*(` + dateTokenLaxPattern + `)`)
 	competitionStartPattern = regexp.MustCompile(`(?:开赛|比赛开始|竞赛开始|赛事开始)(?:时间)?\s*[:：]?\s*(` + dateTokenPattern + `)`)
 	competitionEndPattern   = regexp.MustCompile(`(?:比赛|竞赛|赛事)(?:结束|截止)(?:时间)?\s*[:：]?\s*(` + dateTokenPattern + `)`)
+	// competitionDayRangePattern matches a competition date range whose
+	// right-hand side only states a day (e.g. "26" or "26日"), inheriting the
+	// year and month from the explicitly-dated left-hand side. It supports both
+	// the explicit "比赛/竞赛/赛事时间：" form and a natural-language
+	// "将于...~...举行/举办" expression. Group 3 captures an explicit time
+	// written after the day (e.g. "18:00" / "18时"); when present the whole
+	// fallback is rejected because this adapter does not support a day-only end
+	// with its own time and must never inherit the left-hand time. It is used
+	// ONLY for competition dates; registration ranges keep the stricter
+	// dateTokenLaxPattern and are never broadened to a day-only end.
+	competitionDayRangePattern = regexp.MustCompile(
+		`(?:(?:比赛|竞赛|赛事)(?:时间|赛程)?\s*[:：]?\s*|(?:将于|计划于|定于)[^。！？；;\n]{0,40}?)` +
+			`(` + dateTokenPattern + `)\s*(?:至|到|—|–|-|~|～)\s*(\d{1,2})\s*日?` +
+			`(?:\s*(\d{1,2})\s*[：:时]\s*\d{0,2}\s*分?)?` +
+			`(?:[^。！？；;\n]{0,40}?(?:举行|举办|开幕|开赛|召开|开始|进行))?`,
+	)
 )
 
 var defaultFocus = []string{
@@ -486,7 +502,18 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	}
 	// Page-wide regex extraction is useful as a fallback when no model is
 	// configured, but it is not edition-safe. Once a validated v2 result is
-	// available, only its evidenced facts may populate these fields.
+	// available, only its evidenced facts may populate these fields. The one
+	// deliberate exception is the narrow deterministic competition day-only
+	// range (explicit full start, same-month bare-day end): it is strong,
+	// unambiguous evidence that survives an AI merge only when the model omits
+	// competition dates entirely. All other rule-extracted dates are cleared.
+	savedCompStart, savedCompStartRaw, savedCompEnd, savedCompEndRaw := base.CompetitionStart, base.CompetitionStartRaw, base.CompetitionEnd, base.CompetitionEndRaw
+	preserveDayOnlyComp := isNarrowDayOnlyCompetitionRange(savedCompStart, savedCompEnd, savedCompStartRaw, savedCompEndRaw)
+	// Preserve the original deterministic FactEvidence for the narrow range so
+	// it can be restored verbatim (including its page-evidence snippet and
+	// SourceURL/trust metadata) rather than rebuilt from a bare-day raw value.
+	savedCompStartFact, savedCompStartFactOK := base.Facts[model.FactCompetitionStart]
+	savedCompEndFact, savedCompEndFactOK := base.Facts[model.FactCompetitionEnd]
 	base.Organizer = ""
 	base.RegistrationStart = nil
 	base.RegistrationStartRaw = ""
@@ -546,6 +573,26 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	putAIFact(base.Facts, model.FactRegistrationEnd, result.Facts.RegistrationEnd, doc.URL, base.Trust, doc.PublishedAtRaw, now)
 	putAIFact(base.Facts, model.FactCompetitionStart, result.Facts.CompetitionStart, doc.URL, base.Trust, doc.PublishedAtRaw, now)
 	putAIFact(base.Facts, model.FactCompetitionEnd, result.Facts.CompetitionEnd, doc.URL, base.Trust, doc.PublishedAtRaw, now)
+	// When the model accepted the page but did not provide any competition
+	// dates, the narrow deterministic day-only range (validated in
+	// ruleAnalysis) is safe to keep. AI-validated competition dates always win;
+	// the range is restored only when the model gave none. Registration dates
+	// and every other rule-extracted fact are still cleared above.
+	if preserveDayOnlyComp && base.CompetitionStart == nil && base.CompetitionEnd == nil {
+		base.CompetitionStart = savedCompStart
+		base.CompetitionStartRaw = savedCompStartRaw
+		base.CompetitionEnd = savedCompEnd
+		base.CompetitionEndRaw = savedCompEndRaw
+		// Restore the original deterministic FactEvidence verbatim so the
+		// page-evidence snippet, SourceURL and trust metadata survive the merge.
+		// AI-validated competition dates (handled above) still take precedence.
+		if savedCompStartFactOK {
+			base.Facts[model.FactCompetitionStart] = savedCompStartFact
+		}
+		if savedCompEndFactOK {
+			base.Facts[model.FactCompetitionEnd] = savedCompEndFact
+		}
+	}
 	putAIFact(base.Facts, model.FactTeamRequirement, result.Facts.TeamRequirement, doc.URL, base.Trust, doc.PublishedAtRaw, now)
 	putAIFact(base.Facts, model.FactFee, result.Facts.Fee, doc.URL, base.Trust, doc.PublishedAtRaw, now)
 	putAIFact(base.Facts, model.FactEligibility, result.Facts.Eligibility, doc.URL, base.Trust, doc.PublishedAtRaw, now)
@@ -689,7 +736,120 @@ func extractDates(text string, loc *time.Location) (*time.Time, string, *time.Ti
 }
 
 func extractCompetitionDates(text string, loc *time.Location) (*time.Time, string, *time.Time, string) {
-	return extractDateRange(text, loc, competitionRangePattern, competitionStartPattern, competitionEndPattern)
+	start, startRaw, end, endRaw := extractDateRange(text, loc, competitionRangePattern, competitionStartPattern, competitionEndPattern)
+	if start != nil && end != nil {
+		return start, startRaw, end, endRaw
+	}
+	// A competition range whose right-hand side only states a day ("25~26" /
+	// "25日至26日" / "将于25~26日举行") inherits year and month from the
+	// explicitly-dated left-hand side. This is competition-only: registration
+	// dates are parsed by extractDates and never get this day-only fallback.
+	if dStart, dRaw, dEnd, dEndRaw := extractCompetitionDayRange(text, loc); dStart != nil && dEnd != nil {
+		return dStart, dRaw, dEnd, dEndRaw
+	}
+	return start, startRaw, end, endRaw
+}
+
+// extractCompetitionDayRange parses a competition range whose right-hand side
+// states only a day. The left-hand side must be an explicit full year+month+day
+// date (validated against the real calendar). The right-hand day inherits year
+// and month from it, but only when it does not sort before the start day; a
+// "30日~2日" pattern would imply a cross-month range and is rejected rather than
+// guessed. If the right-hand day is followed by an explicit time ("26日18:00" /
+// "26日18时") the whole fallback is rejected: a day-only end must not carry its
+// own time and the left-hand time must never be inherited. The matched clause
+// must also carry clear competition semantics and must not be registration-like
+// (报名/注册/缴费/材料提交), so a "报名将于...~...进行" range is never mistaken
+// for competition dates.
+func extractCompetitionDayRange(text string, loc *time.Location) (*time.Time, string, *time.Time, string) {
+	// Iterate over every candidate match. The first match may be rejected
+	// because it is registration-like, carries an explicit right-side time, or
+	// has an invalid calendar date; a later match may still be a valid
+	// competition range, so we must keep scanning instead of returning nil on
+	// the first rejection.
+	for _, match := range competitionDayRangePattern.FindAllStringSubmatchIndex(text, -1) {
+		if len(match) != 8 {
+			continue
+		}
+		// match indices: [0,1]=full, [2,3]=start, [4,5]=day, [6,7]=right time.
+		// The right-time group is optional and may not participate; its indices
+		// are -1 then, which must be treated as "no explicit time".
+		hasRightTime := match[6] >= 0 && match[7] >= 0 && strings.TrimSpace(text[match[6]:match[7]]) != ""
+		if hasRightTime {
+			// The right end wrote its own explicit time. This fallback does not
+			// support day-only+time, so refuse rather than inherit the left time.
+			continue
+		}
+		// The local clause must be clearly a competition time, not registration.
+		if !competitionDayRangeClauseOK(text, match[0], match[1]) {
+			continue
+		}
+		start := parseDate(text[match[2]:match[3]], loc)
+		if start == nil {
+			// The left-hand side must be an explicit, valid full date.
+			continue
+		}
+		startRaw := strings.TrimSpace(text[match[2]:match[3]])
+		end := parseDayOnlyEnd(text[match[4]:match[5]], *start, loc)
+		if end == nil || end.Before(*start) {
+			continue
+		}
+		return start, startRaw, end, strings.TrimSpace(text[match[4]:match[5]])
+	}
+	return nil, "", nil, ""
+}
+
+// competitionDayRangeClauseOK guards the day-only competition fallback against
+// registration-like expressions. It inspects the sentence containing the
+// matched date range: any registration / fee / material-submission marker
+// excludes the clause, and a clear competition-semantic marker must be present.
+// Merely having "比赛/竞赛" earlier in the sentence is not enough, because
+// "比赛报名将于..." is still registration semantics.
+func competitionDayRangeClauseOK(text string, startIdx, endIdx int) bool {
+	clause := localClause(text, startIdx, endIdx)
+	for _, marker := range competitionExclusionMarkers {
+		if strings.Contains(clause, marker) {
+			return false
+		}
+	}
+	for _, marker := range competitionPositiveMarkers {
+		if strings.Contains(clause, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// sentenceDelimiters are the characters that separate one local sentence from
+// the next. They include both full-width (。！？；) and half-width (!?;) marks.
+const sentenceDelimiters = "。！？!?；;\n"
+
+// localClause returns the sentence containing the byte range [startIdx,endIdx),
+// bounded by Chinese/full-width sentence delimiters and line breaks. Both
+// startIdx/endIdx are byte offsets into text, but the delimiter search is done
+// with the UTF-8-aware strings.LastIndexAny/IndexAny so multi-byte Chinese
+// punctuation (。！？；) is recognized correctly. A sentence from an adjacent
+// clause (e.g. a "报名" line) therefore never bleeds into this one.
+func localClause(text string, startIdx, endIdx int) string {
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if endIdx > len(text) {
+		endIdx = len(text)
+	}
+	// Find the last sentence delimiter strictly before startIdx, then the next
+	// sentence delimiter at/after endIdx.
+	left := strings.LastIndexAny(text[:startIdx], sentenceDelimiters) + 1
+	right := strings.IndexAny(text[endIdx:], sentenceDelimiters)
+	if right < 0 {
+		right = len(text)
+	} else {
+		right += endIdx
+	}
+	if left > right {
+		right = left
+	}
+	return text[left:right]
 }
 
 // extractDateRange parses a (start, end) date pair from text using a range
@@ -771,6 +931,75 @@ func parseDateInheritYear(raw string, inheritYear int, loc *time.Location) *time
 	}
 	parsed := time.Date(year, time.Month(month), day, hour, minute, 0, 0, loc)
 	if parsed.Year() != year || int(parsed.Month()) != month || parsed.Day() != day {
+		return nil
+	}
+	return &parsed
+}
+
+// bareDayPattern matches a day-only raw value ("26" or "26日") with optional
+// surrounding whitespace. It distinguishes the narrow day-only competition
+// range from arbitrary page-wide regex dates (which carry an explicit month
+// and/or year on the end).
+var bareDayPattern = regexp.MustCompile(`^\s*\d{1,2}\s*日?\s*$`)
+
+// competitionExclusionMarkers are the semantics that must never be treated as
+// competition dates. "比赛报名" (competition registration) is still registration,
+// so these markers are checked on the local clause regardless of a surrounding
+// 比赛/竞赛 token.
+var competitionExclusionMarkers = []string{
+	"报名", "注册", "缴费", "交费", "报名费", "参赛缴费", "材料提交", "材料上传", "材料递交",
+}
+
+// competitionPositiveMarkers establish that the local clause describes the
+// competition time itself rather than a registration window. They include the
+// explicit "比赛/竞赛/赛事时间/赛程" prefixes and competition venue/happening
+// verbs such as 举行/举办/开幕/开赛/召开/总决赛.
+var competitionPositiveMarkers = []string{
+	"比赛时间", "竞赛时间", "赛事时间", "赛程", "举行", "举办", "开幕", "开赛", "召开", "总决赛", "决赛",
+}
+
+// isNarrowDayOnlyCompetitionRange reports whether the given competition date
+// pair is exactly the narrow deterministic day-only range: an explicit full
+// year+month+day start, a bare-day end (same month, valid order), with the end
+// inheriting the start's year and month. Only this strong, unambiguous
+// evidence is safe to preserve across an AI merge when the model omits
+// competition dates; arbitrary page-wide regex dates and month+day ranges are
+// excluded.
+func isNarrowDayOnlyCompetitionRange(start, end *time.Time, startRaw, endRaw string) bool {
+	if start == nil || end == nil {
+		return false
+	}
+	// The end inherits the start's year+month; a different month means this is
+	// not a same-month day-only range.
+	if end.Year() != start.Year() || end.Month() != start.Month() {
+		return false
+	}
+	// The start must carry an explicit full date (parseDate already validated
+	// it), not a bare day. The end must be a bare day with no month.
+	if bareDayPattern.MatchString(startRaw) || !bareDayPattern.MatchString(endRaw) {
+		return false
+	}
+	// A valid, non-cross-month range.
+	return !end.Before(*start)
+}
+
+// parseDayOnlyEnd parses the right-hand side of a competition range when it
+// states only a day ("26" or "26日"), inheriting the year and month from the
+// explicitly-dated start. It validates against the real calendar and refuses
+// the range when the day sorts before the start day, so a cross-month pattern
+// such as "4月30日~2日" is never guessed. The end time is always 00:00: it must
+// never inherit the left-hand time, because the right side did not state one.
+func parseDayOnlyEnd(raw string, start time.Time, loc *time.Location) *time.Time {
+	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), "日"))
+	var day int
+	if _, err := fmt.Sscanf(trimmed, "%d", &day); err != nil {
+		return nil
+	}
+	if day < 1 || day > 31 || day < start.Day() {
+		return nil
+	}
+	parsed := time.Date(start.Year(), start.Month(), day, 0, 0, 0, 0, loc)
+	if parsed.Year() != start.Year() || int(parsed.Month()) != int(start.Month()) || parsed.Day() != day {
 		return nil
 	}
 	return &parsed
