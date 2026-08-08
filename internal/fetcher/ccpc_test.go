@@ -2,11 +2,14 @@ package fetcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"competition-assistant/internal/config"
 )
@@ -131,6 +134,49 @@ func TestCCPCNonOKStatusErrors(t *testing.T) {
 	}
 	if _, err := collector.Fetch(context.Background(), "https://ccpc.io/a/377.html"); err == nil {
 		t.Fatal("Fetch should error on non-1 API status")
+	}
+}
+
+// failingTransport mimics what client.Do returns on a dial/read failure: a
+// *url.Error whose message embeds the full request URL (including the apikey
+// query). This lets us prove the CCPC adapter redacts the key before an error
+// propagates to the caller.
+type failingTransport struct{}
+
+func (f *failingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return nil, &url.Error{
+		Op:  "Get",
+		URL: req.URL.String(),
+		Err: errors.New("connection refused"),
+	}
+}
+
+func TestCCPCNetworkErrorRedactsAPIKey(t *testing.T) {
+	collector := &HTTPCollector{
+		client: &http.Client{
+			Timeout:   20 * time.Second,
+			Transport: &failingTransport{},
+		},
+		maxRetries: 0, // no retries: the network error propagates immediately
+		maxBytes:   5 << 20,
+	}
+	source := config.Source{ID: "ccpc", Name: "CCPC 公告", Kind: "ccpc_api", URL: "https://ccpc.io/", Limit: 5}
+	_, err := collector.Discover(context.Background(), source)
+	if err == nil {
+		t.Fatal("Discover should fail on a network error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "84dfa45fd954ca8421904123b676c5e2") {
+		t.Errorf("network error leaked the full apikey: %q", msg)
+	}
+	if !strings.Contains(msg, "apikey=") {
+		t.Errorf("expected the redacted error to keep the field name: %q", msg)
+	}
+	// The underlying *url.Error chain must survive redaction so errors.As and
+	// errors.Is keep working on the propagated error.
+	var target *url.Error
+	if !errors.As(err, &target) {
+		t.Errorf("redacted error must still unwrap to *url.Error, got %T", err)
 	}
 }
 

@@ -33,6 +33,29 @@ const (
 // ccpcArticlePath matches a CCPC public article URL: /a/{id}.html
 var ccpcArticlePath = regexp.MustCompile(`^/a/(\d+)\.html$`)
 
+// ccpcRedactError returns an error whose message has the public CCPC apikey
+// removed. client.Do (and net/http) surface the full request URL—including its
+// ?apikey=... query—inside network errors, and without redaction that key would
+// leak verbatim into scan/operator logs. Every error escaping the ccpc_api
+// adapter is passed through here before it reaches the caller. The original
+// error is preserved via Unwrap so errors.Is / errors.As still work.
+func ccpcRedactError(err error) error {
+	if err == nil || !strings.Contains(err.Error(), ccpcAPIKey) {
+		return err
+	}
+	return &ccpcRedactedError{err: err}
+}
+
+// ccpcRedactedError wraps an error but replaces the apikey in its rendered
+// message. It is an implementation detail of ccpcRedactError.
+type ccpcRedactedError struct{ err error }
+
+func (e *ccpcRedactedError) Error() string {
+	return strings.ReplaceAll(e.err.Error(), ccpcAPIKey, "REDACTED")
+}
+
+func (e *ccpcRedactedError) Unwrap() error { return e.err }
+
 // discoverCCPC fetches the official archive list API and turns each item into a
 // candidate whose URL is the public article page (never the apikey-bearing API
 // URL), respecting source.Limit.
@@ -40,12 +63,12 @@ func (c *HTTPCollector) discoverCCPC(ctx context.Context, source config.Source) 
 	apiURL := ccpcAPIBase + "/archive?apikey=" + ccpcAPIKey + "&page=1&pageSize=200"
 	resp, err := c.doRequest(ctx, apiURL, botHeaders())
 	if err != nil {
-		return nil, err
+		return nil, ccpcRedactError(err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, ccpcRedactError(err)
 	}
 	if int64(len(body)) > c.maxBytes {
 		return nil, fmt.Errorf("ccpc archive response exceeds %d bytes", c.maxBytes)
@@ -91,7 +114,7 @@ func (c *HTTPCollector) fetchCCPCArticle(ctx context.Context, id int64, publicUR
 	apiURL := fmt.Sprintf("%s/archive/%d?apikey=%s", ccpcAPIBase, id, ccpcAPIKey)
 	resp, err := c.doRequest(ctx, apiURL, botHeaders())
 	if err != nil {
-		return model.Document{}, err
+		return model.Document{}, ccpcRedactError(err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBytes+1))

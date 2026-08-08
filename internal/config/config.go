@@ -292,7 +292,7 @@ func validate(cfg *Config) error {
 		}
 		seen[source.ID] = true
 		switch source.Kind {
-		case "page", "rss":
+		case "page", "rss", "ccpc_api":
 			if source.URL == "" {
 				return fmt.Errorf("source %q needs url", source.ID)
 			}

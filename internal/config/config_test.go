@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -16,6 +17,65 @@ func TestExampleConfigurationLoads(t *testing.T) {
 	}
 	if !cfg.Retention.Enabled || cfg.Retention.ObservationDays != 30 || cfg.Retention.ClosedCompetitionContentDays != 180 {
 		t.Fatalf("example retention policy is incomplete: %#v", cfg.Retention)
+	}
+}
+
+// TestExampleConfigCCPCSourceUsesCCPCAPI guards against the CCPC source being
+// reverted to a plain "page" kind pointing at the SPA shell (/placard), which
+// yields an empty shell and never any real candidates. The example config must
+// declare the ccpc_api adapter with a resolvable base URL.
+func TestExampleConfigCCPCSourceUsesCCPCAPI(t *testing.T) {
+	path := filepath.Join("..", "..", "sources.example.yaml")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range cfg.Sources {
+		if source.ID != "ccpc" {
+			continue
+		}
+		if source.Kind != "ccpc_api" {
+			t.Fatalf("ccpc source kind = %q, want ccpc_api", source.Kind)
+		}
+		if source.URL == "" {
+			t.Fatal("ccpc source must declare a url")
+		}
+		return
+	}
+	t.Fatal("example config is missing the ccpc source")
+}
+
+// TestCCPCAPISourceNeedsURLCovers the validate branch added for the ccpc_api
+// kind: like page/rss, it must declare a url.
+func TestCCPCAPISourceNeedsURL(t *testing.T) {
+	cfg := Config{Sources: []Source{{ID: "ccpc", Name: "CCPC 公告", Kind: "ccpc_api"}}}
+	if err := validate(&cfg); err == nil {
+		t.Fatal("ccpc_api source without url must be rejected")
+	}
+}
+
+// TestCCPCAPISourceValidates loads a real YAML document that uses the ccpc_api
+// kind and asserts it is accepted end-to-end.
+func TestCCPCAPISourceValidates(t *testing.T) {
+	path := t.TempDir() + "/ccpc.yaml"
+	content := `
+schedule: "0 20 * * *"
+sources:
+  - id: ccpc
+    name: CCPC 公告
+    kind: ccpc_api
+    url: https://ccpc.io/
+    trust: high
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("config with ccpc_api source must load: %v", err)
+	}
+	if len(cfg.Sources) != 1 || cfg.Sources[0].Kind != "ccpc_api" {
+		t.Fatalf("ccpc_api source was not loaded: %#v", cfg.Sources)
 	}
 }
 

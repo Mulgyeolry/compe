@@ -158,8 +158,11 @@ sources:
 
   - id: ccpc
     name: CCPC 公告
-    kind: page
-    url: https://ccpc.io/placard
+    # ccpc.io 是 UmiJS SPA，/placard 与 /a/{id}.html 普通 GET 只返回空壳；
+    # 真实数据由官方公开 REST API（/api/archive）提供。ccpc_api 源直接调用
+    # 该 API 获取列表与详情，不再抓取 SPA 空壳页面。url 仅用于归属/信任判定。
+    kind: ccpc_api
+    url: https://ccpc.io/
     trust: high
 
   - id: icpc
