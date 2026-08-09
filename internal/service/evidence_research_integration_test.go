@@ -402,3 +402,92 @@ func TestEvidenceResearchRegistrationOpenedEvent(t *testing.T) {
 		t.Fatalf("research must supplement registration_start and set open, got start=%v phase=%s", after.RegistrationStart, after.RegistrationPhase)
 	}
 }
+
+// TestMixedEvidenceResearchOutcomesPersistAllFieldStates is the Part B regression:
+// it reproduces a session with mixed field outcomes (3 retryable + 1 found that is
+// already present) and asserts that reconcileAndRecordExecution persists a
+// research-state row for EVERY field (4 rows total), with correct status and
+// cooldown semantics. This guards the real-world observation where only one row
+// appeared in the isolated DB.
+func TestMixedEvidenceResearchOutcomesPersistAllFieldStates(t *testing.T) {
+	cfg := researchTestConfig(t)
+	app, database := researchTestService(t, cfg)
+	ctx := context.Background()
+	now := researchNow()
+
+	// Canonical with TrustHigh, FactEdition=2026, same-authority URL, and an
+	// existing CompetitionStart so the found competition_start is already_present.
+	compStart := time.Date(2026, 8, 10, 0, 0, 0, 0, researchLocation())
+	competition := model.Competition{
+		EntityKey:        "mixed-outcome-comp",
+		Name:             "2026某某大赛",
+		OfficialURL:      "https://example.com/2026",
+		Trust:            model.TrustHigh,
+		CompetitionStart: &compStart,
+		Facts: map[string]model.FactEvidence{
+			model.FactEdition: {Value: "2026", Edition: "2026", Evidence: "2026某某大赛", SourceURL: "https://example.com/2026"},
+		},
+	}
+	if _, _, err := database.UpsertCompetition(ctx, competition, "test", now); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := database.GetCompetition(ctx, competition.EntityKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.CompetitionStart == nil {
+		t.Fatal("precondition: competition_start must be set")
+	}
+
+	execution := evidenceResearchExecution{CompetitionID: persisted.ID, Edition: "2026", Fields: []evidenceResearchFieldResult{
+		{Field: model.EvidenceRegistrationStart, Outcome: evidenceResearchRetryable, LastError: "search error"},
+		{Field: model.EvidenceRegistrationEnd, Outcome: evidenceResearchRetryable, LastError: "fetch error"},
+		// found with the same calendar day as the canonical CompetitionStart.
+		{Field: model.EvidenceCompetitionStart, Outcome: evidenceResearchFound, Fact: &analyzer.ResearchEvidenceFact{
+			Field: model.EvidenceCompetitionStart, Date: compStart, Raw: "2026年8月10日",
+			Evidence: "比赛开始于2026年8月10日", Edition: "2026", SourceURL: "https://example.com/2026", Confidence: "high",
+		}},
+		{Field: model.EvidenceCompetitionEnd, Outcome: evidenceResearchRetryable, LastError: "extractor error"},
+	}}
+
+	app.reconcileAndRecordExecution(ctx, persisted, execution, now, map[int64][]model.Event{})
+
+	states, err := database.ListEvidenceResearchStates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Filter to this competition only.
+	byField := map[model.EvidenceField]model.EvidenceResearchState{}
+	for _, s := range states {
+		if s.CompetitionID == persisted.ID {
+			byField[s.Field] = s
+		}
+	}
+	if len(byField) != 4 {
+		t.Fatalf("expected exactly 4 research-state rows for the competition, got %d: %+v", len(byField), states)
+	}
+	wantStatus := map[model.EvidenceField]model.ResearchStateStatus{
+		model.EvidenceRegistrationStart: model.ResearchStateRetryable,
+		model.EvidenceRegistrationEnd:   model.ResearchStateRetryable,
+		model.EvidenceCompetitionStart:  model.ResearchStateResolved,
+		model.EvidenceCompetitionEnd:    model.ResearchStateRetryable,
+	}
+	for field, want := range wantStatus {
+		got, ok := byField[field]
+		if !ok {
+			t.Fatalf("missing research-state row for %s", field)
+		}
+		if got.Status != want {
+			t.Fatalf("field %s status=%s, want %s", field, got.Status, want)
+		}
+		if got.AttemptCount != 1 {
+			t.Fatalf("field %s attempt_count=%d, want 1", field, got.AttemptCount)
+		}
+		if want == model.ResearchStateRetryable && got.NextRetryAt == nil {
+			t.Fatalf("field %s retryable must carry next_retry_at", field)
+		}
+		if want == model.ResearchStateResolved && got.NextRetryAt != nil {
+			t.Fatalf("field %s resolved must not carry next_retry_at", field)
+		}
+	}
+}

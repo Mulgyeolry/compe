@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -75,11 +76,52 @@ type researchEvidenceLLMResult struct {
 }
 
 type researchEvidenceLLMFact struct {
-	Field      model.EvidenceField `json:"field"`
-	Value      string              `json:"value"`
-	Evidence   string              `json:"evidence"`
-	Edition    string              `json:"edition"`
-	Confidence string              `json:"confidence"`
+	Field      model.EvidenceField         `json:"field"`
+	Value      string                      `json:"value"`
+	Evidence   string                      `json:"evidence"`
+	Edition    string                      `json:"edition"`
+	Confidence researchEvidenceLLMConfidence `json:"confidence"`
+}
+
+// researchEvidenceLLMConfidence is the model-reported confidence for one research
+// fact. It is self-reported metadata, never an authority over canonical trust: the
+// Reconciler derives the final FactEvidence.Confidence from canonical.Trust via
+// researchFactConfidence. To tolerate real LLM outputs that emit a number here, a
+// JSON number (or null) is accepted but normalized to "" (unknown/not-authoritative);
+// only a JSON string is kept. Object / array / bool are still rejected so the
+// contract stays mostly strict.
+type researchEvidenceLLMConfidence string
+
+// UnmarshalJSON accepts a JSON string (kept verbatim), a JSON number or null
+// (normalized to ""), and rejects object / array / bool.
+func (c *researchEvidenceLLMConfidence) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		*c = ""
+		return nil
+	}
+	switch trimmed[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return err
+		}
+		*c = researchEvidenceLLMConfidence(s)
+		return nil
+	case 'n': // null
+		*c = ""
+		return nil
+	case 't', 'f', '{', '[': // bool / object / array are rejected
+		return fmt.Errorf("research evidence confidence must be a string or number, got %s", trimmed)
+	default: // any other token, including a bare number
+		var number json.Number
+		if err := json.Unmarshal(trimmed, &number); err != nil {
+			return fmt.Errorf("invalid research evidence confidence: %w", err)
+		}
+		// A numeric confidence is accepted but non-authoritative: normalize to "".
+		*c = ""
+		return nil
+	}
 }
 
 // researchEvidenceFieldsFixedOrder is the deterministic field order used for
@@ -339,8 +381,21 @@ func (a *Analyzer) validateSingleEvidenceFact(req ResearchEvidenceRequest, fullT
 		Evidence:   fact.Evidence,
 		Edition:    strings.TrimSpace(req.Edition),
 		SourceURL:  req.Document.URL,
-		Confidence: normalizeAIConfidence(fact.Confidence),
+		Confidence: researchEvidenceConfidence(string(fact.Confidence)),
 	}, nil
+}
+
+// researchEvidenceConfidence normalizes the model's self-reported confidence. A
+// numeric/null confidence is accepted but is NOT authoritative: it normalizes to
+// "" (unknown) instead of defaulting to "low". A non-empty string goes through the
+// standard high/medium/low normalization. The final canonical FactEvidence
+// confidence is still derived from canonical.Trust by the Reconciler, never from
+// this value.
+func researchEvidenceConfidence(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return normalizeAIConfidence(value)
 }
 
 // datesInEvidenceContain reports whether any deterministic date extracted from
