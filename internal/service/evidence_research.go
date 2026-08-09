@@ -298,11 +298,19 @@ func (s *Service) runEvidenceResearch(ctx context.Context, now time.Time, eventM
 // ResearchState, and feeds accepted lifecycle changes into the eventMap. It is
 // fail-soft: errors are logged and must never break the main source scan.
 func (s *Service) runEvidenceResearchWithTools(ctx context.Context, now time.Time, eventMap map[int64][]model.Event, tools fetcher.ResearchTools, extractor evidenceResearchExtractor) error {
-	dueSessions, byID, _, err := s.prepareEvidenceResearch(ctx, now)
+	dueSessions, byID, stats, err := s.prepareEvidenceResearch(ctx, now)
 	if err != nil {
 		s.log.Warn("evidence research planning failed", "error", err)
 		return nil
 	}
+	// Minimal observability: log the planning decision even when nothing is due.
+	s.log.Info("evidence research planned",
+		"detected_sessions", stats.detectedSessions,
+		"detected_gaps", stats.detectedGaps,
+		"due_sessions", stats.dueSessions,
+		"due_gaps", stats.dueGaps,
+		"deferred_cooldown", stats.deferredCooldown,
+		"deferred_budget", stats.deferredBudget)
 	if len(dueSessions) == 0 {
 		return nil
 	}
@@ -328,6 +336,15 @@ func (s *Service) runEvidenceResearchWithTools(ctx context.Context, now time.Tim
 		if !ok {
 			continue
 		}
+		// Minimal observability: a session has started. Never log page body.
+		gaps := make([]string, 0, len(session.Gaps))
+		for _, gap := range session.Gaps {
+			gaps = append(gaps, string(gap.Field))
+		}
+		s.log.Info("evidence research session started",
+			"competition_id", competition.ID,
+			"competition_name", competition.Name,
+			"gaps", gaps)
 		execution, execErr := executeEvidenceResearchSession(phaseCtx, tools, extractor, competition, session)
 		// Whether execution completed normally or the phase deadline cut it off,
 		// the session HAS started: it counts as one execution, and its per-field
@@ -342,6 +359,14 @@ func (s *Service) runEvidenceResearchWithTools(ctx context.Context, now time.Tim
 			continue
 		}
 		s.reconcileAndRecordExecution(ctx, competition, execution, now, eventMap)
+		s.log.Info("evidence research session completed",
+			"competition_id", competition.ID,
+			"edition", execution.Edition,
+			"search_calls", execution.SearchCalls,
+			"fetch_calls", execution.FetchCalls,
+			"found", countFieldOutcomes(execution.Fields, evidenceResearchFound),
+			"unresolved", countFieldOutcomes(execution.Fields, evidenceResearchUnresolved),
+			"retryable", countFieldOutcomes(execution.Fields, evidenceResearchRetryable))
 	}
 	return nil
 }
@@ -389,4 +414,15 @@ func (s *Service) reconcileAndRecordExecution(ctx context.Context, competition m
 			}
 		}
 	}
+}
+
+// countFieldOutcomes counts how many field results carry a given outcome.
+func countFieldOutcomes(fields []evidenceResearchFieldResult, outcome evidenceResearchFieldOutcome) int {
+	n := 0
+	for _, field := range fields {
+		if field.Outcome == outcome {
+			n++
+		}
+	}
+	return n
 }

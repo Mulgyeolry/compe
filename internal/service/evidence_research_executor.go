@@ -119,14 +119,16 @@ var errEvidenceResearchEditionUnknown = errors.New("cannot determine canonical r
 var errEvidenceResearchEditionConflict = errors.New("conflicting canonical research edition")
 
 // evidenceResearchEdition derives the research edition deterministically from the
-// canonical competition's IDENTITY-level metadata only: the Name year, the
-// lifecycle FactEvidence.Edition values, and the OfficialURL year. It deliberately
-// does NOT read the persisted lifecycle time.Time.Year() (a business date can
-// differ from its UTC instant year, e.g. 2026-01-01 +08 is 2025-12-31 16:00 UTC)
-// and does NOT read the lifecycle Raw date fields, because a competition edition
-// is its own identity while a lifecycle date year is merely the date's own year —
-// a 2026 edition may legitimately have a registration_start on 2025-12-15. Raw
-// dates therefore never contribute to (or conflict with) the edition.
+// canonical competition's IDENTITY-level metadata: the dedicated FactEdition fact
+// (the authoritative identity signal), the Name year, and the OfficialURL year.
+// The lifecycle FactEvidence.Edition values remain as consistency signals only —
+// they describe facts "belonging to an edition", not the edition itself. It
+// deliberately does NOT read the persisted lifecycle time.Time.Year() (a business
+// date can differ from its UTC instant year) nor the lifecycle Raw date fields.
+//
+// FactEdition is written by the primary analyzer from deterministic identity
+// evidence (Document.Title year / validated AI identity.edition), so it survives
+// even when the normalized Name drops the year (e.g. comp=220).
 //
 // It never guesses with FirstSeen.Year() or time.Now().Year(). No explicit
 // identity-level year returns errEvidenceResearchEditionUnknown; conflicting
@@ -140,12 +142,16 @@ func evidenceResearchEdition(competition model.Competition) (string, error) {
 			years = append(years, year)
 		}
 	}
+	// Authoritative identity signal: the dedicated edition fact (Value + Edition).
+	addEditionYear(competition.Facts[model.FactEdition], addYear)
+	addEditionFactValue(competition.Facts[model.FactEdition], addYear)
 	addYear(yearFromResearchText(competition.Name))
+	addYear(yearFromResearchText(competition.OfficialURL))
+	// Consistency signals only: lifecycle facts "belonging to" an edition.
 	addEditionYear(competition.Facts[model.FactRegistrationStart], addYear)
 	addEditionYear(competition.Facts[model.FactRegistrationEnd], addYear)
 	addEditionYear(competition.Facts[model.FactCompetitionStart], addYear)
 	addEditionYear(competition.Facts[model.FactCompetitionEnd], addYear)
-	addYear(yearFromResearchText(competition.OfficialURL))
 	if len(years) == 0 {
 		return "", errEvidenceResearchEditionUnknown
 	}
@@ -162,6 +168,16 @@ func addEditionYear(fact model.FactEvidence, addYear func(int)) {
 		return
 	}
 	addYear(yearFromResearchText(fact.Edition))
+}
+
+// addEditionFactValue feeds the dedicated edition fact's Value year into the
+// collector. The edition fact stores the year in its Value and Edition, so both
+// must agree; a Value year is the strongest identity signal.
+func addEditionFactValue(fact model.FactEvidence, addYear func(int)) {
+	if fact.Value == "" {
+		return
+	}
+	addYear(yearFromResearchText(fact.Value))
 }
 
 // researchOfficialDomain extracts a Search AllowedDomains host from an OfficialURL.

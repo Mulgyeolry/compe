@@ -103,6 +103,7 @@ type FactEvidence struct {
 }
 
 const (
+	FactEdition           = "edition"
 	FactOrganizer         = "organizer"
 	FactRegistrationState = "registration_state"
 	FactCompetitionState  = "competition_state"

@@ -242,7 +242,12 @@ func (a *Analyzer) Analyze(ctx context.Context, candidate model.Candidate, doc m
 		if !aiDocumentCanUpdateCanonical(result) {
 			return competition, false, nil
 		}
-		competition = a.mergeAI(competition, result, doc, now)
+		var editionRejections []model.AnalysisRejection
+		competition, editionRejections = a.mergeAI(competition, result, doc, now)
+		// Merge the edition-related rejections (e.g. title-vs-AI conflict) into
+		// result.Rejections so the final buildAnalysisAudit below persists them.
+		// We only append what mergeAI produced, never re-appending result.Rejections.
+		result.Rejections = append(result.Rejections, editionRejections...)
 		competition.ExtractionAudit = buildAnalysisAudit(result, doc, now, a.llm.ModelName(), competition.Facts)
 		if partialError {
 			// A partially analyzed result retains stable fields but must not be
@@ -459,6 +464,13 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 	if competitionPhase != model.CompetitionUnknown {
 		putFact(facts, model.FactCompetitionState, string(competitionPhase), string(competitionPhase), evidence, edition, doc.URL, trust, doc.PublishedAtRaw, now)
 	}
+	// Persist a dedicated identity-level edition fact from deterministic
+	// identity evidence (Document.Title year), so a later Evidence Research pass
+	// can determine the canonical edition even when the normalized Name drops it.
+	var rejections []model.AnalysisRejection
+	if editionFact, ok := deriveCanonicalEditionFact(doc, AIFact{}, trust, now, &rejections); ok {
+		facts[model.FactEdition] = editionFact
+	}
 	competition := model.Competition{
 		EntityKey:            EntityKey(name, organizer),
 		Name:                 name,
@@ -492,7 +504,11 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 	return competition
 }
 
-func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Document, now time.Time) model.Competition {
+// mergeAI returns the merged competition plus any edition-related rejections
+// produced while re-deriving FactEdition. The rejections are returned separately
+// (rather than appended to base.ExtractionAudit, which Analyze() overwrites with
+// buildAnalysisAudit) so they reach the persisted audit.
+func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Document, now time.Time) (model.Competition, []model.AnalysisRejection) {
 	base.FitScore = min(100, max(base.FitScore, result.FitScore))
 	if result.Recommendation.Value != "" {
 		base.FitReason = result.Recommendation.Value
@@ -601,6 +617,15 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	if _, exists := base.Facts[model.FactPublishedAt]; !exists && doc.PublishedAtRaw != "" {
 		putFact(base.Facts, model.FactPublishedAt, doc.PublishedAtRaw, doc.PublishedAtRaw, doc.PublishedAtRaw, result.Identity.Edition.Value, doc.URL, base.Trust, doc.PublishedAtRaw, now)
 	}
+	// Re-derive the identity-level edition fact from Document + validated AI
+	// identity so the AI merge never drops FactEdition. It is deliberately not a
+	// blind copy of the old map: the edition is re-derived deterministically, and
+	// if it cannot be confirmed it is not saved. Any edition conflict rejections
+	// are returned separately so they survive the later buildAnalysisAudit.
+	var editionRejections []model.AnalysisRejection
+	if editionFact, ok := deriveCanonicalEditionFact(doc, result.Identity.Edition, base.Trust, now, &editionRejections); ok {
+		base.Facts[model.FactEdition] = editionFact
+	}
 	registrationPhase, competitionPhase, evidence := phasesFromAIEvents(model.RegistrationUnknown, model.CompetitionUnknown, result.Events)
 	base.RegistrationPhase = registrationPhase
 	base.CompetitionPhase = competitionPhase
@@ -674,7 +699,7 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	base.Status = model.StatusUnknown
 	model.NormalizeLifecycle(&base)
 	base.EntityKey = EntityKey(base.Name, base.Organizer)
-	return base
+	return base, editionRejections
 }
 
 func TrustForURL(raw string, source config.Source, cfg config.Config) model.Trust {

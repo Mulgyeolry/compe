@@ -11,7 +11,7 @@ import (
 
 func TestPlainStringAIFactIsParsedButRejectedWithoutEvidence(t *testing.T) {
 	var result AIResult
-	raw := `{"schema_version":"competition-audit-v10","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"fit_score":80,"recommendation":"适合开发者","rejection_reason":"","identity":{"name":"2026测试大赛","series":"","edition":"","organizer":"","track":"","group":"","scope":"","region":""},"facts":{"published_at":"","registration_start":"","registration_end":"","competition_start":"","competition_end":"","team_requirement":"","fee":"免费","eligibility":"","competition_contents":""},"events":[]}`
+	raw := `{"schema_version":"competition-audit-v11","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"fit_score":80,"recommendation":"适合开发者","rejection_reason":"","identity":{"name":"2026测试大赛","series":"","edition":"","organizer":"","track":"","group":"","scope":"","region":""},"facts":{"published_at":"","registration_start":"","registration_end":"","competition_start":"","competition_end":"","team_requirement":"","fee":"免费","eligibility":"","competition_contents":""},"events":[]}`
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&result); err != nil {
@@ -134,7 +134,7 @@ func TestMergeAIRejectsOpenStateBeforeRegistrationStart(t *testing.T) {
 	result := validAIResultFixture()
 	result.Facts.RegistrationStart = AIFact{Value: "2026年9月1日", Evidence: "报名开始时间为2026年9月1日", Edition: "2026", Confidence: "high"}
 	result.Events = []AICompetitionEvent{{Type: AIEventRegistrationOpened, Evidence: "2026年赛事报名通道现已开放", Edition: "2026", Confidence: "high"}}
-	competition := analysis.mergeAI(model.Competition{Name: "2026测试赛事"}, result, model.Document{URL: "https://example.org/2026"}, time.Date(2026, 8, 4, 20, 0, 0, 0, location))
+	competition, _ := analysis.mergeAI(model.Competition{Name: "2026测试赛事"}, result, model.Document{URL: "https://example.org/2026"}, time.Date(2026, 8, 4, 20, 0, 0, 0, location))
 	if competition.Status != model.StatusUnknown || competition.StatusEvidence != "" {
 		t.Fatalf("contradictory open state was accepted: %#v", competition)
 	}
