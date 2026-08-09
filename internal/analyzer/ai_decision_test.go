@@ -134,7 +134,7 @@ func TestMergeAIRejectsOpenStateBeforeRegistrationStart(t *testing.T) {
 	result := validAIResultFixture()
 	result.Facts.RegistrationStart = AIFact{Value: "2026年9月1日", Evidence: "报名开始时间为2026年9月1日", Edition: "2026", Confidence: "high"}
 	result.Events = []AICompetitionEvent{{Type: AIEventRegistrationOpened, Evidence: "2026年赛事报名通道现已开放", Edition: "2026", Confidence: "high"}}
-	competition := analysis.mergeAI(model.Competition{Name: "2026测试赛事"}, result, model.Document{URL: "https://example.org/2026"}, time.Date(2026, 8, 4, 20, 0, 0, 0, location))
+	competition, _ := analysis.mergeAI(model.Competition{Name: "2026测试赛事"}, result, model.Document{URL: "https://example.org/2026"}, time.Date(2026, 8, 4, 20, 0, 0, 0, location))
 	if competition.Status != model.StatusUnknown || competition.StatusEvidence != "" {
 		t.Fatalf("contradictory open state was accepted: %#v", competition)
 	}

@@ -163,3 +163,53 @@ func TestRuleAnalysisPersistsEditionFact(t *testing.T) {
 		t.Fatalf("FactEdition value=%q, want 2026", fact.Value)
 	}
 }
+
+// TestCanonicalEditionConflictPersistsAuditRejection is an integration regression
+// through the full Analyze / mergeAI / buildAnalysisAudit chain. The title is
+// explicitly 2026 and the validated AI identity.edition claims 2025 with evidence
+// that genuinely supports 2025 (a true title-vs-AI conflict). The FactEdition must
+// NOT be written, and the edition conflict rejection must survive into the final
+// persisted ExtractionAudit (i.e. it must not be overwritten by buildAnalysisAudit).
+func TestCanonicalEditionConflictPersistsAuditRejection(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v11","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			return
+		}
+		// AI identity.edition = 2025, with evidence that really supports 2025.
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v11","identity":{"edition":{"value":"2025","evidence":"本赛事为2025年举办的一届","edition":"2025","confidence":"high"}},"facts":{},"events":[]}`)))
+	}))
+	defer server.Close()
+	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	analysis := New(config.Config{Location: shanghai})
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, shanghai)
+
+	doc := model.Document{
+		Title: "4C2026通知-关于举办中国大学生计算机设计大赛",
+		URL:   "https://jsjds.blcu.edu.cn/info/1041/2274.htm",
+		Text:  "4C2026通知-关于举办中国大学生计算机设计大赛 本赛事为2025年举办的一届。",
+	}
+	competition, _, err := analysis.Analyze(context.Background(), model.Candidate{Title: doc.Title}, doc, model.TrustHigh, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// FactEdition must NOT be written when title (2026) conflicts with AI (2025).
+	if _, ok := competition.Facts[model.FactEdition]; ok {
+		t.Fatalf("FactEdition must not be saved on a title-vs-AI conflict; facts=%+v", competition.Facts)
+	}
+	// The edition conflict rejection must be present in the final persisted audit.
+	found := false
+	for _, r := range competition.ExtractionAudit.Rejections {
+		if r.Field == string(model.FactEdition) && strings.Contains(r.Reason, "document title edition conflicts with model edition") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("edition conflict rejection missing from persisted audit; rejections=%+v", competition.ExtractionAudit.Rejections)
+	}
+}

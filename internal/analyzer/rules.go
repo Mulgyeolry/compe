@@ -242,7 +242,12 @@ func (a *Analyzer) Analyze(ctx context.Context, candidate model.Candidate, doc m
 		if !aiDocumentCanUpdateCanonical(result) {
 			return competition, false, nil
 		}
-		competition = a.mergeAI(competition, result, doc, now)
+		var editionRejections []model.AnalysisRejection
+		competition, editionRejections = a.mergeAI(competition, result, doc, now)
+		// Merge the edition-related rejections (e.g. title-vs-AI conflict) into
+		// result.Rejections so the final buildAnalysisAudit below persists them.
+		// We only append what mergeAI produced, never re-appending result.Rejections.
+		result.Rejections = append(result.Rejections, editionRejections...)
 		competition.ExtractionAudit = buildAnalysisAudit(result, doc, now, a.llm.ModelName(), competition.Facts)
 		if partialError {
 			// A partially analyzed result retains stable fields but must not be
@@ -499,7 +504,11 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 	return competition
 }
 
-func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Document, now time.Time) model.Competition {
+// mergeAI returns the merged competition plus any edition-related rejections
+// produced while re-deriving FactEdition. The rejections are returned separately
+// (rather than appended to base.ExtractionAudit, which Analyze() overwrites with
+// buildAnalysisAudit) so they reach the persisted audit.
+func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Document, now time.Time) (model.Competition, []model.AnalysisRejection) {
 	base.FitScore = min(100, max(base.FitScore, result.FitScore))
 	if result.Recommendation.Value != "" {
 		base.FitReason = result.Recommendation.Value
@@ -611,9 +620,10 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	// Re-derive the identity-level edition fact from Document + validated AI
 	// identity so the AI merge never drops FactEdition. It is deliberately not a
 	// blind copy of the old map: the edition is re-derived deterministically, and
-	// if it cannot be confirmed it is not saved.
-	base.ExtractionAudit.Rejections = append(base.ExtractionAudit.Rejections, result.Rejections...)
-	if editionFact, ok := deriveCanonicalEditionFact(doc, result.Identity.Edition, base.Trust, now, &base.ExtractionAudit.Rejections); ok {
+	// if it cannot be confirmed it is not saved. Any edition conflict rejections
+	// are returned separately so they survive the later buildAnalysisAudit.
+	var editionRejections []model.AnalysisRejection
+	if editionFact, ok := deriveCanonicalEditionFact(doc, result.Identity.Edition, base.Trust, now, &editionRejections); ok {
 		base.Facts[model.FactEdition] = editionFact
 	}
 	registrationPhase, competitionPhase, evidence := phasesFromAIEvents(model.RegistrationUnknown, model.CompetitionUnknown, result.Events)
@@ -689,7 +699,7 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	base.Status = model.StatusUnknown
 	model.NormalizeLifecycle(&base)
 	base.EntityKey = EntityKey(base.Name, base.Organizer)
-	return base
+	return base, editionRejections
 }
 
 func TrustForURL(raw string, source config.Source, cfg config.Config) model.Trust {
