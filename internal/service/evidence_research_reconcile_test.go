@@ -542,6 +542,53 @@ func TestReconcileAppliedFalseDifferentDateSkipped(t *testing.T) {
 	}
 }
 
+// --- Fix: cross-year lifecycle fact allowed for same edition ---
+
+// TestReconcileAllowsCrossYearLifecycleFact verifies the reconciler accepts a fact
+// whose lifecycle DATE year differs from the competition edition, as long as the
+// fact.Edition equals the canonical edition. A 2026 edition may legitimately have
+// a registration_start on 2025-12-15; fact.Date.Year() must NOT participate in the
+// edition check.
+func TestReconcileAllowsCrossYearLifecycleFact(t *testing.T) {
+	cfg := researchTestConfig(t)
+	app, database := researchTestService(t, cfg)
+	ctx := context.Background()
+
+	competition := reconcileReconcilerCompetition()
+	competition.EntityKey = "reconcile-cross-year"
+	competition.Name = "2026全国大学生程序设计大赛"
+	competition.OfficialURL = "https://example.com/2026"
+	_, _, err := database.UpsertCompetition(ctx, competition, "test", researchNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := database.GetCompetition(ctx, competition.EntityKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := evidenceResearchExecution{CompetitionID: persisted.ID, Edition: "2026"}
+
+	// canonical edition = 2026 (from Name/URL), fact.Edition = 2026, but the date
+	// itself is 2025-12-15 (registration_start in a different year). Must resolve.
+	date := time.Date(2025, 12, 15, 0, 0, 0, 0, researchLocation())
+	fact := analyzer.ResearchEvidenceFact{
+		Field: model.EvidenceRegistrationStart, Date: date, Raw: "2025年12月15日",
+		Evidence: "报名于2025年12月15日开始", Edition: "2026",
+		SourceURL: "https://example.com/2026", Confidence: "high",
+	}
+	decision := app.reconcileEvidenceResearchField(ctx, persisted, execution, evidenceResearchFieldResult{Field: model.EvidenceRegistrationStart, Outcome: evidenceResearchFound, Fact: &fact}, researchNow(), cfg.EvidenceResearch)
+	if decision.ResearchState != model.ResearchStateResolved {
+		t.Fatalf("cross-year lifecycle fact must resolve, got state=%s outcome=%s", decision.ResearchState, decision.Outcome)
+	}
+	after, err := database.GetCompetitionByID(ctx, persisted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.RegistrationStart == nil || after.RegistrationStart.Year() != 2025 {
+		t.Fatalf("registration_start not persisted with 2025 date: %v", after.RegistrationStart)
+	}
+}
+
 // supplementForReconcile builds a minimal valid supplement used to simulate a
 // concurrent canonical write in race tests.
 func supplementForReconcile(field model.EvidenceField, date time.Time) store.EvidenceResearchSupplement {

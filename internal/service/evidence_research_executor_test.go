@@ -157,10 +157,12 @@ func TestEvidenceResearchEdition(t *testing.T) {
 	if edition, err := evidenceResearchEdition(comp); err != nil || edition != "2026" {
 		t.Fatalf("name edition = %q err=%v", edition, err)
 	}
-	// Lifecycle Raw year (no year in name/URL).
+	// A lifecycle Raw date year is NOT an edition source: with no identity-level
+	// year (Name/URL/FactEdition), a Raw date alone yields Unknown, not the Raw
+	// year.
 	dateComp := model.Competition{ID: 1, Name: "某某大赛", RegistrationEnd: ptrTime(2026, 4, 9), RegistrationEndRaw: "2026年4月9日"}
-	if edition, err := evidenceResearchEdition(dateComp); err != nil || edition != "2026" {
-		t.Fatalf("lifecycle Raw edition = %q err=%v", edition, err)
+	if _, err := evidenceResearchEdition(dateComp); !errors.Is(err, errEvidenceResearchEditionUnknown) {
+		t.Fatalf("Raw-only date must not yield an edition, got %v", err)
 	}
 	// Lifecycle FactEvidence.Edition year (no year in name/URL/Raw).
 	factComp := model.Competition{ID: 5, Name: "某某大赛"}
@@ -175,10 +177,13 @@ func TestEvidenceResearchEdition(t *testing.T) {
 	if edition, err := evidenceResearchEdition(urlComp); err != nil || edition != "2026" {
 		t.Fatalf("url edition = %q err=%v", edition, err)
 	}
-	// Conflicting explicit years (from textual metadata: Name vs Raw).
-	conflict := model.Competition{ID: 3, Name: "2026某某大赛", RegistrationEndRaw: "2025年4月9日"}
+	// Conflicting explicit identity-level years (Name vs FactEdition).
+	conflict := model.Competition{ID: 3, Name: "2026某某大赛"}
+	conflict.Facts = map[string]model.FactEvidence{
+		model.FactRegistrationEnd: {Edition: "2025"},
+	}
 	if _, err := evidenceResearchEdition(conflict); err == nil {
-		t.Fatal("conflicting years must error")
+		t.Fatal("conflicting identity-level years must error")
 	}
 	// No explicit year anywhere, even with a non-nil lifecycle time.Time: must be
 	// Unknown, never guessed from the instant year.
@@ -197,7 +202,9 @@ func ptrTime(year int, month int, day int) *time.Time {
 // regression for edition inference. A business 2026-01-01 +08 is the unix instant
 // 2025-12-31 16:00 UTC; after a real Store round-trip the reloaded time.Time may
 // be in UTC/system location whose .Year() is 2025. The edition MUST still be 2026
-// because it is derived from the Raw text / FactEdition, never the instant year.
+// because it is derived from identity-level metadata (Name/FactEdition/URL), never
+// the instant year. The lifecycle Raw date's own year does not contribute to the
+// edition.
 func TestEvidenceResearchEditionPreservesBusinessYearAcrossUTCReload(t *testing.T) {
 	cfg := researchTestConfig(t)
 	_, database := researchTestService(t, cfg)
@@ -205,7 +212,7 @@ func TestEvidenceResearchEditionPreservesBusinessYearAcrossUTCReload(t *testing.
 
 	businessDate := time.Date(2026, 1, 1, 0, 0, 0, 0, researchLocation()) // UTC+8
 	competition := model.Competition{
-		Name:               "某某大赛", // deliberately no year in Name
+		Name:               "2026某某大赛", // identity edition from Name
 		EntityKey:          "edition-cross-year",
 		OfficialURL:        "https://example.com/contest",
 		RegistrationEnd:    &businessDate,
@@ -226,10 +233,44 @@ func TestEvidenceResearchEditionPreservesBusinessYearAcrossUTCReload(t *testing.
 	}
 	edition, err := evidenceResearchEdition(reloaded)
 	if err != nil {
-		t.Fatalf("evidenceResearchEdition(reloaded) error: %v (must derive from Raw, not instant year)", err)
+		t.Fatalf("evidenceResearchEdition(reloaded) error: %v (must derive from identity, not instant year)", err)
 	}
 	if edition != "2026" {
-		t.Fatalf("edition = %q, want 2026 (Raw year), never 2025 (instant year)", edition)
+		t.Fatalf("edition = %q, want 2026 (Name identity year), never 2025 (instant year)", edition)
+	}
+}
+
+// TestEvidenceResearchEditionAllowsCrossYearLifecycleRaw verifies that a Raw
+// lifecycle date in a different year than the edition is NOT an edition conflict:
+// a 2026 edition may legitimately have a registration_start on 2025-12-15. The
+// edition comes from identity-level Name/URL, never from the Raw date year.
+func TestEvidenceResearchEditionAllowsCrossYearLifecycleRaw(t *testing.T) {
+	cfg := researchTestConfig(t)
+	_, database := researchTestService(t, cfg)
+	ctx := context.Background()
+
+	businessDate := time.Date(2025, 12, 15, 0, 0, 0, 0, researchLocation())
+	competition := model.Competition{
+		Name:                  "2026 XXX大赛",
+		EntityKey:             "edition-cross-year-raw",
+		OfficialURL:           "https://example.com/contest",
+		RegistrationStart:     &businessDate,
+		RegistrationStartRaw:  "2025年12月15日",
+		Trust:                 model.TrustHigh,
+	}
+	if _, isNew, err := database.UpsertCompetition(ctx, competition, "test", researchNow()); err != nil || !isNew {
+		t.Fatalf("upsert canonical: isNew=%v err=%v", isNew, err)
+	}
+	reloaded, err := database.GetCompetition(ctx, competition.EntityKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edition, err := evidenceResearchEdition(reloaded)
+	if err != nil {
+		t.Fatalf("evidenceResearchEdition(reloaded) error: %v (Raw date year must NOT conflict with edition)", err)
+	}
+	if edition != "2026" {
+		t.Fatalf("edition = %q, want 2026", edition)
 	}
 }
 
@@ -915,7 +956,9 @@ func TestExecutorStopsSearchingWhenFetchBudgetExhausted(t *testing.T) {
 func TestExecutorConflictingEditionIsError(t *testing.T) {
 	competition := executorTestCompetition()
 	competition.Name = "2026某某大赛"
-	competition.RegistrationEndRaw = "2025年4月9日"
+	competition.Facts = map[string]model.FactEvidence{
+		model.FactRegistrationEnd: {Edition: "2025"},
+	}
 	session := executorTestSession(model.EvidenceRegistrationEnd)
 	tools := &researchToolsFake{}
 	extractor := &researchExtractorFake{}

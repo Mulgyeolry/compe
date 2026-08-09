@@ -119,18 +119,18 @@ var errEvidenceResearchEditionUnknown = errors.New("cannot determine canonical r
 var errEvidenceResearchEditionConflict = errors.New("conflicting canonical research edition")
 
 // evidenceResearchEdition derives the research edition deterministically from the
-// canonical competition's deterministic TEXTUAL metadata only: the Name year, the
-// lifecycle Raw fields, the lifecycle FactEvidence.Edition values, and the
-// OfficialURL year. It deliberately does NOT read the persisted lifecycle
-// time.Time.Year(): those dates are stored as unix instants whose UTC/system-year
-// can differ from the business calendar year (e.g. a business 2026-01-01 +08 is
-// the instant 2025-12-31 16:00 UTC), so a timezone-shifted .Year() would wrongly
-// produce a conflicting edition or an off-by-one. The Raw/Edition text carries
-// the intended semantic year and is timezone-agnostic.
+// canonical competition's IDENTITY-level metadata only: the Name year, the
+// lifecycle FactEvidence.Edition values, and the OfficialURL year. It deliberately
+// does NOT read the persisted lifecycle time.Time.Year() (a business date can
+// differ from its UTC instant year, e.g. 2026-01-01 +08 is 2025-12-31 16:00 UTC)
+// and does NOT read the lifecycle Raw date fields, because a competition edition
+// is its own identity while a lifecycle date year is merely the date's own year —
+// a 2026 edition may legitimately have a registration_start on 2025-12-15. Raw
+// dates therefore never contribute to (or conflict with) the edition.
 //
-// It never guesses with FirstSeen.Year() or time.Now().Year(). No explicit year
-// returns errEvidenceResearchEditionUnknown; conflicting explicit years return
-// errEvidenceResearchEditionConflict.
+// It never guesses with FirstSeen.Year() or time.Now().Year(). No explicit
+// identity-level year returns errEvidenceResearchEditionUnknown; conflicting
+// explicit years return errEvidenceResearchEditionConflict.
 func evidenceResearchEdition(competition model.Competition) (string, error) {
 	seen := make(map[int]bool)
 	var years []int
@@ -141,10 +141,6 @@ func evidenceResearchEdition(competition model.Competition) (string, error) {
 		}
 	}
 	addYear(yearFromResearchText(competition.Name))
-	addYear(yearFromResearchText(competition.RegistrationStartRaw))
-	addYear(yearFromResearchText(competition.RegistrationEndRaw))
-	addYear(yearFromResearchText(competition.CompetitionStartRaw))
-	addYear(yearFromResearchText(competition.CompetitionEndRaw))
 	addEditionYear(competition.Facts[model.FactRegistrationStart], addYear)
 	addEditionYear(competition.Facts[model.FactRegistrationEnd], addYear)
 	addEditionYear(competition.Facts[model.FactCompetitionStart], addYear)

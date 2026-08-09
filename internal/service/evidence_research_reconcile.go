@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -218,10 +217,13 @@ func (s *Service) reconcileEvidenceResearchField(
 		}
 	}
 
-	// Derive the current canonical edition from the reloaded current.
+	// Derive the current canonical edition from the reloaded current. Final
+	// edition check is purely identity-level: execution.Edition == fact.Edition ==
+	// canonical edition. The lifecycle DATE's own year is deliberately NOT part of
+	// the edition — a 2026 edition may legitimately have a 2025-12-15 date, so
+	// fact.Date.Year() never participates.
 	canonicalEdition, edErr := evidenceResearchEdition(current)
 	if edErr != nil || execution.Edition == "" || fact.Edition == "" ||
-		fmt.Sprintf("%d", fact.Date.Year()) != fact.Edition ||
 		execution.Edition != fact.Edition ||
 		canonicalEdition != fact.Edition {
 		return researchReconcileFieldResult{
