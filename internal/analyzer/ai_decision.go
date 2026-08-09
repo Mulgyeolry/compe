@@ -209,6 +209,7 @@ func validateAIResult(result AIResult, doc model.Document, now time.Time, locati
 	result.Facts.Fee = sanitizeAIFact("facts.fee", result.Facts.Fee, text, &result.Rejections)
 	result.Facts.Eligibility = sanitizeAIFact("facts.eligibility", result.Facts.Eligibility, text, &result.Rejections)
 	result.Facts.CompetitionContents = sanitizeAIFact("facts.competition_contents", result.Facts.CompetitionContents, text, &result.Rejections)
+	result.Facts.RegistrationWindowApplicability = sanitizeAIFact("facts.registration_window_applicability", result.Facts.RegistrationWindowApplicability, text, &result.Rejections)
 
 	documentEdition := firstNonEmpty(result.Identity.Edition.Value, result.Identity.Name.Edition, result.Identity.Series.Edition)
 	if documentEdition == "" {
@@ -226,6 +227,7 @@ func validateAIResult(result AIResult, doc model.Document, now time.Time, locati
 	result.Facts.Fee = editionBoundFact("facts.fee", result.Facts.Fee, documentEdition, true, &result.Rejections)
 	result.Facts.Eligibility = editionBoundFact("facts.eligibility", result.Facts.Eligibility, documentEdition, true, &result.Rejections)
 	result.Facts.CompetitionContents = editionBoundFact("facts.competition_contents", result.Facts.CompetitionContents, documentEdition, true, &result.Rejections)
+	result.Facts.RegistrationWindowApplicability = editionBoundFact("facts.registration_window_applicability", result.Facts.RegistrationWindowApplicability, documentEdition, true, &result.Rejections)
 	seen := make(map[AIEventType]bool)
 	validatedEvents := make([]AICompetitionEvent, 0, len(result.Events))
 	for _, event := range result.Events {
@@ -409,12 +411,17 @@ func deriveCanonicalEditionFact(doc model.Document, aiEdition AIFact, trust mode
 // researchable gaps.
 //
 // not_applicable requires BOTH:
-//   A. the AIFact passed sanitizeAIFact (its Evidence is verbatim in the Document);
-//   B. the Evidence shows an explicit selection hierarchy (校级/省级/国赛/全国赛)
-//      AND at least one progression marker (推荐/选拔/晋级/上报/上推/推送/进入国赛).
+//   A. the AIFact passed sanitizeAIFact (its Evidence is verbatim in the Document)
+//      AND the edition-bound validation pipeline (editionBoundFact) in
+//      validateAIResult, so a wrong-edition proposal never reaches this helper;
+//   B. registrationProgressionEvidence(evidence) is true: the Evidence carries at
+//      least TWO distinct competition levels (school / provincial / national) AND
+//      at least one strong up-push progression marker, with no explicit
+//      centralized/direct signup wording that would contradict not_applicable.
 //
-// Regional/site/district words alone ("上海"/"分赛区"/"高校"/"省") are NOT enough:
-// a regional competition is not the same as "no unified registration window".
+// Regional/site/district words alone ("上海"/"分赛区"/"高校"/"省"/"区域赛"/"选拔赛")
+// are NOT enough: a regional competition is not the same as "no unified
+// registration window".
 func deriveRegistrationWindowApplicabilityFact(aiFact AIFact, doc model.Document, trust model.Trust, observedAt time.Time, rejections *[]model.AnalysisRejection) (model.FactEvidence, bool) {
 	value := strings.TrimSpace(aiFact.Value)
 	if value == "" || value != string(model.RegistrationWindowNotApplicable) {
@@ -428,7 +435,7 @@ func deriveRegistrationWindowApplicabilityFact(aiFact AIFact, doc model.Document
 		return model.FactEvidence{}, false
 	}
 	if !registrationProgressionEvidence(evidence) {
-		*rejections = append(*rejections, model.AnalysisRejection{Field: string(model.FactRegistrationWindowApplicability), Reason: "evidence lacks an explicit selection/up-push hierarchy", Value: value})
+		*rejections = append(*rejections, model.AnalysisRejection{Field: string(model.FactRegistrationWindowApplicability), Reason: "evidence lacks at least two competition levels with a strong up-push progression marker", Value: value})
 		return model.FactEvidence{}, false
 	}
 	edition := strings.TrimSpace(aiFact.Edition)
@@ -443,14 +450,57 @@ func deriveRegistrationWindowApplicabilityFact(aiFact AIFact, doc model.Document
 	}, true
 }
 
-// registrationProgressionEvidence reports whether the evidence text contains an
-// explicit selection hierarchy (校级/省级/国赛/全国赛) AND at least one
-// progression marker (推荐/选拔/晋级/上报/上推/推送/进入国赛). This guards
-// against region/site/district words alone implying "no unified registration".
+// competition level groups. Each distinct group that appears in the evidence
+// counts as one competition level. Region/site/district words (区域赛/分赛区) and
+// "选拔赛" (a competition TYPE, not a level) are deliberately NOT included: they
+// do not by themselves prove the multi-level up-push chain that not_applicable
+// requires.
+var schoolLevelMarkers = []string{"校级赛", "校赛", "校级"}
+var provincialLevelMarkers = []string{"省级赛", "省赛", "省级"}
+var nationalLevelMarkers = []string{"国家级赛", "全国赛", "国赛"}
+
+// strongProgressionMarkers express an explicit up-push / selection relationship
+// between a lower competition level and a higher one (a work or participant is
+// 推荐/晋级/上报/上推 from a lower level to a higher one). Bare "选拔" is NOT
+// strong on its own: "选拔赛"/"选拔优秀选手" describes a competition type or a
+// generic activity, not an explicit multi-level progression. "报名参加" is
+// excluded because it usually means ordinary direct signup, which is the exact
+// opposite of not_applicable.
+var strongProgressionMarkers = []string{"推荐", "晋级", "上报", "上推", "推送", "进入国赛", "参加国赛"}
+
+// centralizedSignupMarkers express explicit unified / direct signup semantics
+// that contradict not_applicable. If any of these appears in the evidence, the
+// evidence can never support not_applicable, even if it also contains level and
+// progression markers. This is the contradiction guard: when in doubt return
+// unknown, never vote not_applicable.
+var centralizedSignupMarkers = []string{
+	"统一报名", "统一网上报名", "官网统一报名", "统一官网报名", "全国统一报名",
+	"直接报名", "开放报名", "统一在线报名", "统一通过官网",
+}
+
+// registrationProgressionEvidence reports whether the evidence text meets the V1
+// strong "no unified registration window" gate. It requires ALL of:
+//   A. no explicit centralized/direct signup wording (contradiction guard);
+//   B. at least TWO distinct competition levels (school / provincial / national);
+//   C. at least one strong up-push progression marker.
+//
+// This deliberately errs toward false-negative: a single level token plus a
+// generic progression token (e.g. "全国赛报名参加") is never enough, because that
+// could describe a centralized competition that does have a unified window.
 func registrationProgressionEvidence(text string) bool {
-	hierarchy := containsAnySubstr(text, []string{"校级", "省级", "国赛", "全国赛", "区域赛", "选拔赛"})
-	progression := containsAnySubstr(text, []string{"推荐", "选拔", "晋级", "上报", "上推", "推送", "进入国赛", "参加国赛", "报名参加"})
-	return hierarchy && progression
+	if containsAnySubstr(text, centralizedSignupMarkers) {
+		return false
+	}
+	levels := 0
+	for _, group := range [][]string{schoolLevelMarkers, provincialLevelMarkers, nationalLevelMarkers} {
+		if containsAnySubstr(text, group) {
+			levels++
+		}
+	}
+	if levels < 2 {
+		return false
+	}
+	return containsAnySubstr(text, strongProgressionMarkers)
 }
 
 // containsAnySubstr reports whether text contains any of the substrings.
@@ -461,21 +511,6 @@ func containsAnySubstr(text string, subs []string) bool {
 		}
 	}
 	return false
-}
-
-// firstProgressionSentence returns the first sentence of text that contains both
-// a selection hierarchy and a progression marker (i.e. qualifies as strong
-// "no unified registration window" evidence), or "" if none does. It is used by
-// the rules-only path to surface a real evidence sentence for the applicability
-// fact.
-func firstProgressionSentence(text string) string {
-	for _, sentence := range strings.FieldsFunc(text, func(r rune) bool { return r == '。' || r == '；' || r == '\n' }) {
-		sentence = strings.TrimSpace(sentence)
-		if sentence != "" && registrationProgressionEvidence(sentence) {
-			return sentence
-		}
-	}
-	return ""
 }
 
 func validDocumentType(value AIDocumentType) bool {

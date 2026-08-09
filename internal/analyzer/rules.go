@@ -471,15 +471,14 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 	if editionFact, ok := deriveCanonicalEditionFact(doc, AIFact{}, trust, now, &rejections); ok {
 		facts[model.FactEdition] = editionFact
 	}
-	// Persist a canonical registration-window applicability fact when the page
-	// strongly expresses a selection hierarchy with progression (e.g. 校赛→省赛→
-	// 国赛 with 推荐/上推), meaning there is no unified national signup window.
-	if appEvidence := firstProgressionSentence(text); appEvidence != "" {
-		appFact := AIFact{Value: string(model.RegistrationWindowNotApplicable), Evidence: appEvidence, Edition: edition}
-		if appFact, ok := deriveRegistrationWindowApplicabilityFact(appFact, doc, trust, now, &rejections); ok {
-			facts[model.FactRegistrationWindowApplicability] = appFact
-		}
-	}
+	// NOTE: FactRegistrationWindowApplicability is intentionally NOT derived on
+	// the deterministic rules-only path. not_applicable closes future
+	// registration_start/end Research (a strong negative fact), so it is only
+	// ever produced from a validated AI proposal whose evidence passes the
+	// deterministic strong gate in deriveRegistrationWindowApplicabilityFact.
+	// Without AI (or when AI proposes nothing) the field stays unknown and
+	// registration remains a researchable gap — a safe false-negative that never
+	// loses a real registration window.
 	competition := model.Competition{
 		EntityKey:            EntityKey(name, organizer),
 		Name:                 name,
