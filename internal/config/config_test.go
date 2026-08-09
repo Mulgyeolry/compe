@@ -18,6 +18,25 @@ func TestExampleConfigurationLoads(t *testing.T) {
 	if !cfg.Retention.Enabled || cfg.Retention.ObservationDays != 30 || cfg.Retention.ClosedCompetitionContentDays != 180 {
 		t.Fatalf("example retention policy is incomplete: %#v", cfg.Retention)
 	}
+	if cfg.EvidenceResearch.Enabled {
+		t.Fatal("example evidence_research must default to enabled=false (safe rollout)")
+	}
+	if cfg.EvidenceResearch.MaxCompetitionsPerRun != 5 || cfg.EvidenceResearch.RetryCooldownHours != 6 || cfg.EvidenceResearch.UnresolvedCooldownHours != 72 {
+		t.Fatalf("example evidence_research defaults wrong: %#v", cfg.EvidenceResearch)
+	}
+}
+
+func TestEvidenceResearchDisabledByDefault(t *testing.T) {
+	// A config that never sets evidence_research must have Enabled=false, so a
+	// configured LLM does not silently start agent research.
+	cfg := Config{}
+	applyDefaults(&cfg)
+	if cfg.EvidenceResearch.Enabled {
+		t.Fatal("evidence_research.enabled must default to false")
+	}
+	if cfg.EvidenceResearch.MaxCompetitionsPerRun != 5 {
+		t.Fatalf("default max_competitions_per_run=%d want 5", cfg.EvidenceResearch.MaxCompetitionsPerRun)
+	}
 }
 
 // TestExampleConfigCCPCSourceUsesCCPCAPI guards against the CCPC source being

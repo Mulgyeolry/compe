@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"competition-assistant/internal/config"
+	"competition-assistant/internal/fetcher"
 	"competition-assistant/internal/model"
 	"competition-assistant/internal/subscription"
 )
@@ -218,7 +219,11 @@ func planDueResearchSessions(sessions []model.ResearchSession, states []model.Ev
 // NOT call RecordEvidenceResearchAttempt: being planned is not the same as
 // having executed a research attempt, so attempt_count is only ever incremented
 // by a future research executor.
-func (s *Service) runEvidenceResearchPlanning(ctx context.Context, now time.Time) error {
+// prepareEvidenceResearch is the shared planning core used by both the
+// read-only planning pass and the production research phase. It lists the full
+// canonical set, builds eligible sessions, applies cooldown + budget, and
+// returns the due sessions alongside the competitions keyed by id.
+func (s *Service) prepareEvidenceResearch(ctx context.Context, now time.Time) ([]model.ResearchSession, map[int64]model.Competition, researchPlanStats, error) {
 	// Read the full canonical set, not the UI/active-list subset. ListActiveCompetitions
 	// pre-filters by status (preview/upcoming/registration_open/ongoing), which would
 	// drop the canonicals most in need of evidence research: StatusUnknown (all dates
@@ -227,14 +232,29 @@ func (s *Service) runEvidenceResearchPlanning(ctx context.Context, now time.Time
 	// evidenceResearchEligible, so no status pre-filter belongs here.
 	competitions, err := s.store.ListCompetitions(ctx)
 	if err != nil {
-		return err
+		return nil, nil, researchPlanStats{}, err
+	}
+	byID := make(map[int64]model.Competition, len(competitions))
+	for _, competition := range competitions {
+		byID[competition.ID] = competition
 	}
 	sessions := buildEvidenceResearchSessions(competitions, now, s.freshnessWindow())
 	states, err := s.store.ListEvidenceResearchStates(ctx)
 	if err != nil {
-		return err
+		return nil, nil, researchPlanStats{}, err
 	}
 	dueSessions, stats := planDueResearchSessions(sessions, states, now, s.cfg.EvidenceResearch.MaxCompetitionsPerRun)
+	return dueSessions, byID, stats, nil
+}
+
+// runEvidenceResearchPlanning is the read-only planning pass. It shares
+// prepareEvidenceResearch with the production phase but performs no Search/Fetch/
+// Extractor/ResearchState/canonical work.
+func (s *Service) runEvidenceResearchPlanning(ctx context.Context, now time.Time) error {
+	dueSessions, _, stats, err := s.prepareEvidenceResearch(ctx, now)
+	if err != nil {
+		return err
+	}
 	s.log.Info("evidence research planning",
 		"detected_sessions", stats.detectedSessions,
 		"detected_gaps", stats.detectedGaps,
@@ -242,6 +262,131 @@ func (s *Service) runEvidenceResearchPlanning(ctx context.Context, now time.Time
 		"due_gaps", stats.dueGaps,
 		"deferred_cooldown", stats.deferredCooldown,
 		"deferred_budget", stats.deferredBudget)
-	_ = dueSessions // planned for a future research executor
+	_ = dueSessions
 	return nil
+}
+
+// evidenceResearchPhaseTimeout caps the whole production research phase across
+// all sessions. Sessions run sequentially (no worker pool).
+const evidenceResearchPhaseTimeout = 120 * time.Second
+
+// runEvidenceResearch is the production research phase. It only runs when
+// EvidenceResearch.Enabled is true and the collector exposes ResearchTools. It
+// plans due sessions, executes each sequentially, reconciles each found fact
+// into a narrow canonical supplement, records ResearchState, and feeds accepted
+// lifecycle changes into the existing eventMap. It is fail-soft: errors are
+// logged and must never break the main source scan.
+func (s *Service) runEvidenceResearch(ctx context.Context, now time.Time, eventMap map[int64][]model.Event) error {
+	if !s.cfg.EvidenceResearch.Enabled {
+		return nil
+	}
+	tools, ok := s.collector.(fetcher.ResearchTools)
+	if !ok {
+		s.log.Warn("evidence research skipped: collector does not expose ResearchTools")
+		return nil
+	}
+	if !s.analyzer.ResearchEnabled() {
+		s.log.Warn("evidence research skipped: research capability is not enabled")
+		return nil
+	}
+	return s.runEvidenceResearchWithTools(ctx, now, eventMap, tools, s.analyzer)
+}
+
+// runEvidenceResearchWithTools is the testable core of the production research
+// phase. It plans due sessions, executes each sequentially under a phase
+// timeout, reconciles found facts into narrow canonical supplements, records
+// ResearchState, and feeds accepted lifecycle changes into the eventMap. It is
+// fail-soft: errors are logged and must never break the main source scan.
+func (s *Service) runEvidenceResearchWithTools(ctx context.Context, now time.Time, eventMap map[int64][]model.Event, tools fetcher.ResearchTools, extractor evidenceResearchExtractor) error {
+	dueSessions, byID, _, err := s.prepareEvidenceResearch(ctx, now)
+	if err != nil {
+		s.log.Warn("evidence research planning failed", "error", err)
+		return nil
+	}
+	if len(dueSessions) == 0 {
+		return nil
+	}
+
+	// Two contexts are deliberately kept:
+	//   - phaseCtx bounds ONLY the Search/Fetch/Extractor research work.
+	//   - ctx (the parent, uncancelled-by-phase) is used for the short DB
+	//     persistence of a session that ALREADY started, so a global phase
+	//     deadline does not make the state write itself fail immediately.
+	phaseTimeout := evidenceResearchPhaseTimeout
+	if s.evidenceResearchPhaseTimeoutOverride > 0 {
+		phaseTimeout = s.evidenceResearchPhaseTimeoutOverride
+	}
+	phaseCtx, cancel := context.WithTimeout(ctx, phaseTimeout)
+	defer cancel()
+
+	for _, session := range dueSessions {
+		if phaseCtx.Err() != nil {
+			// Sessions that never started must not record attempts.
+			break
+		}
+		competition, ok := byID[session.CompetitionID]
+		if !ok {
+			continue
+		}
+		execution, execErr := executeEvidenceResearchSession(phaseCtx, tools, extractor, competition, session)
+		// Whether execution completed normally or the phase deadline cut it off,
+		// the session HAS started: it counts as one execution, and its per-field
+		// outcomes (retryable/unresolved/found) must still be persisted. Persist
+		// using the parent ctx so the write is not rejected by a canceled
+		// phaseCtx.
+		if execErr != nil {
+			// Fatal executor error (e.g. edition conflict). Mark this session's
+			// fields unresolved with a long cooldown and continue.
+			s.log.Warn("evidence research execution failed", "competition_id", competition.ID, "error", execErr)
+			s.recordUnresolvedForSession(ctx, now, session, execErr.Error())
+			continue
+		}
+		s.reconcileAndRecordExecution(ctx, competition, execution, now, eventMap)
+	}
+	return nil
+}
+
+// recordEvidenceResearchDecision persists one research-state outcome, never
+// swallowing the write error. A canonical write that already succeeded is NOT
+// rolled back when the state write fails; the failure is surfaced as a warning
+// so the operator can observe the inconsistency.
+func (s *Service) recordEvidenceResearchDecision(ctx context.Context, competitionID int64, field model.EvidenceField, status model.ResearchStateStatus, now time.Time, nextRetryAt *time.Time, lastError string) {
+	if err := s.store.RecordEvidenceResearchAttempt(ctx, competitionID, field, status, now, nextRetryAt, lastError); err != nil {
+		s.log.Warn("record evidence research state failed",
+			"competition_id", competitionID,
+			"field", string(field),
+			"status", string(status),
+			"error", err)
+	}
+}
+
+// recordUnresolvedForSession records every gap field of an un-executable session
+// as unresolved (long cooldown) — used for fatal executor errors like edition
+// conflict, which should not hot-loop every 6 hours. Write errors are logged,
+// never silently dropped.
+func (s *Service) recordUnresolvedForSession(ctx context.Context, now time.Time, session model.ResearchSession, reason string) {
+	cfg := s.cfg.EvidenceResearch
+	retry := researchNextRetryAt(model.ResearchStateUnresolved, now, cfg)
+	for _, gap := range session.Gaps {
+		if !model.ValidEvidenceField(gap.Field) {
+			continue
+		}
+		s.recordEvidenceResearchDecision(ctx, session.CompetitionID, gap.Field, model.ResearchStateUnresolved, now, retry, firstNonEmpty(reason, "executor fatal error"))
+	}
+}
+
+// reconcileAndRecordExecution reconciles one session execution and records
+// ResearchState + events.
+func (s *Service) reconcileAndRecordExecution(ctx context.Context, competition model.Competition, execution evidenceResearchExecution, now time.Time, eventMap map[int64][]model.Event) {
+	cfg := s.cfg.EvidenceResearch
+	for _, fieldResult := range execution.Fields {
+		decision := s.reconcileEvidenceResearchField(ctx, competition, execution, fieldResult, now, cfg)
+		s.recordEvidenceResearchDecision(ctx, competition.ID, decision.Field, decision.ResearchState, now, decision.NextRetryAt, firstNonEmpty(decision.LastError, ""))
+		if decision.CanonicalChanged && decision.SavedCompetition != nil {
+			events := changeEvents(competition, *decision.SavedCompetition, false, now, s.freshnessWindow())
+			if len(events) > 0 {
+				eventMap[competition.ID] = append(eventMap[competition.ID], events...)
+			}
+		}
+	}
 }

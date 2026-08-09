@@ -27,6 +27,7 @@ discovery:
 # retry_cooldown_hours：瞬时失败（网络/临时服务错误）后的短冷却时间。
 # unresolved_cooldown_hours：有效研究但未找到可靠官方证据后的长冷却时间。
 evidence_research:
+  enabled: false
   max_competitions_per_run: 5
   retry_cooldown_hours: 6
   unresolved_cooldown_hours: 72

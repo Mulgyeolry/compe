@@ -625,29 +625,9 @@ func TestEvidenceExtractorDocumentPromptHardBound(t *testing.T) {
 	}
 }
 
-// TestEvidenceExtractorModelEditionCannotOverrideEvidenceYear verifies a model
-// cannot relabel a 2025 evidence date as edition 2026: the authoritative edition
-// is derived from the evidence date, and the conflicting model edition is
-// rejected.
-func TestEvidenceExtractorModelEditionCannotOverrideEvidenceYear(t *testing.T) {
-	req := evidenceRequest()
-	req.Document.Text = "报名截止时间为2025年4月9日。"
-	payload := `{"schema_version":"research-evidence-v1","facts":[{"field":"registration_end","value":"2025年4月9日","evidence":"报名截止时间为2025年4月9日","edition":"2026","confidence":"high"}]}`
-	analyzer := evidenceTestAnalyzer(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(chatCompletionResponse(payload)))
-	})
-	result, err := analyzer.ExtractEvidenceFacts(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result.Facts) != 0 {
-		t.Fatalf("model edition must not override evidence year, got %+v", result.Facts)
-	}
-}
-
 // TestEvidenceExtractorRejectsModelEditionConflict verifies a model edition that
-// conflicts with the deterministic evidence date is rejected.
+// conflicts with the requested edition is rejected: a model may not declare an
+// edition different from req.Edition even when the document binds to req.Edition.
 func TestEvidenceExtractorRejectsModelEditionConflict(t *testing.T) {
 	req := evidenceRequest()
 	req.Document.Text = "报名截止时间为2026年4月9日。"
@@ -662,5 +642,59 @@ func TestEvidenceExtractorRejectsModelEditionConflict(t *testing.T) {
 	}
 	if len(result.Facts) != 0 {
 		t.Fatalf("conflicting model edition must be rejected, got %+v", result.Facts)
+	}
+}
+
+// TestEvidenceExtractorAllowsCrossYearLifecycleDate verifies that a 2026 edition
+// may legitimately own a 2025 lifecycle date (e.g. registration_start on
+// 2025-12-15). The document binds to 2026 via its title; the model edition matches
+// req.Edition; the date's own year is NOT part of the edition, so the fact is
+// accepted with Date 2025-12-15 and Edition 2026.
+func TestEvidenceExtractorAllowsCrossYearLifecycleDate(t *testing.T) {
+	req := evidenceRequest()
+	req.Fields = []model.EvidenceField{model.EvidenceRegistrationStart}
+	req.Document.Text = "报名于2025年12月15日开始。"
+	payload := `{"schema_version":"research-evidence-v1","facts":[{"field":"registration_start","value":"2025年12月15日","evidence":"报名于2025年12月15日开始","edition":"2026","confidence":"high"}]}`
+	analyzer := evidenceTestAnalyzer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatCompletionResponse(payload)))
+	})
+	result, err := analyzer.ExtractEvidenceFacts(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Facts) != 1 {
+		t.Fatalf("cross-year lifecycle date must be accepted, got %+v", result.Facts)
+	}
+	got := result.Facts[0]
+	if got.Date.Year() != 2025 || got.Date.Month() != 12 || got.Date.Day() != 15 {
+		t.Fatalf("date = %v, want 2025-12-15", got.Date)
+	}
+	if got.Edition != "2026" {
+		t.Fatalf("edition = %q, want 2026", got.Edition)
+	}
+}
+
+// TestEvidenceExtractorRejectsWrongDocumentEdition verifies the model cannot
+// relabel a prior-year document as the current edition: when the requested
+// edition is 2026 but the Document's title explicitly marks 2025, every fact is
+// rejected even if the model returns edition=2026.
+func TestEvidenceExtractorRejectsWrongDocumentEdition(t *testing.T) {
+	req := evidenceRequest()
+	req.Fields = []model.EvidenceField{model.EvidenceRegistrationStart}
+	req.Document.Title = "2025 XXX 大赛报名通知"
+	req.Document.URL = "https://example.com/codecraft2025"
+	req.Document.Text = "报名于2025年12月15日开始。"
+	payload := `{"schema_version":"research-evidence-v1","facts":[{"field":"registration_start","value":"2025年12月15日","evidence":"报名于2025年12月15日开始","edition":"2026","confidence":"high"}]}`
+	analyzer := evidenceTestAnalyzer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatCompletionResponse(payload)))
+	})
+	result, err := analyzer.ExtractEvidenceFacts(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Facts) != 0 {
+		t.Fatalf("wrong-document edition must be rejected, got %+v", result.Facts)
 	}
 }

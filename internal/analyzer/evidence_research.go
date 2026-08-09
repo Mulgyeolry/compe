@@ -225,6 +225,15 @@ func (a *Analyzer) validateResearchEvidenceFacts(req ResearchEvidenceRequest, re
 	fullText := normalize(req.Document.Title + " " + req.Document.Text)
 	result := ResearchEvidenceResult{}
 
+	// The document itself must deterministically bind to the requested edition
+	// (via an explicit four-digit year token in its title or URL). If it does
+	// not, V1 rejects the whole batch rather than guessing: the model must not
+	// relabel a prior-year page as the current edition.
+	if !researchDocumentMatchesEdition(req.Document, req.Edition) {
+		result.Rejections = append(result.Rejections, model.AnalysisRejection{Field: "", Reason: "document does not deterministically bind to requested edition"})
+		return result, nil
+	}
+
 	// A field may be proposed only once; a duplicate means the whole field is
 	// rejected to avoid the LLM's ordering picking the canonical candidate.
 	seen := make(map[model.EvidenceField]bool)
@@ -311,20 +320,16 @@ func (a *Analyzer) validateSingleEvidenceFact(req ResearchEvidenceRequest, fullT
 		return reject("value date is not reproducible from evidence")
 	}
 
-	// Edition binding. The authoritative edition is derived deterministically
-	// from the evidence-reproducible date (parsed.Year()), never from the model's
-	// declaration. Because Value must parseDate and must be reproduced from the
-	// Evidence verbatim, parsed.Year() is effectively the evidence's own year.
-	deterministicEdition := strconv.Itoa(parsed.Year())
-	if !sameEdition(req.Edition, deterministicEdition) {
-		return reject("evidence date belongs to a different edition")
-	}
-	// The model's edition, if provided, is only a consistency check: it must
-	// agree with the deterministic edition. It is never used as the final source
-	// of truth, so a model cannot relabel a 2025 evidence date as 2026.
+	// Edition binding. The authoritative edition is req.Edition (already bound to
+	// the current edition by researchDocumentMatchesEdition in
+	// validateResearchEvidenceFacts). A lifecycle date's own year is unrelated to
+	// the competition edition — e.g. a 2026 edition can legitimately have a
+	// registration_start on 2025-12-15 — so parsed.Year() is NOT a valid edition
+	// source. The model's edition field is only a consistency check against
+	// req.Edition; it never becomes the authoritative edition.
 	modelEdition := strings.TrimSpace(fact.Edition)
-	if modelEdition != "" && !sameEdition(modelEdition, deterministicEdition) {
-		return reject("model edition conflicts with evidence date")
+	if modelEdition != "" && !sameEdition(modelEdition, req.Edition) {
+		return reject("model edition conflicts with requested edition")
 	}
 
 	return ResearchEvidenceFact{
@@ -332,7 +337,7 @@ func (a *Analyzer) validateSingleEvidenceFact(req ResearchEvidenceRequest, fullT
 		Date:       model.DayStart(*parsed),
 		Raw:        strings.TrimSpace(fact.Value),
 		Evidence:   fact.Evidence,
-		Edition:    deterministicEdition,
+		Edition:    strings.TrimSpace(req.Edition),
 		SourceURL:  req.Document.URL,
 		Confidence: normalizeAIConfidence(fact.Confidence),
 	}, nil
@@ -357,4 +362,31 @@ func datesInEvidenceContain(evidence string, want time.Time, loc *time.Location)
 // utf8RuneCount returns the number of runes in s.
 func utf8RuneCount(s string) int {
 	return len([]rune(s))
+}
+
+// researchDocumentMatchesEdition reports whether a fetched Document deterministically
+// binds to the requested edition. Only explicit four-digit year tokens in the title
+// or URL are considered — no fuzzy guessing. If any token appears it must equal the
+// requested edition's year; a differing token (a prior-year page) rejects. If no
+// token is present at all, V1 conservatively rejects rather than guess.
+func researchDocumentMatchesEdition(doc model.Document, edition string) bool {
+	reqYear := yearIn(edition)
+	if reqYear == 0 {
+		return false
+	}
+	for _, source := range []string{doc.Title, doc.URL} {
+		for _, token := range fourDigitYear.FindAllString(source, -1) {
+			y, err := strconv.Atoi(token)
+			if err != nil {
+				continue
+			}
+			if y != reqYear {
+				return false
+			}
+		}
+	}
+	// At least one explicit token must have been present and all present tokens
+	// must match the requested edition.
+	hasToken := fourDigitYear.MatchString(doc.Title) || fourDigitYear.MatchString(doc.URL)
+	return hasToken
 }

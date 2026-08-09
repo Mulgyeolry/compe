@@ -118,11 +118,19 @@ var errEvidenceResearchEditionUnknown = errors.New("cannot determine canonical r
 // candidate result.
 var errEvidenceResearchEditionConflict = errors.New("conflicting canonical research edition")
 
-// evidenceResearchEdition derives the research edition deterministically from
-// the canonical competition (Name year, known lifecycle dates, OfficialURL year).
-// It never guesses with FirstSeen.Year() or time.Now().Year(). No explicit year
-// returns errEvidenceResearchEditionUnknown; conflicting explicit years return
-// errEvidenceResearchEditionConflict.
+// evidenceResearchEdition derives the research edition deterministically from the
+// canonical competition's IDENTITY-level metadata only: the Name year, the
+// lifecycle FactEvidence.Edition values, and the OfficialURL year. It deliberately
+// does NOT read the persisted lifecycle time.Time.Year() (a business date can
+// differ from its UTC instant year, e.g. 2026-01-01 +08 is 2025-12-31 16:00 UTC)
+// and does NOT read the lifecycle Raw date fields, because a competition edition
+// is its own identity while a lifecycle date year is merely the date's own year —
+// a 2026 edition may legitimately have a registration_start on 2025-12-15. Raw
+// dates therefore never contribute to (or conflict with) the edition.
+//
+// It never guesses with FirstSeen.Year() or time.Now().Year(). No explicit
+// identity-level year returns errEvidenceResearchEditionUnknown; conflicting
+// explicit years return errEvidenceResearchEditionConflict.
 func evidenceResearchEdition(competition model.Competition) (string, error) {
 	seen := make(map[int]bool)
 	var years []int
@@ -133,18 +141,10 @@ func evidenceResearchEdition(competition model.Competition) (string, error) {
 		}
 	}
 	addYear(yearFromResearchText(competition.Name))
-	if competition.RegistrationStart != nil {
-		addYear(competition.RegistrationStart.Year())
-	}
-	if competition.RegistrationEnd != nil {
-		addYear(competition.RegistrationEnd.Year())
-	}
-	if competition.CompetitionStart != nil {
-		addYear(competition.CompetitionStart.Year())
-	}
-	if competition.CompetitionEnd != nil {
-		addYear(competition.CompetitionEnd.Year())
-	}
+	addEditionYear(competition.Facts[model.FactRegistrationStart], addYear)
+	addEditionYear(competition.Facts[model.FactRegistrationEnd], addYear)
+	addEditionYear(competition.Facts[model.FactCompetitionStart], addYear)
+	addEditionYear(competition.Facts[model.FactCompetitionEnd], addYear)
 	addYear(yearFromResearchText(competition.OfficialURL))
 	if len(years) == 0 {
 		return "", errEvidenceResearchEditionUnknown
@@ -153,6 +153,15 @@ func evidenceResearchEdition(competition model.Competition) (string, error) {
 		return "", fmt.Errorf("%w: %v", errEvidenceResearchEditionConflict, years)
 	}
 	return strconv.Itoa(years[0]), nil
+}
+
+// addEditionYear feeds a lifecycle FactEvidence's Edition year (as a
+// deterministic textual source) into the collector, ignoring absent facts.
+func addEditionYear(fact model.FactEvidence, addYear func(int)) {
+	if fact.Edition == "" {
+		return
+	}
+	addYear(yearFromResearchText(fact.Edition))
 }
 
 // researchOfficialDomain extracts a Search AllowedDomains host from an OfficialURL.
