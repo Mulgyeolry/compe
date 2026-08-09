@@ -471,6 +471,15 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 	if editionFact, ok := deriveCanonicalEditionFact(doc, AIFact{}, trust, now, &rejections); ok {
 		facts[model.FactEdition] = editionFact
 	}
+	// Persist a canonical registration-window applicability fact when the page
+	// strongly expresses a selection hierarchy with progression (e.g. 校赛→省赛→
+	// 国赛 with 推荐/上推), meaning there is no unified national signup window.
+	if appEvidence := firstProgressionSentence(text); appEvidence != "" {
+		appFact := AIFact{Value: string(model.RegistrationWindowNotApplicable), Evidence: appEvidence, Edition: edition}
+		if appFact, ok := deriveRegistrationWindowApplicabilityFact(appFact, doc, trust, now, &rejections); ok {
+			facts[model.FactRegistrationWindowApplicability] = appFact
+		}
+	}
 	competition := model.Competition{
 		EntityKey:            EntityKey(name, organizer),
 		Name:                 name,
@@ -626,6 +635,15 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	if editionFact, ok := deriveCanonicalEditionFact(doc, result.Identity.Edition, base.Trust, now, &editionRejections); ok {
 		base.Facts[model.FactEdition] = editionFact
 	}
+	// Re-derive the canonical registration-window applicability fact from the
+	// validated AI proposal + Document. Only "not_applicable" with strong
+	// hierarchy/progression evidence is persisted; otherwise it stays absent
+	// (unknown), preserving the existing researchable-gap behavior.
+	var appRejections []model.AnalysisRejection
+	if appFact, ok := deriveRegistrationWindowApplicabilityFact(result.Facts.RegistrationWindowApplicability, doc, base.Trust, now, &appRejections); ok {
+		base.Facts[model.FactRegistrationWindowApplicability] = appFact
+	}
+	editionRejections = append(editionRejections, appRejections...)
 	registrationPhase, competitionPhase, evidence := phasesFromAIEvents(model.RegistrationUnknown, model.CompetitionUnknown, result.Events)
 	base.RegistrationPhase = registrationPhase
 	base.CompetitionPhase = competitionPhase

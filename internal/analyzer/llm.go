@@ -498,6 +498,7 @@ func mergeAIChunkResults(parts []AIResult) (AIResult, []string) {
 		{Field: "facts.fee", Get: func(p AIResult) AIFact { return p.Facts.Fee }, Set: func(r *AIResult, f AIFact) { r.Facts.Fee = f }},
 		{Field: "facts.eligibility", Get: func(p AIResult) AIFact { return p.Facts.Eligibility }, Set: func(r *AIResult, f AIFact) { r.Facts.Eligibility = f }},
 		{Field: "facts.competition_contents", Get: func(p AIResult) AIFact { return p.Facts.CompetitionContents }, Set: func(r *AIResult, f AIFact) { r.Facts.CompetitionContents = f }},
+		{Field: "facts.registration_window_applicability", Get: func(p AIResult) AIFact { return p.Facts.RegistrationWindowApplicability }, Set: func(r *AIResult, f AIFact) { r.Facts.RegistrationWindowApplicability = f }},
 	}
 	for _, field := range singleValueFacts {
 		winner, conflict := consensusFact(field.Field, parts, field.Get, &merged.Rejections)

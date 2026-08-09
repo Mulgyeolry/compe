@@ -104,10 +104,10 @@ func TestCanonicalPersistsEditionWhenNormalizedNameDropsYear(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if calls.Add(1) == 1 {
-			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v11","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
 			return
 		}
-		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v11","identity":{"name":{"value":"中国大学生计算机设计大赛","evidence":"中国大学生计算机设计大赛","edition":"2026","confidence":"high"}},"facts":{},"events":[]}`)))
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","identity":{"name":{"value":"中国大学生计算机设计大赛","evidence":"中国大学生计算机设计大赛","edition":"2026","confidence":"high"}},"facts":{},"events":[]}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
@@ -175,11 +175,11 @@ func TestCanonicalEditionConflictPersistsAuditRejection(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if calls.Add(1) == 1 {
-			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v11","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
 			return
 		}
 		// AI identity.edition = 2025, with evidence that really supports 2025.
-		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v11","identity":{"edition":{"value":"2025","evidence":"本赛事为2025年举办的一届","edition":"2025","confidence":"high"}},"facts":{},"events":[]}`)))
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","identity":{"edition":{"value":"2025","evidence":"本赛事为2025年举办的一届","edition":"2025","confidence":"high"}},"facts":{},"events":[]}`)))
 	}))
 	defer server.Close()
 	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")

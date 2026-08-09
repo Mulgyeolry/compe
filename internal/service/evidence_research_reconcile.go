@@ -249,6 +249,16 @@ func (s *Service) reconcileEvidenceResearchField(
 		return reject("canonical trust is low")
 	}
 
+	// Defense-in-depth: if the canonical has already been confirmed to have no
+	// unified national registration window, never let Research write a
+	// registration_start / registration_end (which would only be a local /
+	// regional / up-push deadline). This is a final guard; the Gap Detector is the
+	// primary entry point that already excludes these fields.
+	if model.RegistrationWindowApplicabilityOf(current) == model.RegistrationWindowNotApplicable &&
+		(fieldResult.Field == model.EvidenceRegistrationStart || fieldResult.Field == model.EvidenceRegistrationEnd) {
+		return reject("canonical registration window is not applicable")
+	}
+
 	// Target already populated? Same date → already_present/resolved, no write.
 	// Different date → conflict/skipped, never overwrite.
 	if !researchFieldNil(current, fieldResult.Field) {

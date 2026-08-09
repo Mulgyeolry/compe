@@ -13,7 +13,7 @@ import (
 	"competition-assistant/internal/model"
 )
 
-const AIAnalyzerVersion = "competition-audit-v11"
+const AIAnalyzerVersion = "competition-audit-v12"
 
 // PendingCandidateError means the page was credible enough to retain as a
 // minimal competition candidate, but AI verification must be retried before
@@ -138,15 +138,16 @@ type AIIdentity struct {
 }
 
 type AIFacts struct {
-	PublishedAt         AIFact `json:"published_at"`
-	RegistrationStart   AIFact `json:"registration_start"`
-	RegistrationEnd     AIFact `json:"registration_end"`
-	CompetitionStart    AIFact `json:"competition_start"`
-	CompetitionEnd      AIFact `json:"competition_end"`
-	TeamRequirement     AIFact `json:"team_requirement"`
-	Fee                 AIFact `json:"fee"`
-	Eligibility         AIFact `json:"eligibility"`
-	CompetitionContents AIFact `json:"competition_contents"`
+	PublishedAt                   AIFact `json:"published_at"`
+	RegistrationStart             AIFact `json:"registration_start"`
+	RegistrationEnd               AIFact `json:"registration_end"`
+	CompetitionStart              AIFact `json:"competition_start"`
+	CompetitionEnd                AIFact `json:"competition_end"`
+	TeamRequirement               AIFact `json:"team_requirement"`
+	Fee                           AIFact `json:"fee"`
+	Eligibility                   AIFact `json:"eligibility"`
+	CompetitionContents           AIFact `json:"competition_contents"`
+	RegistrationWindowApplicability AIFact `json:"registration_window_applicability"`
 }
 
 type AICompetitionEvent struct {
@@ -398,6 +399,83 @@ func deriveCanonicalEditionFact(doc model.Document, aiEdition AIFact, trust mode
 		Confidence: computedFactConfidence(trust, evidence, yearStr, doc.PublishedAtRaw),
 		ObservedAt: observedAt,
 	}, true
+}
+
+// deriveRegistrationWindowApplicabilityFact deterministically decides whether the
+// canonical competition has a unified national registration window. V1 ONLY
+// confirms "not_applicable" under strong, evidence-backed conditions; any other
+// value (or missing evidence) yields no fact (treated as "unknown" by the model
+// helper), preserving the existing behavior that registration_start/end remain
+// researchable gaps.
+//
+// not_applicable requires BOTH:
+//   A. the AIFact passed sanitizeAIFact (its Evidence is verbatim in the Document);
+//   B. the Evidence shows an explicit selection hierarchy (校级/省级/国赛/全国赛)
+//      AND at least one progression marker (推荐/选拔/晋级/上报/上推/推送/进入国赛).
+//
+// Regional/site/district words alone ("上海"/"分赛区"/"高校"/"省") are NOT enough:
+// a regional competition is not the same as "no unified registration window".
+func deriveRegistrationWindowApplicabilityFact(aiFact AIFact, doc model.Document, trust model.Trust, observedAt time.Time, rejections *[]model.AnalysisRejection) (model.FactEvidence, bool) {
+	value := strings.TrimSpace(aiFact.Value)
+	if value == "" || value != string(model.RegistrationWindowNotApplicable) {
+		return model.FactEvidence{}, false
+	}
+	// Evidence must be real in the document and must carry the strong hierarchy +
+	// progression semantics.
+	evidence := normalize(aiFact.Evidence)
+	if evidence == "" || !strings.Contains(normalize(doc.Title+" "+doc.Text), evidence) {
+		*rejections = append(*rejections, model.AnalysisRejection{Field: string(model.FactRegistrationWindowApplicability), Reason: "evidence not found in document"})
+		return model.FactEvidence{}, false
+	}
+	if !registrationProgressionEvidence(evidence) {
+		*rejections = append(*rejections, model.AnalysisRejection{Field: string(model.FactRegistrationWindowApplicability), Reason: "evidence lacks an explicit selection/up-push hierarchy", Value: value})
+		return model.FactEvidence{}, false
+	}
+	edition := strings.TrimSpace(aiFact.Edition)
+	return model.FactEvidence{
+		Value:      string(model.RegistrationWindowNotApplicable),
+		Raw:        string(model.RegistrationWindowNotApplicable),
+		Evidence:   evidence,
+		Edition:    edition,
+		SourceURL:  strings.TrimSpace(doc.URL),
+		Confidence: computedFactConfidence(trust, evidence, edition, doc.PublishedAtRaw),
+		ObservedAt: observedAt,
+	}, true
+}
+
+// registrationProgressionEvidence reports whether the evidence text contains an
+// explicit selection hierarchy (校级/省级/国赛/全国赛) AND at least one
+// progression marker (推荐/选拔/晋级/上报/上推/推送/进入国赛). This guards
+// against region/site/district words alone implying "no unified registration".
+func registrationProgressionEvidence(text string) bool {
+	hierarchy := containsAnySubstr(text, []string{"校级", "省级", "国赛", "全国赛", "区域赛", "选拔赛"})
+	progression := containsAnySubstr(text, []string{"推荐", "选拔", "晋级", "上报", "上推", "推送", "进入国赛", "参加国赛", "报名参加"})
+	return hierarchy && progression
+}
+
+// containsAnySubstr reports whether text contains any of the substrings.
+func containsAnySubstr(text string, subs []string) bool {
+	for _, s := range subs {
+		if strings.Contains(text, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstProgressionSentence returns the first sentence of text that contains both
+// a selection hierarchy and a progression marker (i.e. qualifies as strong
+// "no unified registration window" evidence), or "" if none does. It is used by
+// the rules-only path to surface a real evidence sentence for the applicability
+// fact.
+func firstProgressionSentence(text string) string {
+	for _, sentence := range strings.FieldsFunc(text, func(r rune) bool { return r == '。' || r == '；' || r == '\n' }) {
+		sentence = strings.TrimSpace(sentence)
+		if sentence != "" && registrationProgressionEvidence(sentence) {
+			return sentence
+		}
+	}
+	return ""
 }
 
 func validDocumentType(value AIDocumentType) bool {
