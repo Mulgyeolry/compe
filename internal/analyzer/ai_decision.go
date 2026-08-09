@@ -429,9 +429,19 @@ func deriveRegistrationWindowApplicabilityFact(aiFact AIFact, doc model.Document
 	}
 	// Evidence must be real in the document and must carry the strong hierarchy +
 	// progression semantics.
+	document := normalize(doc.Title + " " + doc.Text)
 	evidence := normalize(aiFact.Evidence)
-	if evidence == "" || !strings.Contains(normalize(doc.Title+" "+doc.Text), evidence) {
+	if evidence == "" || !strings.Contains(document, evidence) {
 		*rejections = append(*rejections, model.AnalysisRejection{Field: string(model.FactRegistrationWindowApplicability), Reason: "evidence not found in document"})
+		return model.FactEvidence{}, false
+	}
+	// Whole-document contradiction guard: not_applicable is a strong negative
+	// fact, so any explicit centralized/direct signup wording ANYWHERE in the
+	// same document overrides a hierarchy+progression evidence snippet. A failed
+	// or unread segment may carry this contradictory evidence, so when in doubt
+	// keep unknown.
+	if containsAnySubstr(document, centralizedSignupMarkers) {
+		*rejections = append(*rejections, model.AnalysisRejection{Field: string(model.FactRegistrationWindowApplicability), Reason: "document contains unified/direct signup wording; applicability withheld", Value: value})
 		return model.FactEvidence{}, false
 	}
 	if !registrationProgressionEvidence(evidence) {
@@ -461,18 +471,26 @@ var nationalLevelMarkers = []string{"国家级赛", "全国赛", "国赛"}
 
 // strongProgressionMarkers express an explicit up-push / selection relationship
 // between a lower competition level and a higher one (a work or participant is
-// 推荐/晋级/上报/上推 from a lower level to a higher one). Bare "选拔" is NOT
-// strong on its own: "选拔赛"/"选拔优秀选手" describes a competition type or a
-// generic activity, not an explicit multi-level progression. "报名参加" is
-// excluded because it usually means ordinary direct signup, which is the exact
-// opposite of not_applicable.
-var strongProgressionMarkers = []string{"推荐", "晋级", "上报", "上推", "推送", "进入国赛", "参加国赛"}
+// 晋级/上推 into a higher level). Only markers whose substring is unambiguous in
+// V1 (no natural-language relation parsing) are kept. Bare "推荐"/"上报"/"推送"
+// are NOT strong on their own: "推荐参赛者关注官网"/"统一推送给参赛者"/"上报材料"
+// describe an ordinary announcement, not a multi-level progression. Bare "选拔"
+// is likewise excluded ("选拔赛"/"选拔优秀选手"). "报名参加" is excluded because it
+// usually means ordinary direct signup, the opposite of not_applicable.
+// "参加国赛" is retained only under the existing >=2 levels gate.
+var strongProgressionMarkers = []string{"晋级", "上推", "进入国赛", "参加国赛"}
+
+// narrowRecommendationMarkers are the only acceptable 推荐-forms: an explicit
+// up-push of a work/participant into the national level. Bare "推荐" is never
+// strong enough on its own.
+var narrowRecommendationMarkers = []string{"推荐参加国赛", "推荐进入国赛", "推荐至国赛"}
 
 // centralizedSignupMarkers express explicit unified / direct signup semantics
-// that contradict not_applicable. If any of these appears in the evidence, the
-// evidence can never support not_applicable, even if it also contains level and
-// progression markers. This is the contradiction guard: when in doubt return
-// unknown, never vote not_applicable.
+// that contradict not_applicable. If any of these appears in the evidence (or the
+// whole document, see deriveRegistrationWindowApplicabilityFact), the fact can
+// never support not_applicable, even if it also contains level and progression
+// markers. This is the contradiction guard: when in doubt return unknown, never
+// vote not_applicable.
 var centralizedSignupMarkers = []string{
 	"统一报名", "统一网上报名", "官网统一报名", "统一官网报名", "全国统一报名",
 	"直接报名", "开放报名", "统一在线报名", "统一通过官网",
@@ -482,7 +500,7 @@ var centralizedSignupMarkers = []string{
 // strong "no unified registration window" gate. It requires ALL of:
 //   A. no explicit centralized/direct signup wording (contradiction guard);
 //   B. at least TWO distinct competition levels (school / provincial / national);
-//   C. at least one strong up-push progression marker.
+//   C. at least one strong up-push progression marker (or a narrow 推荐-phrase).
 //
 // This deliberately errs toward false-negative: a single level token plus a
 // generic progression token (e.g. "全国赛报名参加") is never enough, because that
@@ -500,7 +518,7 @@ func registrationProgressionEvidence(text string) bool {
 	if levels < 2 {
 		return false
 	}
-	return containsAnySubstr(text, strongProgressionMarkers)
+	return containsAnySubstr(text, strongProgressionMarkers) || containsAnySubstr(text, narrowRecommendationMarkers)
 }
 
 // containsAnySubstr reports whether text contains any of the substrings.

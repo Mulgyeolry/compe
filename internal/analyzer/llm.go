@@ -326,7 +326,13 @@ type 只能是 competition_previewed、registration_announced、registration_ope
 顶层必须且只能包含：schema_version、identity、facts、events。
 schema_version 固定为 %q。
 identity 必须且只能包含：name、series、edition、organizer、track、group、scope、region。
-facts 必须且只能包含：published_at、registration_start、registration_end、competition_start、competition_end、team_requirement、fee、eligibility、competition_contents。
+facts 必须且只能包含：published_at、registration_start、registration_end、competition_start、competition_end、team_requirement、fee、eligibility、competition_contents、registration_window_applicability。
+
+registration_window_applicability 字段说明（保守规则）：
+- V1 只允许 value 为 "not_applicable"，或该字段整体留空。
+- 只有当文档明确说明：普通参赛者必须经过至少两个赛事层级之间的晋级/上推/推荐进入更高层级，因此不存在面对普通参赛者的统一 canonical 报名窗口时，才提出 not_applicable。
+- 以下情况必须全部留空：存在统一官网报名、存在统一网上报名、存在统一通过官网报名、存在直接报名、证据不确定、只是多个赛区、只是地方赛事、只是学校参与、只是推荐关注官网。
+- 严禁输出 centralized、decentralized、hybrid 等值；不要要求模型输出 applicable。
 
 候选标题：%s
 候选摘要：%s
@@ -679,26 +685,35 @@ func betterFact(current, candidate AIFact) bool {
 }
 
 // lifecycleFactConflict reports whether any unresolved conflict touches the
-// identity or lifecycle date facts that gate lifecycle state transitions.
+// identity or lifecycle facts that gate lifecycle state transitions. This
+// includes registration_window_applicability: a multi-segment tie on this field
+// must not advance it, because not_applicable closes future
+// registration_start/end research.
 func lifecycleFactConflict(fields []string) bool {
 	for _, field := range fields {
 		switch field {
 		case "identity.name", "identity.series", "identity.edition",
 			"facts.registration_start", "facts.registration_end",
-			"facts.competition_start", "facts.competition_end":
+			"facts.competition_start", "facts.competition_end",
+			"facts.registration_window_applicability":
 			return true
 		}
 	}
 	return false
 }
 
-// clearLifecycleFacts removes the lifecycle date facts and all events from a
-// partially analyzed result so no premature notice is sent.
+// clearLifecycleFacts removes the lifecycle date facts, the lifecycle-gating
+// registration_window_applicability fact, and all events from a partially
+// analyzed result so no premature notice is sent. registration_window_applicability
+// is withheld on partial analysis because a failed segment may have contained
+// contradictory centralized/direct signup evidence (统一报名/直接报名), so V1 keeps
+// it unknown.
 func clearLifecycleFacts(result *AIResult) {
 	result.Facts.RegistrationStart = AIFact{}
 	result.Facts.RegistrationEnd = AIFact{}
 	result.Facts.CompetitionStart = AIFact{}
 	result.Facts.CompetitionEnd = AIFact{}
+	result.Facts.RegistrationWindowApplicability = AIFact{}
 	result.Events = nil
 }
 

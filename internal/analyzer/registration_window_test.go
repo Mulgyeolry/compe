@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -308,5 +309,247 @@ func TestRegistrationWindowNotApplicableRejectsWrongEdition(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("audit must include an edition rejection for %s; rejections=%+v", "facts.registration_window_applicability", competition.ExtractionAudit.Rejections)
+	}
+}
+
+// TestRegistrationWindowNotApplicableRejectsGenericRecommendation is a false-positive
+// regression: "推荐参赛者关注官方网站" is a generic recommendation, not an up-push
+// progression. Bare "推荐" was removed from strongProgressionMarkers, so a
+// multi-level sentence with only generic 推荐 must FAIL.
+func TestRegistrationWindowNotApplicableRejectsGenericRecommendation(t *testing.T) {
+	doc := model.Document{
+		Title: "XX大赛2026通知",
+		URL:   "https://example.com/generic-rec",
+		Text:  "赛事设校赛、省赛和国赛，推荐参赛者关注官方网站获取通知。",
+	}
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, shanghai)
+	ai := AIFact{
+		Value:      "not_applicable",
+		Evidence:   "赛事设校赛、省赛和国赛，推荐参赛者关注官方网站获取通知",
+		Edition:    "2026",
+		Confidence: "high",
+	}
+	var rejections []model.AnalysisRejection
+	if fact, ok := deriveRegistrationWindowApplicabilityFact(ai, doc, model.TrustHigh, now, &rejections); ok {
+		t.Fatalf("generic 推荐 must NOT become not_applicable, got %+v", fact)
+	}
+	if len(rejections) == 0 {
+		t.Fatal("must record a rejection for generic recommendation evidence")
+	}
+}
+
+// TestRegistrationWindowNotApplicableRejectsBarePush is a false-positive regression:
+// "统一推送给参赛者" is an announcement, not a multi-level progression. Bare "推送"
+// was removed, so it must FAIL.
+func TestRegistrationWindowNotApplicableRejectsBarePush(t *testing.T) {
+	doc := model.Document{
+		Title: "XX大赛2026通知",
+		URL:   "https://example.com/bare-push",
+		Text:  "校赛、省赛、国赛信息将统一推送给参赛者。",
+	}
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, shanghai)
+	ai := AIFact{
+		Value:      "not_applicable",
+		Evidence:   "校赛、省赛、国赛信息将统一推送给参赛者",
+		Edition:    "2026",
+		Confidence: "high",
+	}
+	var rejections []model.AnalysisRejection
+	if fact, ok := deriveRegistrationWindowApplicabilityFact(ai, doc, model.TrustHigh, now, &rejections); ok {
+		t.Fatalf("bare 推送 must NOT become not_applicable, got %+v", fact)
+	}
+	if len(rejections) == 0 {
+		t.Fatal("must record a rejection for bare 推送 evidence")
+	}
+}
+
+// TestRegistrationWindowNotApplicableRejectsContradictionAcrossDocument is a
+// whole-document contradiction regression: one part states 校赛→省赛→国赛 with 上推,
+// but another part of the same document states a unified online signup. Even though
+// the AI evidence snippet cites only the hierarchy+progression part, not_applicable
+// must be withheld because the strong negative fact contradicts same-document
+// centralized signup evidence.
+func TestRegistrationWindowNotApplicableRejectsContradictionAcrossDocument(t *testing.T) {
+	doc := model.Document{
+		Title: "4C2026通知-中国大学生计算机设计大赛",
+		URL:   "https://jsjds.blcu.edu.cn/info/1041/2274.htm",
+		Text:  "大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品。所有参赛者统一通过官网报名。",
+	}
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, shanghai)
+	ai := AIFact{
+		Value: "not_applicable",
+		// Evidence cites ONLY the hierarchy+progression part, not the signup part.
+		Evidence:   "大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品",
+		Edition:    "2026",
+		Confidence: "high",
+	}
+	var rejections []model.AnalysisRejection
+	if fact, ok := deriveRegistrationWindowApplicabilityFact(ai, doc, model.TrustHigh, now, &rejections); ok {
+		t.Fatalf("whole-document centralized signup must override snippet evidence, got %+v", fact)
+	}
+	found := false
+	for _, rejection := range rejections {
+		if strings.Contains(rejection.Reason, "unified/direct signup") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("must record a whole-document contradiction rejection; rejections=%+v", rejections)
+	}
+}
+
+// TestEnrichPromptSupportsRegistrationWindowApplicability verifies the production
+// extraction prompt actually instructs the model about the new field: it must be in
+// the facts allowed list, only not_applicable/empty are permitted, and unified/direct
+// signup must be left empty.
+func TestEnrichPromptSupportsRegistrationWindowApplicability(t *testing.T) {
+	location := time.FixedZone("CST", 8*3600)
+	requests := make(chan string, 16)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- string(body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), "只判断") {
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			return
+		}
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","identity":{"edition":{"value":"2026","evidence":"4C2026通知-中国大学生计算机设计大赛","edition":"2026","confidence":"high"}},"events":[]}`)))
+	}))
+	defer server.Close()
+	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	analysis := New(config.Config{Location: location})
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, location)
+
+	doc := model.Document{
+		Title: "4C2026通知-中国大学生计算机设计大赛",
+		URL:   "https://jsjds.blcu.edu.cn/info/1041/2274.htm",
+		Text:  "大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品。",
+	}
+	if _, _, err := analysis.Analyze(context.Background(), model.Candidate{Title: doc.Title}, doc, model.TrustHigh, now); err != nil {
+		t.Fatal(err)
+	}
+	// Collect request bodies: skip the tiny classification request, keep the extraction one.
+	var extractionPrompt string
+	for len(requests) > 0 {
+		body := <-requests
+		if strings.Contains(body, "只判断") {
+			continue
+		}
+		extractionPrompt = body
+	}
+	if extractionPrompt == "" {
+		t.Fatal("no extraction request captured")
+	}
+	if !strings.Contains(extractionPrompt, "registration_window_applicability") {
+		t.Fatalf("extraction prompt must mention registration_window_applicability")
+	}
+	// The request body is a JSON-encoded string, so inner quotes appear escaped
+	// as \". Match the token without the surrounding quotes.
+	if !strings.Contains(extractionPrompt, "not_applicable") {
+		t.Fatalf("extraction prompt must mention the only allowed value not_applicable")
+	}
+	// The prompt must explicitly instruct leave-empty for unified/direct signup
+	// cases and must never request centralized/decentralized/hybrid/applicable.
+	for _, phrase := range []string{"统一官网报名", "直接报名", "统一通过官网", "centralized", "decentralized", "hybrid", "applicable"} {
+		if !strings.Contains(extractionPrompt, phrase) {
+			t.Fatalf("extraction prompt must constrain %q to leave-empty, but it does not mention it", phrase)
+		}
+	}
+	if !strings.Contains(extractionPrompt, "registration_start") {
+		t.Fatalf("extraction prompt must still list registration_start")
+	}
+}
+
+// TestPartialEnrichmentWithholdsRegistrationWindowApplicability verifies that when
+// one selected segment extraction fails, the applicability fact proposed by a
+// successful segment is withheld from canonical (V1 keeps it unknown), because the
+// failed segment may have carried contradictory centralized/direct signup evidence.
+func TestPartialEnrichmentWithholdsRegistrationWindowApplicability(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), "只判断") {
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			return
+		}
+		if strings.Contains(string(body), "seg-b") {
+			http.Error(w, "segment b extraction failed", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","identity":{"edition":{"value":"2026","evidence":"4C2026通知-中国大学生计算机设计大赛","edition":"2026","confidence":"high"}},"facts":{"registration_window_applicability":{"value":"not_applicable","evidence":"大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品","edition":"2026","confidence":"high"}},"events":[]}`)))
+	}))
+	defer server.Close()
+	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	analysis := New(config.Config{Location: shanghai})
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, shanghai)
+
+	doc := model.Document{
+		Title: "4C2026通知-中国大学生计算机设计大赛",
+		URL:   "https://jsjds.blcu.edu.cn/info/1041/2274.htm",
+		Text:  "大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品。报名时间请关注各省级赛区后续通知。",
+		Segments: []model.DocumentSegment{
+			{ID: "seg-a", Kind: "text", Text: "大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品。"},
+			{ID: "seg-b", Kind: "text", Text: "报名时间请关注各省级赛区后续通知。"},
+		},
+	}
+	competition, _, err := analysis.Analyze(context.Background(), model.Candidate{Title: doc.Title}, doc, model.TrustHigh, now)
+	// Partial enrichment returns a PendingCandidateError (expected here) while
+	// still preserving the stable fields; verify the applicability fact is
+	// withheld regardless.
+	if err != nil && !IsPendingCandidateError(err) {
+		t.Fatal(err)
+	}
+	if _, ok := competition.Facts[model.FactRegistrationWindowApplicability]; ok {
+		t.Fatalf("partial enrichment must withhold registration_window_applicability; facts=%+v", competition.Facts)
+	}
+}
+
+// TestRegistrationWindowApplicabilityConflictWithheld verifies that an unresolved
+// cross-segment tie on the applicability field (two successful segments proposing
+// not_applicable for different editions) must be withheld like a lifecycle date
+// conflict, leaving canonical unknown.
+func TestRegistrationWindowApplicabilityConflictWithheld(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), "只判断") {
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","document_type":"official_announcement","source_role":"official_primary","computer_related":true,"competition_announcement":true,"rejection_reason":""}`)))
+			return
+		}
+		if strings.Contains(string(body), "seg-b") {
+			_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","identity":{"edition":{"value":"2026","evidence":"4C2026通知-中国大学生计算机设计大赛","edition":"2026","confidence":"high"}},"facts":{"registration_window_applicability":{"value":"not_applicable","evidence":"大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品","edition":"2025","confidence":"high"}},"events":[]}`)))
+			return
+		}
+		_, _ = w.Write([]byte(chatCompletionResponse(`{"schema_version":"competition-audit-v12","identity":{"edition":{"value":"2026","evidence":"4C2026通知-中国大学生计算机设计大赛","edition":"2026","confidence":"high"}},"facts":{"registration_window_applicability":{"value":"not_applicable","evidence":"大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品","edition":"2026","confidence":"high"}},"events":[]}`)))
+	}))
+	defer server.Close()
+	t.Setenv("OPENAI_BASE_URL", server.URL+"/v1")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	analysis := New(config.Config{Location: shanghai})
+	now := time.Date(2026, 8, 4, 20, 0, 0, 0, shanghai)
+
+	doc := model.Document{
+		Title: "4C2026通知-中国大学生计算机设计大赛",
+		URL:   "https://jsjds.blcu.edu.cn/info/1041/2274.htm",
+		Text:  "大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品。报名时间请关注各省级赛区后续通知。",
+		Segments: []model.DocumentSegment{
+			{ID: "seg-a", Kind: "text", Text: "大赛以校级赛、省级赛、国家级赛三级竞赛形式开展，国赛只接受省级赛上推的参赛作品。"},
+			{ID: "seg-b", Kind: "text", Text: "报名时间请关注各省级赛区后续通知。"},
+		},
+	}
+	competition, _, err := analysis.Analyze(context.Background(), model.Candidate{Title: doc.Title}, doc, model.TrustHigh, now)
+	// A cross-segment conflict surfaces as a PendingCandidateError (expected);
+	// verify the applicability fact is withheld regardless.
+	if err != nil && !IsPendingCandidateError(err) {
+		t.Fatal(err)
+	}
+	if _, ok := competition.Facts[model.FactRegistrationWindowApplicability]; ok {
+		t.Fatalf("cross-segment applicability conflict must be withheld; facts=%+v", competition.Facts)
 	}
 }
