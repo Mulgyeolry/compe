@@ -698,3 +698,59 @@ func TestEvidenceExtractorRejectsWrongDocumentEdition(t *testing.T) {
 		t.Fatalf("wrong-document edition must be rejected, got %+v", result.Facts)
 	}
 }
+
+// TestEvidenceExtractorAcceptsNumericConfidence verifies a real LLM output that
+// emits confidence as a JSON number does not fail the strict JSON decode: the
+// numeric confidence is accepted and normalized to "" (non-authoritative), while
+// the deterministic date/evidence/edition validation still runs normally.
+func TestEvidenceExtractorAcceptsNumericConfidence(t *testing.T) {
+	req := evidenceRequest() // Document title/URL bind to 2026
+	req.Document.Text = "报名截止时间为2026年4月9日。"
+	payload := `{"schema_version":"research-evidence-v1","facts":[{"field":"registration_end","value":"2026年4月9日","evidence":"报名截止时间为2026年4月9日","edition":"2026","confidence":0.92}]}`
+	analyzer := evidenceTestAnalyzer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatCompletionResponse(payload)))
+	})
+	result, err := analyzer.ExtractEvidenceFacts(context.Background(), req)
+	if err != nil {
+		t.Fatalf("numeric confidence must not fail the extractor: %v", err)
+	}
+	// The fact is accepted via deterministic validation; its confidence is "".
+	if len(result.Facts) != 1 {
+		t.Fatalf("expected 1 accepted fact, got %+v", result.Facts)
+	}
+	got := result.Facts[0]
+	if got.Date.Year() != 2026 || got.Date.Month() != 4 || got.Date.Day() != 9 {
+		t.Fatalf("date must still be deterministically parsed, got %v", got.Date)
+	}
+	if got.Confidence != "" {
+		t.Fatalf("numeric confidence must normalize to empty (non-authoritative), got %q", got.Confidence)
+	}
+}
+
+// TestEvidenceExtractorRejectsInvalidConfidenceStructure verifies object / array /
+// bool confidence values are still rejected by the strict JSON decode, so the
+// confidence tolerance only covers string / number / null.
+func TestEvidenceExtractorRejectsInvalidConfidenceStructure(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		conf    string
+	}{
+		{"object", `{}`},
+		{"array", `[]`},
+		{"bool", `true`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := evidenceRequest()
+			payload := `{"schema_version":"research-evidence-v1","facts":[{"field":"registration_end","value":"2026年4月9日","evidence":"报名截止时间为2026年4月9日","edition":"2026","confidence":` + tc.conf + `}]}`
+			analyzer := evidenceTestAnalyzer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(chatCompletionResponse(payload)))
+			})
+			_, err := analyzer.ExtractEvidenceFacts(context.Background(), req)
+			if err == nil {
+				t.Fatalf("invalid confidence structure %s must error", tc.conf)
+			}
+		})
+	}
+}
