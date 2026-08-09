@@ -42,7 +42,7 @@ func (s *Service) BackfillUser(ctx context.Context, userID int64) (int, error) {
 				return inserted, err
 			}
 		}
-		events := backfillEvents(competition, now, s.cfg.Location, s.freshnessWindow())
+		events := backfillEvents(competition, s.cfg.Location)
 		decision, err := s.store.GetUserCompetitionDecision(ctx, userID, competition.ID)
 		if err != nil {
 			return inserted, err
