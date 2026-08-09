@@ -193,24 +193,33 @@ func TestIsCurrentEditionFallsBackToFirstSeenWithoutPublishDate(t *testing.T) {
 	}
 }
 
-func TestCurrentSpecificAnnouncementCanNotifyWithUnknownRegistration(t *testing.T) {
+// TestPendingUnknownCompetitionDoesNotNotifyThenActionableNotifies proves the
+// business rule: a newly discovered competition with both phases Unknown is saved
+// to canonical but produces NO notification; once it is promoted to a concrete
+// actionable phase (RegistrationOpen) the normal registration_opened event fires.
+func TestPendingUnknownCompetitionDoesNotNotifyThenActionableNotifies(t *testing.T) {
 	now := time.Date(2026, 8, 4, 20, 0, 0, 0, time.FixedZone("CST", 8*60*60))
-	competition := model.Competition{
+	pending := model.Competition{
 		Name:        "2026年全国大学生云原生开发大赛通知",
 		Content:     "面向全国高校的软件开发与云原生赛事",
 		OfficialURL: "https://contest.example.org/2026/notice",
 		Trust:       model.TrustMedium,
 	}
-	events := changeEvents(model.Competition{}, competition, true, now, 90*24*time.Hour)
-	if len(events) != 1 || events[0].Type != "competition_discovered" {
-		t.Fatalf("unknown-state current announcement did not create discovery event: %#v", events)
+	// Pending (Unknown/Unknown) new discovery: no notification event.
+	if events := changeEvents(model.Competition{}, pending, true, now, 90*24*time.Hour); len(events) != 0 {
+		t.Fatalf("pending Unknown/Unknown discovery must not notify, got %#v", events)
 	}
-	if !subscription.EventDeliverable(competition, events[0].Type, model.ParticipationUndecided, now) {
-		t.Fatal("discovery event was not deliverable")
+
+	// Now the same competition is confirmed into RegistrationOpen: the actionable
+	// notification chain still works and fires registration_opened.
+	opened := pending
+	opened.RegistrationPhase = model.RegistrationOpen
+	events := changeEvents(pending, opened, false, now, 90*24*time.Hour)
+	if len(events) != 1 || events[0].Type != "registration_opened" {
+		t.Fatalf("Unknown->open transition must fire registration_opened, got %#v", events)
 	}
-	filtered := eventsForCurrentState(competition, events)
-	if len(filtered) != 1 || filtered[0].Type != "competition_discovered" {
-		t.Fatalf("discovery event was removed from current state: %#v", filtered)
+	if !subscription.EventDeliverable(opened, events[0].Type, model.ParticipationUndecided, now) {
+		t.Fatal("registration_opened event was not deliverable")
 	}
 }
 
@@ -227,10 +236,11 @@ func TestDiscoveryDoesNotNotifyListingOrPastEdition(t *testing.T) {
 	}
 }
 
-func TestDiscoveryNotifiesYearlessCompetitionSeenRecently(t *testing.T) {
+func TestDiscoverySuppressesYearlessCompetitionAsPending(t *testing.T) {
 	now := time.Date(2026, 8, 4, 20, 0, 0, 0, time.FixedZone("CST", 8*60*60))
-	// Title has no year, but the page was first seen within the window, so it
-	// is a current announcement rather than an archived previous-year page.
+	// Title has no year and the page is Unknown/Unknown, so it is a pending
+	// ("待确认") competition: even when first seen within the freshness window it
+	// is saved but must NOT produce a discovery notification.
 	competition := model.Competition{
 		Name:        "腾讯云黑客松官网",
 		Content:     "面向开发者开放的云端黑客松赛事",
@@ -239,8 +249,8 @@ func TestDiscoveryNotifiesYearlessCompetitionSeenRecently(t *testing.T) {
 		FirstSeen:   now.AddDate(0, 0, -2),
 	}
 	events := changeEvents(model.Competition{}, competition, true, now, 90*24*time.Hour)
-	if len(events) != 1 || events[0].Type != "competition_discovered" {
-		t.Fatalf("recently seen yearless competition did not create discovery event: %#v", events)
+	if len(events) != 0 {
+		t.Fatalf("pending Unknown/Unknown competition must not notify, got %#v", events)
 	}
 }
 

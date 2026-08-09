@@ -201,7 +201,7 @@ func TestRegistrationMailFailureIsRetriedWithoutDuplicate(t *testing.T) {
 	}
 }
 
-func TestLLMFailureStoresAndNotifiesPendingHighConfidenceCompetition(t *testing.T) {
+func TestLLMFailureStoresPendingCompetitionWithoutNotification(t *testing.T) {
 	var llmCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		llmCalls++
@@ -221,8 +221,25 @@ func TestLLMFailureStoresAndNotifiesPendingHighConfidenceCompetition(t *testing.
 	if err := app.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if llmCalls == 0 || sender.count() != 1 || !strings.Contains(sender.mails[0].body, "发现新赛事（报名状态待确认）") {
-		t.Fatalf("pending high-confidence competition was not retained and delivered: calls=%d mails=%#v", llmCalls, sender.mails)
+	// The LLM genuinely failed, but the canonical competition is still retained.
+	if llmCalls == 0 {
+		t.Fatal("expected simulated model outage to be hit")
+	}
+	// The retained canonical is a pending ("待确认") competition: both phases
+	// Unknown, so it is saved but must NOT notify or email anyone.
+	list, err := database.ListCompetitions(context.Background())
+	if err != nil {
+		t.Fatalf("list canonical: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("pending canonical must be retained, got %d competitions", len(list))
+	}
+	saved := list[0]
+	if saved.RegistrationPhase != model.RegistrationUnknown || saved.CompetitionPhase != model.CompetitionUnknown {
+		t.Fatalf("pending canonical must be Unknown/Unknown, got %s/%s", saved.RegistrationPhase, saved.CompetitionPhase)
+	}
+	if sender.count() != 0 {
+		t.Fatalf("pending Unknown/Unknown competition must not notify, got %d mails", sender.count())
 	}
 }
 

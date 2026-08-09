@@ -245,12 +245,14 @@ func TestReconcileRecoversRegistrationOpenedOnBootstrap(t *testing.T) {
 	}
 }
 
-// TestReconcileRecoversCompetitionDiscovered proves reconciliation restores the
-// competition_discovered event for a current unknown/unknown announcement after
-// the system is already bootstrapped (normal-operation recovery).
-func TestReconcileRecoversCompetitionDiscovered(t *testing.T) {
-	// A year-less, dateless announcement is analysed as unknown/unknown but is a
-	// current discoverable announcement, so it qualifies for competition_discovered.
+// TestReconcileDoesNotBackfillPendingCompetitionDiscovered proves that a
+// persisted Unknown/Unknown ("待确认") competition is NOT re-pushed as
+// competition_discovered on a restart/reconcile: after bootstrapping, purging
+// events, and re-running, no discovered event and no pending notification are
+// created for the pending competition.
+func TestReconcileDoesNotBackfillPendingCompetitionDiscovered(t *testing.T) {
+	// A year-less, dateless announcement is analysed as Unknown/Unknown: it is a
+	// pending competition saved to canonical but must never be discovered.
 	doc := model.Document{
 		Title: "华为软件精英挑战赛官网",
 		URL:   testPageBase,
@@ -269,31 +271,37 @@ func TestReconcileRecoversCompetitionDiscovered(t *testing.T) {
 	if err := app.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM competition_events WHERE event_type='competition_discovered'"); got != 1 {
-		t.Fatalf("initial competition_discovered events=%d, want 1", got)
+	// The pending Unknown/Unknown competition is retained in canonical but is not
+	// discovered and produces no notification.
+	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM competition_events WHERE event_type='competition_discovered'"); got != 0 {
+		t.Fatalf("initial competition_discovered events=%d, want 0 (pending must not be discovered)", got)
+	}
+	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM user_notifications"); got != 0 {
+		t.Fatalf("initial user_notifications=%d, want 0 (pending must not notify)", got)
 	}
 
-	// Keep the system bootstrapped; only the events and notifications are lost,
-	// which mirrors a crash during a normal (post-bootstrap) scan.
+	// Keep the system bootstrapped; purge events/notifications to mirror a crash
+	// and re-run the reconcile/backfill path.
 	purgeCommittedEvents(t, cfg.DBPath, false)
 
 	if err := app.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM competition_events WHERE event_type='competition_discovered'"); got != 1 {
-		t.Fatalf("reconciled competition_discovered events=%d, want 1", got)
+	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM competition_events WHERE event_type='competition_discovered'"); got != 0 {
+		t.Fatalf("reconciled competition_discovered events=%d, want 0 (no backfill for pending)", got)
 	}
-	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM user_notifications"); got != 1 {
-		t.Fatalf("reconciled user_notifications=%d, want 1", got)
+	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM user_notifications"); got != 0 {
+		t.Fatalf("reconciled user_notifications=%d, want 0 (no backfill notification)", got)
 	}
 
+	// A third run stays idempotent: still nothing emitted.
 	if err := app.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM competition_events WHERE event_type='competition_discovered'"); got != 1 {
-		t.Fatalf("post-reconcile competition_discovered events=%d, want 1 (idempotent)", got)
+	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM competition_events WHERE event_type='competition_discovered'"); got != 0 {
+		t.Fatalf("post-reconcile competition_discovered events=%d, want 0 (idempotent)", got)
 	}
-	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM user_notifications"); got != 1 {
-		t.Fatalf("post-reconcile user_notifications=%d, want 1 (idempotent)", got)
+	if got := countRows(t, cfg.DBPath, "SELECT COUNT(*) FROM user_notifications"); got != 0 {
+		t.Fatalf("post-reconcile user_notifications=%d, want 0 (idempotent)", got)
 	}
 }

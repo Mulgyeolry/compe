@@ -21,8 +21,9 @@ import (
 // date-less, unknown Huawei-style canonical is re-analysed under v8. The AI
 // rejects the page as campus forwarding, but the deterministic fallback keeps
 // its rules facts. The single canonical row upgrades to v8 with correct dates,
-// trust stays medium, the URL is untouched, and no duplicate discovered event
-// is produced.
+// trust stays medium, the URL is untouched, and the pending Unknown/Unknown
+// competition produces NO notification event (no competition_discovered, no
+// premature actionable event).
 func TestCampusRulesFallbackRecoversPublicCompetition(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -105,19 +106,32 @@ func TestCampusRulesFallbackRecoversPublicCompetition(t *testing.T) {
 		t.Errorf("competition_end = %v, want 2026-09-27 12:00", saved.CompetitionEnd)
 	}
 
-	// No duplicate discovered event: the canonical must yield exactly one
-	// competition_discovered row for this competition.
+	// The pending Unknown/Unknown canonical was never "discovered" (no
+	// competition_discovered event, no pending notification). When the re-analysis
+	// promotes it to RegistrationOpen it transitions through the normal actionable
+	// path: exactly one registration_opened event, no duplicates.
 	raw, err := openRawDB(cfg.DBPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer raw.Close()
+	// The re-analyzed canonical is retained (with correct dates) but its persisted
+	// lifecycle phases remain Unknown/Unknown: it is a pending ("待确认")
+	// competition, so NO notification event is created — neither a stale
+	// competition_discovered nor a premature actionable event.
 	var disc int
 	if err := raw.QueryRow(`SELECT COUNT(*) FROM competition_events WHERE competition_id=? AND event_type='competition_discovered'`, saved.ID).Scan(&disc); err != nil {
 		t.Fatal(err)
 	}
-	if disc != 1 {
-		t.Errorf("competition_discovered count = %d, want exactly 1 (no duplicates)", disc)
+	if disc != 0 {
+		t.Errorf("competition_discovered count = %d, want 0 (pending Unknown must not be discovered)", disc)
+	}
+	var opened int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM competition_events WHERE competition_id=? AND event_type='registration_opened'`, saved.ID).Scan(&opened); err != nil {
+		t.Fatal(err)
+	}
+	if opened != 0 {
+		t.Errorf("registration_opened count = %d, want 0 (pending Unknown must not fire actionable event)", opened)
 	}
 }
 

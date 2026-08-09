@@ -324,7 +324,7 @@ func (s *Service) reconcileEvents(ctx context.Context, now time.Time, users []mo
 		if !reconcileEligible(competition, now, freshness) {
 			continue
 		}
-		events := eventsForCurrentState(competition, deduplicateEvents(backfillEvents(competition, now, s.cfg.Location, freshness)))
+		events := eventsForCurrentState(competition, deduplicateEvents(backfillEvents(competition, s.cfg.Location)))
 		if err := s.commitEventsForUsers(ctx, now, users, competition, events); err != nil {
 			return err
 		}
@@ -480,9 +480,12 @@ func changeEvents(old, current model.Competition, isNew bool, now time.Time, fre
 	}
 	var events []model.Event
 	if isNew {
-		if current.RegistrationPhase == model.RegistrationUnknown && current.CompetitionPhase == model.CompetitionUnknown {
-			events = append(events, model.Event{Type: "competition_discovered", Key: "discovered"})
-		}
+		// A newly discovered competition whose phases are both Unknown is
+		// "待确认" (pending confirmation): it is saved to canonical, appears in
+		// the web "待确认赛事" list, but produces NO notification event and NO
+		// email. Once a later scan or Evidence Research promotes it to a
+		// concrete phase (preview/open/upcoming/ongoing), the actionable events
+		// below fire normally.
 		switch current.RegistrationPhase {
 		case model.RegistrationPreview:
 			events = append(events, model.Event{Type: "preview_detected", Key: "preview"})
@@ -518,12 +521,12 @@ func changeEvents(old, current model.Competition, isNew bool, now time.Time, fre
 	return events
 }
 
-func backfillEvents(competition model.Competition, now time.Time, _ *time.Location, freshness time.Duration) []model.Event {
+func backfillEvents(competition model.Competition, _ *time.Location) []model.Event {
 	model.NormalizeLifecycle(&competition)
 	var events []model.Event
-	if competition.RegistrationPhase == model.RegistrationUnknown && competition.CompetitionPhase == model.CompetitionUnknown && discoverableAnnouncement(competition, now, freshness) {
-		events = append(events, model.Event{Type: "competition_discovered", Key: "discovered"})
-	}
+	// Deliberately NO competition_discovered backfill for an Unknown/Unknown
+	// competition: on a restart/reconcile it must not re-push a pending
+	// ("待确认") competition that was never confirmed into an actionable phase.
 	switch competition.RegistrationPhase {
 	case model.RegistrationPreview:
 		events = append(events, model.Event{Type: "preview_detected", Key: "preview"})
