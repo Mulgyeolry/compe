@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type Trust string
 
@@ -103,20 +106,59 @@ type FactEvidence struct {
 }
 
 const (
-	FactEdition           = "edition"
-	FactOrganizer         = "organizer"
-	FactRegistrationState = "registration_state"
-	FactCompetitionState  = "competition_state"
-	FactRegistrationStart = "registration_start"
-	FactRegistrationEnd   = "registration_end"
-	FactCompetitionStart  = "competition_start"
-	FactCompetitionEnd    = "competition_end"
-	FactTeamRequirement   = "team_requirement"
-	FactFee               = "fee"
-	FactEligibility       = "eligibility"
-	FactContent           = "competition_contents"
-	FactPublishedAt       = "published_at"
+	FactEdition                        = "edition"
+	FactOrganizer                      = "organizer"
+	FactRegistrationState              = "registration_state"
+	FactCompetitionState               = "competition_state"
+	FactRegistrationStart              = "registration_start"
+	FactRegistrationEnd                = "registration_end"
+	FactCompetitionStart               = "competition_start"
+	FactCompetitionEnd                 = "competition_end"
+	FactTeamRequirement                = "team_requirement"
+	FactFee                            = "fee"
+	FactEligibility                    = "eligibility"
+	FactContent                        = "competition_contents"
+	FactPublishedAt                    = "published_at"
+	FactRegistrationWindowApplicability = "registration_window_applicability"
 )
+
+// RegistrationWindowApplicability models whether this canonical Competition has a
+// single, unified registration window that ordinary participants can use to sign
+// up directly. It is deliberately NOT the competition's organizational structure
+// (centralized/decentralized/hybrid): some multi-level competitions still have a
+// unified online signup, while others require school/provincial/regional selection
+// first with no national signup window.
+//
+// Only "not_applicable" is a strong, evidence-backed claim. "unknown" is the safe
+// default and behaves exactly as before (registration_start/end are still
+// researched as gaps). "applicable" is recorded only when strong evidence exists,
+// but V1 focuses on confirming not_applicable; an absent or invalid value is
+// "unknown".
+type RegistrationWindowApplicability string
+
+const (
+	RegistrationWindowUnknown       RegistrationWindowApplicability = "unknown"
+	RegistrationWindowApplicable    RegistrationWindowApplicability = "applicable"
+	RegistrationWindowNotApplicable RegistrationWindowApplicability = "not_applicable"
+)
+
+// RegistrationWindowApplicabilityOf reads the canonical registration-window
+// applicability from the FactRegistrationWindowApplicability fact. A missing,
+// empty or invalid value yields RegistrationWindowUnknown (the safe default).
+func RegistrationWindowApplicabilityOf(competition Competition) RegistrationWindowApplicability {
+	fact, ok := competition.Facts[FactRegistrationWindowApplicability]
+	if !ok {
+		return RegistrationWindowUnknown
+	}
+	switch RegistrationWindowApplicability(strings.TrimSpace(fact.Value)) {
+	case RegistrationWindowApplicable:
+		return RegistrationWindowApplicable
+	case RegistrationWindowNotApplicable:
+		return RegistrationWindowNotApplicable
+	default:
+		return RegistrationWindowUnknown
+	}
+}
 
 // ResearchSource is secondary context used only for qualitative analysis.
 // It must never overwrite official registration facts.

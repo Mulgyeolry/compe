@@ -24,11 +24,21 @@ var evidenceFieldsFixedOrder = []model.EvidenceField{
 // the four date fields; fee, team requirement, eligibility, organizer and any
 // other field are deliberately out of scope. The returned slice is stable:
 // registration_start, registration_end, competition_start, competition_end.
+//
+// When the canonical competition has no unified national registration window
+// (RegistrationWindowNotApplicable), the registration_start / registration_end
+// fields are deliberately NOT reported as gaps: researching them would only ever
+// turn up local/regional/up-push deadlines that must not become the canonical
+// registration window. competition_start / competition_end are unaffected.
 func detectEvidenceGaps(c model.Competition) []model.EvidenceGap {
+	skipRegistration := model.RegistrationWindowApplicabilityOf(c) == model.RegistrationWindowNotApplicable
 	var gaps []model.EvidenceGap
 	dates := []*time.Time{c.RegistrationStart, c.RegistrationEnd, c.CompetitionStart, c.CompetitionEnd}
 	for index, field := range evidenceFieldsFixedOrder {
 		if dates[index] == nil {
+			if skipRegistration && (field == model.EvidenceRegistrationStart || field == model.EvidenceRegistrationEnd) {
+				continue
+			}
 			gaps = append(gaps, model.EvidenceGap{Field: field, Reason: model.ResearchReasonMissing})
 		}
 	}

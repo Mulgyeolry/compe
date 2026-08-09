@@ -471,6 +471,14 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 	if editionFact, ok := deriveCanonicalEditionFact(doc, AIFact{}, trust, now, &rejections); ok {
 		facts[model.FactEdition] = editionFact
 	}
+	// NOTE: FactRegistrationWindowApplicability is intentionally NOT derived on
+	// the deterministic rules-only path. not_applicable closes future
+	// registration_start/end Research (a strong negative fact), so it is only
+	// ever produced from a validated AI proposal whose evidence passes the
+	// deterministic strong gate in deriveRegistrationWindowApplicabilityFact.
+	// Without AI (or when AI proposes nothing) the field stays unknown and
+	// registration remains a researchable gap — a safe false-negative that never
+	// loses a real registration window.
 	competition := model.Competition{
 		EntityKey:            EntityKey(name, organizer),
 		Name:                 name,
@@ -626,6 +634,15 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	if editionFact, ok := deriveCanonicalEditionFact(doc, result.Identity.Edition, base.Trust, now, &editionRejections); ok {
 		base.Facts[model.FactEdition] = editionFact
 	}
+	// Re-derive the canonical registration-window applicability fact from the
+	// validated AI proposal + Document. Only "not_applicable" with strong
+	// hierarchy/progression evidence is persisted; otherwise it stays absent
+	// (unknown), preserving the existing researchable-gap behavior.
+	var appRejections []model.AnalysisRejection
+	if appFact, ok := deriveRegistrationWindowApplicabilityFact(result.Facts.RegistrationWindowApplicability, doc, base.Trust, now, &appRejections); ok {
+		base.Facts[model.FactRegistrationWindowApplicability] = appFact
+	}
+	editionRejections = append(editionRejections, appRejections...)
 	registrationPhase, competitionPhase, evidence := phasesFromAIEvents(model.RegistrationUnknown, model.CompetitionUnknown, result.Events)
 	base.RegistrationPhase = registrationPhase
 	base.CompetitionPhase = competitionPhase
