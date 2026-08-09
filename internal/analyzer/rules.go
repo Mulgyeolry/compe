@@ -459,6 +459,13 @@ func (a *Analyzer) ruleAnalysis(candidate model.Candidate, doc model.Document, t
 	if competitionPhase != model.CompetitionUnknown {
 		putFact(facts, model.FactCompetitionState, string(competitionPhase), string(competitionPhase), evidence, edition, doc.URL, trust, doc.PublishedAtRaw, now)
 	}
+	// Persist a dedicated identity-level edition fact from deterministic
+	// identity evidence (Document.Title year), so a later Evidence Research pass
+	// can determine the canonical edition even when the normalized Name drops it.
+	var rejections []model.AnalysisRejection
+	if editionFact, ok := deriveCanonicalEditionFact(doc, AIFact{}, trust, now, &rejections); ok {
+		facts[model.FactEdition] = editionFact
+	}
 	competition := model.Competition{
 		EntityKey:            EntityKey(name, organizer),
 		Name:                 name,
@@ -600,6 +607,14 @@ func (a *Analyzer) mergeAI(base model.Competition, result AIResult, doc model.Do
 	putAIFact(base.Facts, model.FactPublishedAt, result.Facts.PublishedAt, doc.URL, base.Trust, doc.PublishedAtRaw, now)
 	if _, exists := base.Facts[model.FactPublishedAt]; !exists && doc.PublishedAtRaw != "" {
 		putFact(base.Facts, model.FactPublishedAt, doc.PublishedAtRaw, doc.PublishedAtRaw, doc.PublishedAtRaw, result.Identity.Edition.Value, doc.URL, base.Trust, doc.PublishedAtRaw, now)
+	}
+	// Re-derive the identity-level edition fact from Document + validated AI
+	// identity so the AI merge never drops FactEdition. It is deliberately not a
+	// blind copy of the old map: the edition is re-derived deterministically, and
+	// if it cannot be confirmed it is not saved.
+	base.ExtractionAudit.Rejections = append(base.ExtractionAudit.Rejections, result.Rejections...)
+	if editionFact, ok := deriveCanonicalEditionFact(doc, result.Identity.Edition, base.Trust, now, &base.ExtractionAudit.Rejections); ok {
+		base.Facts[model.FactEdition] = editionFact
 	}
 	registrationPhase, competitionPhase, evidence := phasesFromAIEvents(model.RegistrationUnknown, model.CompetitionUnknown, result.Events)
 	base.RegistrationPhase = registrationPhase

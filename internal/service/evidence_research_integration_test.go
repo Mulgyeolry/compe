@@ -1,9 +1,11 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -201,6 +203,53 @@ func TestEvidenceResearchProductionEnabled(t *testing.T) {
 	}
 	if !foundResolved {
 		t.Fatalf("expected registration_end resolved state, got %+v", states)
+	}
+}
+
+// TestEvidenceResearchObservabilityLogs verifies the minimal research logging:
+// a planning line, a session-started line, and a session-completed line are all
+// emitted for a real session, so an operator can confirm the agent actually ran
+// without relying solely on the DB.
+func TestEvidenceResearchObservabilityLogs(t *testing.T) {
+	cfg := integrationConfig(t, true)
+	collector := &researchToolCollector{
+		researchToolsFake: researchToolsFake{
+			searchFn: func(_ context.Context, _ fetcher.ResearchSearchRequest) ([]fetcher.ResearchSearchResult, error) {
+				return nil, nil
+			},
+		},
+	}
+	// Capture the service logger output.
+	var buf bytes.Buffer
+	database, err := store.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	app := New(cfg, database, collector, analyzer.New(cfg), researchNoopSender{}, logger)
+	app.SetNow(researchNow)
+	ctx := context.Background()
+
+	// A competition with a determinable edition and a missing registration_end gap
+	// so a session actually starts.
+	competition := model.Competition{
+		EntityKey: "research-log-comp",
+		Name:      "2026某某大赛",
+		OfficialURL: "https://example.com/2026",
+		Trust:     model.TrustHigh,
+	}
+	if _, _, err := database.UpsertCompetition(ctx, competition, "test", researchNow()); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.runEvidenceResearchWithTools(ctx, researchNow(), map[int64][]model.Event{}, collector, &researchExtractorFake{}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"evidence research planned", "evidence research session started", "evidence research session completed"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("research observability log %q missing; got:\n%s", want, out)
+		}
 	}
 }
 

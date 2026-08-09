@@ -13,7 +13,7 @@ import (
 	"competition-assistant/internal/model"
 )
 
-const AIAnalyzerVersion = "competition-audit-v10"
+const AIAnalyzerVersion = "competition-audit-v11"
 
 // PendingCandidateError means the page was credible enough to retain as a
 // minimal competition candidate, but AI verification must be retried before
@@ -328,6 +328,76 @@ func normalizeAIConfidence(value string) string {
 	default:
 		return "low"
 	}
+}
+
+// deriveCanonicalEditionFact deterministically derives the competition's
+// identity-level edition from identity-level evidence ONLY, and returns it as a
+// FactEdition (model.FactEdition). It never uses organizer/registration/date/
+// fee/team/content fact editions, published_at, FirstSeen.Year() or now.Year():
+// those describe facts "belonging to an edition", not the edition itself.
+//
+// V1 sources, strongest-first, both must be identity-level:
+//   A. an explicit four-digit year token in the Document.Title — the Evidence is
+//      the title itself (real page content);
+//   B. a validated AI identity.edition — its Value must be an explicit four-digit
+//      year Y, its Evidence must contain that same Y, and the Evidence must have
+//      passed sanitizeAIFact (real in the Document).
+//
+// If title year and AI edition are both present but disagree, neither is chosen
+// and the fact is not saved (a rejection is recorded). The returned bool reports
+// whether a fact was produced.
+func deriveCanonicalEditionFact(doc model.Document, aiEdition AIFact, trust model.Trust, observedAt time.Time, rejections *[]model.AnalysisRejection) (model.FactEvidence, bool) {
+	titleYear := yearIn(doc.Title)
+
+	// Validate AI identity.edition deterministically: explicit year in Value,
+	// same year present in Evidence, and evidence real in the document.
+	aiYear := 0
+	aiEditionOK := false
+	var aiEditionSanitized AIFact
+	if strings.TrimSpace(aiEdition.Value) != "" {
+		aiEditionSanitized = sanitizeAIFact("edition", aiEdition, normalize(doc.Title+" "+doc.Text), rejections)
+		if aiEditionSanitized.Value != "" {
+			if y := yearIn(aiEditionSanitized.Value); y != 0 && yearIn(aiEditionSanitized.Evidence) == y {
+				aiYear = y
+				aiEditionOK = true
+			} else {
+				// The model claimed an edition its evidence cannot support: record
+				// a rejection so a relabel attempt is observable.
+				*rejections = append(*rejections, model.AnalysisRejection{Field: string(model.FactEdition), Reason: "model edition not supported by its evidence", Value: aiEditionSanitized.Value})
+			}
+		}
+	}
+
+	year := 0
+	evidence := ""
+	switch {
+	case titleYear != 0 && aiEditionOK:
+		if titleYear != aiYear {
+			*rejections = append(*rejections, model.AnalysisRejection{Field: string(model.FactEdition), Reason: "document title edition conflicts with model edition", Value: fmt.Sprintf("%d vs %d", titleYear, aiYear)})
+			return model.FactEvidence{}, false
+		}
+		year = titleYear
+		evidence = strings.TrimSpace(doc.Title)
+	case titleYear != 0:
+		year = titleYear
+		evidence = strings.TrimSpace(doc.Title)
+	case aiEditionOK:
+		year = aiYear
+		evidence = aiEditionSanitized.Evidence
+	default:
+		return model.FactEvidence{}, false
+	}
+
+	yearStr := strconv.Itoa(year)
+	return model.FactEvidence{
+		Value:      yearStr,
+		Raw:        yearStr,
+		Evidence:   normalize(evidence),
+		Edition:    yearStr,
+		SourceURL:  strings.TrimSpace(doc.URL),
+		Confidence: computedFactConfidence(trust, evidence, yearStr, doc.PublishedAtRaw),
+		ObservedAt: observedAt,
+	}, true
 }
 
 func validDocumentType(value AIDocumentType) bool {

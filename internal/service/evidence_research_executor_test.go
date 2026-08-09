@@ -193,6 +193,46 @@ func TestEvidenceResearchEdition(t *testing.T) {
 	}
 }
 
+// TestEvidenceResearchEditionUsesDedicatedFactEdition is the comp=220 regression:
+// a competition whose normalized Name drops the year and whose URL carries no year
+// is still resolved to 2026 when a FactEdition fact is present (written by the
+// primary analyzer from the Document.Title year).
+func TestEvidenceResearchEditionUsesDedicatedFactEdition(t *testing.T) {
+	competition := model.Competition{
+		ID:          220,
+		Name:        "中国大学生计算机设计大赛", // normalized, no year
+		OfficialURL: "https://jsjds.blcu.edu.cn/info/1041/2274.htm", // no year
+		Facts: map[string]model.FactEvidence{
+			model.FactEdition: {Value: "2026", Edition: "2026", Evidence: "4C2026通知-关于举办中国大学生计算机设计大赛", SourceURL: "https://jsjds.blcu.edu.cn/info/1041/2274.htm"},
+		},
+	}
+	edition, err := evidenceResearchEdition(competition)
+	if err != nil {
+		t.Fatalf("evidenceResearchEdition error: %v", err)
+	}
+	if edition != "2026" {
+		t.Fatalf("edition = %q, want 2026 from FactEdition", edition)
+	}
+}
+
+// TestEvidenceResearchEditionOrganizerEditionCannotUnlock verifies that an
+// organizer FactEvidence.Edition alone cannot unlock research: without a
+// FactEdition, Name year, or URL year, the edition must remain Unknown. This
+// guards against regressing to reading organizer Edition for the comp=220 case.
+func TestEvidenceResearchEditionOrganizerEditionCannotUnlock(t *testing.T) {
+	competition := model.Competition{
+		ID:          220,
+		Name:        "中国大学生计算机设计大赛", // no year
+		OfficialURL: "https://jsjds.blcu.edu.cn/info/1041/2274.htm", // no year
+		Facts: map[string]model.FactEvidence{
+			model.FactOrganizer: {Value: "中国大学生计算机设计大赛组织委员会", Edition: "2026"},
+		},
+	}
+	if _, err := evidenceResearchEdition(competition); !errors.Is(err, errEvidenceResearchEditionUnknown) {
+		t.Fatalf("organizer edition must not unlock research, got %v", err)
+	}
+}
+
 func ptrTime(year int, month int, day int) *time.Time {
 	value := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
 	return &value
