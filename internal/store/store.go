@@ -247,8 +247,7 @@ func findExistingCompetition(ctx context.Context, tx *sql.Tx, value model.Compet
 }
 
 var (
-	identityYearPattern    = regexp.MustCompile(`20\d{2}`)
-	identityEditionPattern = regexp.MustCompile(`第[一二三四五六七八九十百零〇\d]+届`)
+	identityYearPattern = regexp.MustCompile(`20\d{2}`)
 )
 
 func sameCompetitionIdentity(left, right model.Competition) bool {
@@ -256,11 +255,11 @@ func sameCompetitionIdentity(left, right model.Competition) bool {
 	if leftYear != 0 && rightYear != 0 && leftYear != rightYear {
 		return false
 	}
-	leftEdition, rightEdition := competitionEdition(left.Name), competitionEdition(right.Name)
-	if leftEdition != "" && rightEdition != "" && leftEdition != rightEdition {
+	leftIdentity, rightIdentity := parseCompetitionIdentity(left.Name), parseCompetitionIdentity(right.Name)
+	if !identityCompatible(leftIdentity, rightIdentity) {
 		return false
 	}
-	leftName, rightName := normalizedCompetitionName(left.Name), normalizedCompetitionName(right.Name)
+	leftName, rightName := normalizedCompetitionName(normalizeEditionInName(left.Name)), normalizedCompetitionName(normalizeEditionInName(right.Name))
 	if len([]rune(leftName)) < 6 || len([]rune(rightName)) < 6 {
 		return false
 	}
@@ -293,7 +292,7 @@ func explicitCompetitionEditionConflict(left, right model.Competition) bool {
 }
 
 func competitionEdition(text string) string {
-	return identityEditionPattern.FindString(text)
+	return normalizeEditionOrdinal(text)
 }
 
 func competitionYear(text string) int {
