@@ -301,25 +301,6 @@ func sameCompetitionIdentity(left, right model.Competition) bool {
 	return true
 }
 
-// explicitCompetitionEditionConflict reports whether two competitions are
-// unmistakably different editions: either both carry a four-digit year that
-// differs, or both carry an explicit "第X届" ordinal that differs. It is used
-// to prevent a reused official URL from silently merging a new edition into an
-// existing one. When only one side has a year or edition, there is no explicit
-// conflict and the URL match is allowed to stand.
-func explicitCompetitionEditionConflict(left, right model.Competition) bool {
-	leftYear, rightYear := competitionYear(left.Name+" "+left.StatusEvidence), competitionYear(right.Name+" "+right.StatusEvidence)
-	if leftYear != 0 && rightYear != 0 && leftYear != rightYear {
-		return true
-	}
-	leftEdition, rightEdition := competitionEdition(left.Name), competitionEdition(right.Name)
-	return leftEdition != "" && rightEdition != "" && leftEdition != rightEdition
-}
-
-func competitionEdition(text string) string {
-	return normalizeEditionOrdinal(text)
-}
-
 func competitionYear(text string) int {
 	match := identityYearPattern.FindString(text)
 	if match == "" {

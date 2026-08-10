@@ -300,10 +300,6 @@ func isStationNoise(place string) bool {
 	return false
 }
 
-// seriesAcronymPattern matches a parenthesised or bare latin acronym token used
-// as the series shorthand (e.g. （CCPC）, (ICPC), CCPC).
-var seriesAcronymPattern = `[a-z]{2,12}`
-
 // identitySeries derives a canonical series token from the competition name. It
 // prefers the latin acronym (parenthesised or bare) such as ccpc / icpc, else
 // falls back to the core Chinese entity after stripping edition/stage/station and
@@ -484,16 +480,6 @@ func identityBoundaryAsymmetric(a, b competitionIdentity) bool {
 		return true
 	}
 	return false
-}
-
-// identityCompatible reports whether the two structured identities do NOT
-// disagree on any boundary component. Components that are unknown on either side
-// are ignored (conservative: no guessing). The series boundary is only enforced
-// when at least one side carries a clear latin acronym (e.g. ccpc vs icpc); for
-// Chinese-only names we defer to name similarity, which is stable across the
-// announcement phrasing (preview vs formal signup).
-func identityCompatible(a, b competitionIdentity) bool {
-	return !identityBoundaryConflict(a, b)
 }
 
 // sameIdentityText is the pure-string form of the identity merge decision. It is
