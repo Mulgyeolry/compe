@@ -44,6 +44,14 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// CountCompetitionEvents returns the number of rows in competition_events. It is
+// used to prove scan idempotency (a rescan must not create duplicate events).
+func (s *Store) CountCompetitionEvents(ctx context.Context) int {
+	var n int
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM competition_events`).Scan(&n)
+	return n
+}
+
 // Ping verifies the underlying SQLite connection is alive and usable. It is
 // used by the readiness endpoint and never exposes database internals; errors
 // are wrapped with enough context to be traced in server logs.
@@ -211,13 +219,15 @@ func findExistingCompetition(ctx context.Context, tx *sql.Tx, value model.Compet
 		if loadErr != nil {
 			return model.Competition{}, loadErr
 		}
-		// The URL is reused year after year for the same official site. If the
-		// newly crawled announcement is an explicitly different year or edition,
-		// it is a brand-new competition, not an update of the existing one. We
-		// do not return it here and instead fall through to the identity match
-		// below; if nothing else matches, sql.ErrNoRows lets the caller create a
-		// fresh row rather than silently merging across editions.
-		if explicitCompetitionEditionConflict(existing, value) {
+		// The URL is reused year after year for the same official site. A reused
+		// URL is strong evidence that the two documents concern the same entity,
+		// so it may bridge a missing stage/station on one side. It must NEVER
+		// override an explicit identity conflict (different edition, stage,
+		// station or series), which would silently merge distinct competitions.
+		// On an explicit conflict we fall through to the identity match below;
+		// if nothing else matches, sql.ErrNoRows lets the caller create a fresh
+		// row rather than silently merging across boundaries.
+		if identityBoundaryConflict(parseCompetitionIdentity(existing.Name), parseCompetitionIdentity(value.Name)) {
 			err = sql.ErrNoRows
 		} else {
 			return existing, nil
@@ -247,8 +257,7 @@ func findExistingCompetition(ctx context.Context, tx *sql.Tx, value model.Compet
 }
 
 var (
-	identityYearPattern    = regexp.MustCompile(`20\d{2}`)
-	identityEditionPattern = regexp.MustCompile(`第[一二三四五六七八九十百零〇\d]+届`)
+	identityYearPattern = regexp.MustCompile(`20\d{2}`)
 )
 
 func sameCompetitionIdentity(left, right model.Competition) bool {
@@ -256,11 +265,17 @@ func sameCompetitionIdentity(left, right model.Competition) bool {
 	if leftYear != 0 && rightYear != 0 && leftYear != rightYear {
 		return false
 	}
-	leftEdition, rightEdition := competitionEdition(left.Name), competitionEdition(right.Name)
-	if leftEdition != "" && rightEdition != "" && leftEdition != rightEdition {
+	leftIdentity, rightIdentity := parseCompetitionIdentity(left.Name), parseCompetitionIdentity(right.Name)
+	if identityBoundaryConflict(leftIdentity, rightIdentity) {
 		return false
 	}
-	leftName, rightName := normalizedCompetitionName(left.Name), normalizedCompetitionName(right.Name)
+	// A boundary asymmetry (one side has a stage/station the other lacks) must not
+	// be bridged by fuzzy name similarity: a generic series announcement must not
+	// merge into a specific station/final.
+	if identityBoundaryAsymmetric(leftIdentity, rightIdentity) {
+		return false
+	}
+	leftName, rightName := normalizedCompetitionName(normalizeEditionInName(left.Name)), normalizedCompetitionName(normalizeEditionInName(right.Name))
 	if len([]rune(leftName)) < 6 || len([]rune(rightName)) < 6 {
 		return false
 	}
@@ -269,31 +284,21 @@ func sameCompetitionIdentity(left, right model.Competition) bool {
 	if !contained && nameSimilarity < 0.78 {
 		return false
 	}
+	// A strong structured identity match (same series AND same edition AND same
+	// stage) is strong enough that an organizer wording difference (e.g. "CCPC"
+	// vs "中国大学生程序设计竞赛") must not block the merge. This is what lets an
+	// acronym title and the Chinese-full-name title of the same final collapse.
+	strongIdentity := leftIdentity.series != "" && rightIdentity.series != "" &&
+		leftIdentity.series == rightIdentity.series &&
+		leftIdentity.edition != "" && rightIdentity.edition != "" &&
+		leftIdentity.edition == rightIdentity.edition &&
+		leftIdentity.stage != "" && leftIdentity.stage == rightIdentity.stage
 	leftOrganizer, rightOrganizer := normalizedOrganizer(left.Organizer), normalizedOrganizer(right.Organizer)
-	if leftOrganizer != "" && rightOrganizer != "" && leftOrganizer != rightOrganizer &&
+	if !strongIdentity && leftOrganizer != "" && rightOrganizer != "" && leftOrganizer != rightOrganizer &&
 		!strings.Contains(leftOrganizer, rightOrganizer) && !strings.Contains(rightOrganizer, leftOrganizer) && nameSimilarity < 0.92 {
 		return false
 	}
 	return true
-}
-
-// explicitCompetitionEditionConflict reports whether two competitions are
-// unmistakably different editions: either both carry a four-digit year that
-// differs, or both carry an explicit "第X届" ordinal that differs. It is used
-// to prevent a reused official URL from silently merging a new edition into an
-// existing one. When only one side has a year or edition, there is no explicit
-// conflict and the URL match is allowed to stand.
-func explicitCompetitionEditionConflict(left, right model.Competition) bool {
-	leftYear, rightYear := competitionYear(left.Name+" "+left.StatusEvidence), competitionYear(right.Name+" "+right.StatusEvidence)
-	if leftYear != 0 && rightYear != 0 && leftYear != rightYear {
-		return true
-	}
-	leftEdition, rightEdition := competitionEdition(left.Name), competitionEdition(right.Name)
-	return leftEdition != "" && rightEdition != "" && leftEdition != rightEdition
-}
-
-func competitionEdition(text string) string {
-	return identityEditionPattern.FindString(text)
 }
 
 func competitionYear(text string) int {
