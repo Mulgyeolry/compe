@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"strings"
 	"unicode"
 )
@@ -147,13 +148,15 @@ func normalizeEditionInName(name string) string {
 }
 
 // stageLexicon maps a competition stage token to its canonical stage. Only
-// tokens that mark a genuinely separate competition entity are listed.
+// tokens that mark a genuinely separate competition entity are listed. 决赛 and
+// 总决赛 collapse to a single canonical "总决赛" stage so the same final never
+// becomes two entities.
 var stageLexicon = []struct {
-	token   string
-	canon   string
+	token string
+	canon string
 }{
 	{"总决赛", "总决赛"},
-	{"决赛", "决赛"},
+	{"决赛", "总决赛"},
 	{"区域赛", "区域"},
 	{"分站赛", "分站"},
 	{"分站", "分站"},
@@ -166,6 +169,34 @@ var stageLexicon = []struct {
 	{"预选赛", "预选"},
 	{"预赛", "预选"},
 	{"邀请赛", "邀请"},
+}
+
+// seriesAliases maps a canonical series key to the set of strings (latin acronym
+// and Chinese full names) that all denote that series. It is the single,
+// central place to declare that an acronym and a full name are the same series.
+// It is deliberately small and extensible; it is not a full competition catalog.
+var seriesAliases = map[string][]string{
+	"ccpc": {"ccpc", "中国大学生程序设计竞赛", "中国大学生程序设计大赛"},
+}
+
+// normalizeSeriesAlias maps a derived series token to its canonical key. If the
+// token (or a canonical alias) matches, the canonical key is returned; otherwise
+// the token is returned unchanged so that clearly different series never merge.
+func normalizeSeriesAlias(token string) string {
+	if token == "" {
+		return ""
+	}
+	for canon, aliases := range seriesAliases {
+		if token == canon {
+			return canon
+		}
+		for _, alias := range aliases {
+			if token == alias {
+				return canon
+			}
+		}
+	}
+	return token
 }
 
 // stationLexicon is a small, conservative set of site / regional tokens used to
@@ -183,34 +214,90 @@ var stationLexicon = []string{
 }
 
 // identityStage returns the canonical stage of a competition name, or "" when no
-// explicit stage marker is present. A "<city>站" or "<region>赛区" form implies a
-// station-level stage (分站).
+// explicit stage marker is present. A "<place>站" or "<place>赛区" form implies a
+// station-level stage (分站) even for places not in the city lexicon.
 func identityStage(name string) string {
 	for _, s := range stageLexicon {
 		if strings.Contains(name, s.token) {
 			return s.canon
 		}
 	}
-	// <city>站 / <city>赛区 implies a station-level round.
-	if identityStation(name) != "" && (strings.Contains(name, "站") || strings.Contains(name, "赛区")) {
+	if extractStationPlace(name) != "" {
 		return "分站"
 	}
 	return ""
 }
 
 // identityStation returns a normalized station/site token for a competition name,
-// or "" when none is present. A station word alone (without 站/赛区) does not
-// imply a station; it only contributes once a station marker is present.
+// or "" when none is present or the place cannot be reliably extracted (never
+// guessed). The city lexicon is only an aid; an unknown <place>站 / <place>赛区 is
+// still captured from the text.
 func identityStation(name string) string {
-	if !strings.Contains(name, "站") && !strings.Contains(name, "赛区") {
+	place := extractStationPlace(name)
+	if place == "" {
 		return ""
 	}
+	// Prefer a known lexicon city/region if one is present (more reliable), else
+	// fall back to the text-extracted place token.
 	for _, city := range stationLexicon {
 		if strings.Contains(name, city) {
 			return city
 		}
 	}
+	return place
+}
+
+// extractStationPlace extracts the place token preceding 站 or 赛区 (e.g. 郑州,
+// 蚌埠, 西南). It returns "" when no station marker exists or when the place is
+// empty / unreliable (e.g. a bare 站 with no preceding place). It walks runes so
+// multi-byte CJK places are captured correctly.
+func extractStationPlace(name string) string {
+	runes := []rune(name)
+	for i, r := range runes {
+		var markerLen int
+		switch r {
+		case '站':
+			markerLen = 1
+		case '区':
+			// Only a "赛区" marker; the place precedes "赛".
+			if i == 0 || runes[i-1] != '赛' {
+				continue
+			}
+			markerLen = 2 // place is before "赛区"
+		default:
+			continue
+		}
+		// walk left over CJK place runes (place ends before the marker)
+		end := i
+		if markerLen == 2 {
+			end = i - 1 // exclude the 赛
+		}
+		start := end
+		for start > 0 && isCJKPlaceRune(runes[start-1]) {
+			start--
+		}
+		if start < end {
+			place := string(runes[start:end])
+			if len([]rune(place)) >= 2 && !isStationNoise(place) {
+				return place
+			}
+		}
+	}
 	return ""
+}
+
+// isCJKPlaceRune reports whether a rune can be part of a place name.
+func isCJKPlaceRune(r rune) bool {
+	return r >= 0x3400 && r <= 0x9FFF
+}
+
+// isStationNoise excludes generic tokens that are not places.
+func isStationNoise(place string) bool {
+	switch place {
+	case "分站", "本赛区", "线上", "线下", "各赛区", "所有":
+		return true
+	}
+	return false
 }
 
 // seriesAcronymPattern matches a parenthesised or bare latin acronym token used
@@ -250,6 +337,15 @@ func identitySeries(name string) string {
 			return token
 		}
 	}
+	// A known Chinese full-name series alias contained in the name wins before
+	// aggressive noise stripping, so that 中国大学生程序设计竞赛 maps to ccpc.
+	for canon, aliases := range seriesAliases {
+		for _, alias := range aliases {
+			if len(alias) >= 4 && strings.Contains(lower, alias) {
+				return canon
+			}
+		}
+	}
 	// Fall back to the core Chinese entity name.
 	s := lower
 	for _, s2 := range stageLexicon {
@@ -273,7 +369,7 @@ func identitySeries(name string) string {
 			b.WriteRune(r)
 		}
 	}
-	return b.String()
+	return normalizeSeriesAlias(b.String())
 }
 
 // stripEditionFragment removes the whole "第..届" span (digits or Chinese
@@ -322,6 +418,7 @@ func isSeriesAcronym(token string) bool {
 type competitionIdentity struct {
 	series  string
 	edition string
+	year    int
 	stage   string
 	station string
 }
@@ -330,9 +427,63 @@ func parseCompetitionIdentity(name string) competitionIdentity {
 	return competitionIdentity{
 		series:  identitySeries(name),
 		edition: normalizeEditionOrdinal(name),
+		year:    identityYearIn(name),
 		stage:   identityStage(name),
 		station: identityStation(name),
 	}
+}
+
+// identityYearIn returns the first four-digit year found in the text, or 0.
+func identityYearIn(text string) int {
+	m := identityYearPattern.FindString(text)
+	if m == "" {
+		return 0
+	}
+	var y int
+	_, _ = fmt.Sscanf(m, "%d", &y)
+	return y
+}
+
+// identityBoundaryConflict reports whether two structured identities carry an
+// EXPLICIT disagreement on any boundary component (series, edition, stage,
+// station). Only components present on BOTH sides count as a conflict; a missing
+// component on one side is not itself a conflict. This is the single pure
+// predicate used by both the URL fast path and the name-similarity path so the
+// rules are never duplicated.
+func identityBoundaryConflict(a, b competitionIdentity) bool {
+	if a.series != "" && b.series != "" && a.series != b.series &&
+		(isSeriesAcronym(a.series) || isSeriesAcronym(b.series)) {
+		return true
+	}
+	if a.year != 0 && b.year != 0 && a.year != b.year {
+		return true
+	}
+	if a.edition != "" && b.edition != "" && a.edition != b.edition {
+		return true
+	}
+	if a.stage != "" && b.stage != "" && a.stage != b.stage {
+		return true
+	}
+	if a.station != "" && b.station != "" && a.station != b.station {
+		return true
+	}
+	return false
+}
+
+// identityBoundaryAsymmetric reports whether one side carries an explicit
+// boundary (stage or station) that the other side lacks. Such an asymmetry means
+// "unknown on one side" — e.g. a generic series announcement vs a specific
+// station — which must NOT be bridged by fuzzy name similarity. This is distinct
+// from a hard conflict: a missing value is not a contradiction, but it also must
+// not auto-merge a generic announcement into a specific stage/station.
+func identityBoundaryAsymmetric(a, b competitionIdentity) bool {
+	if (a.stage == "") != (b.stage == "") {
+		return true
+	}
+	if (a.station == "") != (b.station == "") {
+		return true
+	}
+	return false
 }
 
 // identityCompatible reports whether the two structured identities do NOT
@@ -342,27 +493,20 @@ func parseCompetitionIdentity(name string) competitionIdentity {
 // Chinese-only names we defer to name similarity, which is stable across the
 // announcement phrasing (preview vs formal signup).
 func identityCompatible(a, b competitionIdentity) bool {
-	if a.series != "" && b.series != "" && a.series != b.series &&
-		(isSeriesAcronym(a.series) || isSeriesAcronym(b.series)) {
-		return false
-	}
-	if a.edition != "" && b.edition != "" && a.edition != b.edition {
-		return false
-	}
-	if a.stage != "" && b.stage != "" && a.stage != b.stage {
-		return false
-	}
-	if a.station != "" && b.station != "" && a.station != b.station {
-		return false
-	}
-	return true
+	return !identityBoundaryConflict(a, b)
 }
 
 // sameIdentityText is the pure-string form of the identity merge decision. It is
 // exported for table-driven tests and mirrors sameCompetitionIdentity.
 func sameIdentityText(a, b string) bool {
 	ia, ib := parseCompetitionIdentity(a), parseCompetitionIdentity(b)
-	if !identityCompatible(ia, ib) {
+	if identityBoundaryConflict(ia, ib) {
+		return false
+	}
+	// A boundary asymmetry (one side has a stage/station the other lacks) must not
+	// be bridged by fuzzy name similarity: a generic series announcement must not
+	// merge into a specific station/final.
+	if identityBoundaryAsymmetric(ia, ib) {
 		return false
 	}
 	// Name similarity on edition-normalized names.

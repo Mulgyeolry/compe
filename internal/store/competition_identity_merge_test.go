@@ -321,3 +321,105 @@ func TestIdentityChineseAndDigitsEditionCollapse(t *testing.T) {
 	}
 	assertCount(t, db, "SELECT COUNT(*) FROM competitions", 1)
 }
+
+// Blocker C: the same URL reused for a DIFFERENT station in the same edition must
+// create a new row (URL fast path must not bypass the station boundary).
+func TestIdentityURLReuseDifferentStationNewRow(t *testing.T) {
+	db := newIdentityDB(t)
+	const url = "https://ccpc.io/a/1.html"
+	_, isNew := upsertComp(t, db, "第11届CCPC郑州站", "CCPC", url, model.TrustHigh)
+	if !isNew {
+		t.Fatal("first insert should be new")
+	}
+	_, isNew = upsertComp(t, db, "第11届CCPC济南站", "CCPC", url, model.TrustHigh)
+	if !isNew {
+		t.Fatal("same URL + different station must create a new row")
+	}
+	assertCount(t, db, "SELECT COUNT(*) FROM competitions", 2)
+}
+
+// Blocker C: same URL + 分站 vs 总决赛 in the same edition must be separate rows.
+func TestIdentityURLReuseStationVsFinalNewRow(t *testing.T) {
+	db := newIdentityDB(t)
+	const url = "https://ccpc.io/a/2.html"
+	_, isNew := upsertComp(t, db, "第11届CCPC分站赛", "CCPC", url, model.TrustHigh)
+	if !isNew {
+		t.Fatal("first insert should be new")
+	}
+	_, isNew = upsertComp(t, db, "第11届CCPC总决赛", "CCPC", url, model.TrustHigh)
+	if !isNew {
+		t.Fatal("same URL + 分站 vs 总决赛 must be separate rows")
+	}
+	assertCount(t, db, "SELECT COUNT(*) FROM competitions", 2)
+}
+
+// Blocker C: same URL + different edition must create a new row.
+func TestIdentityURLReuseDifferentEditionNewRow(t *testing.T) {
+	db := newIdentityDB(t)
+	const url = "https://ccpc.io/a/3.html"
+	_, isNew := upsertComp(t, db, "第10届CCPC总决赛", "CCPC", url, model.TrustHigh)
+	if !isNew {
+		t.Fatal("first insert should be new")
+	}
+	_, isNew = upsertComp(t, db, "第11届CCPC总决赛", "CCPC", url, model.TrustHigh)
+	if !isNew {
+		t.Fatal("same URL + different edition must be separate rows")
+	}
+	assertCount(t, db, "SELECT COUNT(*) FROM competitions", 2)
+}
+
+// Blocker C: same URL + same entity with a minor title change must merge.
+func TestIdentityURLSameEntityMinorTitleChangeMerges(t *testing.T) {
+	db := newIdentityDB(t)
+	const url = "https://ccpc.io/a/4.html"
+	_, isNew := upsertComp(t, db, "第11届CCPC总决赛", "CCPC", url, model.TrustHigh)
+	if !isNew {
+		t.Fatal("first insert should be new")
+	}
+	old, isNew, err := db.UpsertCompetition(context.Background(), model.Competition{
+		EntityKey:   "auto-第11届CCPC总决赛",
+		Name:        "第11届中国大学生程序设计竞赛（CCPC）总决赛",
+		Organizer:   "CCPC",
+		OfficialURL: url,
+		Trust:       model.TrustHigh,
+	}, "src", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isNew {
+		t.Fatal("same URL + same entity minor title change must merge")
+	}
+	if old.Name == "" {
+		t.Fatal("expected the existing row to be found")
+	}
+	assertCount(t, db, "SELECT COUNT(*) FROM competitions", 1)
+}
+
+// Blocker A at merge level: 缩写 vs 中文全称 for the same final collapse.
+func TestIdentityAbbreviationVsFullNameMerge(t *testing.T) {
+	db := newIdentityDB(t)
+	_, isNew := upsertComp(t, db, "第11届中国大学生程序设计竞赛（CCPC）总决赛", "CCPC", "https://ccpc.io/a/1.html", model.TrustHigh)
+	if !isNew {
+		t.Fatal("first insert should be new")
+	}
+	_, isNew = upsertComp(t, db, "第十一届中国大学生程序设计竞赛总决赛", "中国大学生程序设计竞赛", "https://ccpc.io/a/2.html", model.TrustHigh)
+	if isNew {
+		t.Fatal("缩写 and 中文全称 of the same series must merge")
+	}
+	assertCount(t, db, "SELECT COUNT(*) FROM competitions", 1)
+}
+
+// Blocker B at merge level: a generic series announcement must not merge into a
+// specific station.
+func TestIdentityGenericDoesNotMergeIntoSpecific(t *testing.T) {
+	db := newIdentityDB(t)
+	_, isNew := upsertComp(t, db, "第11届CCPC", "CCPC", "https://ccpc.io/a/1.html", model.TrustHigh)
+	if !isNew {
+		t.Fatal("first insert should be new")
+	}
+	_, isNew = upsertComp(t, db, "第11届CCPC郑州站", "CCPC", "https://ccpc.io/a/2.html", model.TrustHigh)
+	if !isNew {
+		t.Fatal("generic series announcement must not merge into a specific station")
+	}
+	assertCount(t, db, "SELECT COUNT(*) FROM competitions", 2)
+}
