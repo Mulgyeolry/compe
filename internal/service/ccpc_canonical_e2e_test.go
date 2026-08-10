@@ -23,7 +23,7 @@ type ccpcE2ECollector struct {
 }
 
 func (c *ccpcE2ECollector) Discover(_ context.Context, _ config.Source) ([]model.Candidate, error) {
-	// Return candidates in publish order (newest first), mirroring the archive API.
+	// Return the fixed candidate set in publish order (newest first).
 	order := []string{
 		"https://ccpc.io/a/6.html", // 第11届 郑州站正式报名
 		"https://ccpc.io/a/5.html", // 第11届 郑州站报名预告
@@ -47,10 +47,10 @@ func (c *ccpcE2ECollector) Fetch(_ context.Context, raw string) (model.Document,
 	return model.Document{}, errors.New("ccpc e2e: unknown article url " + raw)
 }
 
-// newCCPCE2EService builds a Service backed by a real store and the mock CCPC
-// collector, with a rules-only analyzer (no LLM) so the identity merge is fully
-// deterministic. The DB path is returned so idempotency can be checked through a
-// fresh read connection.
+// newCCPCE2EService builds a Service backed by a real store and a fake in-memory
+// CCPC collector (no network), with a rules-only analyzer (no LLM) so the identity
+// merge is fully deterministic. The DB path is returned so idempotency can be
+// checked through a fresh read connection.
 func newCCPCE2EService(t *testing.T) (*Service, *store.Store, string) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "ccpc.db")
@@ -114,8 +114,9 @@ func ccpcE2EArticles() map[string]model.Document {
 }
 
 // TestCCPCCanonicalEndToEnd drives the full pipeline twice (Discover -> Fetch ->
-// Analyze -> Upsert -> rescan) against a mock CCPC archive and asserts that the
-// canonical identity boundaries hold and that the scan is idempotent.
+// Analyze -> Upsert -> rescan) against a deterministic in-memory CCPC dataset and
+// asserts that the canonical identity boundaries hold and that the scan is
+// idempotent.
 func TestCCPCCanonicalEndToEnd(t *testing.T) {
 	app, database, dbPath := newCCPCE2EService(t)
 	ctx := context.Background()

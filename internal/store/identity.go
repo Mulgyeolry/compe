@@ -15,9 +15,11 @@ import (
 //   - 分站 and 总决赛 never merge;
 //   - a preview and the formal signup for the SAME series+edition+station merge.
 //
-// The rules are deliberately conservative: whenever a boundary component is
-// unknown on one side we fall back to the existing name-similarity merge rather
-// than guessing a value. They are also generic (no CCPC-specific strings), so
+// The rules are deliberately conservative: an explicit disagreement on any
+// boundary (series, edition, stage, station) always rejects the merge, and an
+// asymmetric gap (one side has a stage/station the other lacks) also prevents a
+// fuzzy name-similarity merge, because "unknown" is not the same as "compatible".
+// A value is never guessed. The rules are generic (no CCPC-specific strings), so
 // they serve ICPC regionals, provincial contests, BlueBridge Cup sub-sites and
 // other multi-stage competitions as well.
 
